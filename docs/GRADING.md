@@ -366,6 +366,51 @@ This is not decoration. Feedback that reads like a chatbot gets ignored by stude
 and embarrasses the instructor whose name is on it. `style.py` is meant to be edited
 directly: it describes how you write, not how the tool works.
 
+### The second pass: the humanizer
+
+The style block is guidance at prompt time, and a model that has just spent a
+long turn scoring a rubric still lets tells through. So everything the grader
+writes goes back through the `/humanizer` skill before you see it: the comment
+to the student and every per-criterion rationale, whether one student was
+re-graded or the whole class was run; the written class summary; the teaching
+read; the overlap triage; an answer to a question you asked about a student;
+an announcement draft; and a drafted inbox reply. `humanize.py` sends the
+finished text to Claude with the skill as the editor's brief and takes the
+rewrite back.
+
+The brief keeps itself current with no one's attention. Once a day the Studio
+fetches the skill's `SKILL.md` from its GitHub repository into your per-user
+folder (`%APPDATA%\CourseForge-Studio\humanizer\`), keeps it only if it is a
+valid skill file whose version is not older than the one already kept, and the
+next grade reads it. No click, no restart. What it fetches is checked before it
+is trusted: one fixed address over TLS, no redirects off that host, a size
+band, the skill's own frontmatter and sections present, and none of the text a
+writing guide has no reason to carry. A fetch that fails for any reason
+(offline, a proxy that refuses the host, a page that is not the skill) is
+written to `state.json` beside the copy and changes nothing.
+
+Of the copies on the PC, the newest version is used: that refreshed copy, your
+own installed skill at `~/.claude/skills/humanizer/SKILL.md`, or the one bundled
+in `courseforge/knowledge/humanizer.md`. `python -m courseforge doctor` checks
+GitHub on the spot and says which copy is in use. `"humanize_auto_update":
+false` freezes the skill at whatever is installed, and `humanize_skill_path`
+pins one file and stops the choice altogether.
+
+Nothing a grade depends on can be lost to the editing. The pass runs while the
+pseudonym tags are still in place, so the editor never sees a name. Every
+rewrite is checked before it replaces the original: the same numbers and
+scores, the same tags, every quoted student phrase still present verbatim, no
+bloat, no dash that was not there before, and a comment still under its cap.
+A field that fails any check keeps the grading model's words, and a pass that
+fails outright (no CLI, a timeout, an unreadable reply) keeps all of them. The
+outcome is recorded on the entry as `humanized` (which fields changed, which
+were kept and why, what it cost), and the cost is folded into the entry's
+`cost_usd`.
+
+It is one extra model call per graded student and per summary, on
+`humanize_model` (`sonnet` by default; an editing pass does not need the
+grading model). `"humanize": false` in `config.json` turns it off.
+
 Students are graded concurrently (`grading_concurrency`, default 8, ceiling 8).
 Each lane is its own `claude` CLI call, so this changes how long a section takes,
 not what it costs. Lower it if you see rate-limit errors against individual
@@ -915,6 +960,12 @@ correctly.
 | `model` | `opus` | `opus`, `sonnet`, or `haiku` |
 | `grading_concurrency` | `8` | Parallel Claude calls, 1-8 |
 | `claude_timeout_s` | `600` | Per-student timeout |
+| `humanize` | `true` | Run every comment, rationale, summary, teaching read, overlap triage, answer, announcement and inbox draft through the `/humanizer` skill before showing it. See [The second pass](#the-second-pass-the-humanizer) |
+| `humanize_model` | `sonnet` | The editing model. Sonnet is enough; opus costs more for the same edit |
+| `humanize_timeout_s` | `180` | Per-pass timeout |
+| `humanize_skill_path` | *(auto)* | Empty means the newest of the refreshed copy, your installed `~/.claude/skills/humanizer/SKILL.md`, and the bundled copy. A path pins one file |
+| `humanize_auto_update` | `true` | Fetch the current skill from its GitHub repository once a day and use it from the next grade on, with no click and no restart. `false` freezes the installed copy |
+| `humanize_update_s` | `86400` | How often to check, in seconds. Never less than an hour |
 | `pseudonymize` | `true` | See Privacy |
 | `grade_scale` | `{"A":90,"B":80,"C":70,"D":60}` | Minimum percent per letter; below the lowest is an F |
 | `schedule_max_age_min` | `30` | Opening the term schedule refreshes it from Canvas when the cache is older than this |

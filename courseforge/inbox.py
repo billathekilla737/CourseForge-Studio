@@ -32,7 +32,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urljoin
 
-from . import audit, identity, llm, pseudonym
+from . import audit, humanize, identity, llm, pseudonym
 
 MAX_BODY = 4000          # of one message, before it is handed to a model
 MAX_THREADS = 60
@@ -530,13 +530,24 @@ def read_thread(app, conversation_id, model: str | None = None,
             if draft2 and not _echoed(draft2, told):
                 data = data2
                 draft = draft2
+    # The second pass, while the tags are still in place: the reply a student
+    # will read and the note to the instructor both go through the humanizer
+    # skill. The tag is checked after the rewrite; a draft that lost it, or
+    # changed a date or a number, keeps its original words.
+    why = str(data.get("why") or "").strip()
+    edited: dict = {}
+    if humanize.enabled(app.cfg):
+        fields, edited = humanize.humanize_fields(
+            {"reply": draft, "why": why}, app.cfg, humanize.KIND_INBOX)
+        draft, why = fields.get("reply", draft), fields.get("why", why)
     return {
         "id": t.id,
+        "humanized": edited,
         "asking": t.unmask(str(data.get("asking") or "").strip()),
         "kind": str(data.get("kind") or "other").strip(),
         "urgency": str(data.get("urgency") or "routine").strip(),
         "needs_you": bool(data.get("needs_you")),
-        "why": t.unmask(str(data.get("why") or "").strip()),
+        "why": t.unmask(why),
         # Both forms: the tagged one is what was actually generated, and the
         # readable one is what goes in the box. Sending re-resolves from the
         # box, so an edit is never lost to the tag round trip.

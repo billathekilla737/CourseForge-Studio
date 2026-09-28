@@ -120,6 +120,26 @@ class Config:
     java_path: str = ""
     # Alt text and other image descriptions: sonnet sees well and costs less.
     describe_model: str = "sonnet"
+    # The second pass. Every piece of prose the Studio writes (the comment a
+    # student reads, the per-criterion rationales, the class summary, the
+    # teaching read, the overlap triage, an answered question, an announcement
+    # draft, an inbox reply) goes back through the humanizer skill before it is
+    # shown, so it reads as a person wrote it. See humanize.py. A pass that
+    # fails keeps the original words, so turning this off only saves the call.
+    humanize: bool = True
+    humanize_model: str = "sonnet"      # an editing pass; sonnet is enough
+    humanize_timeout_s: int = 180
+    # Empty = the newest of: the copy this app refreshes from GitHub on its own
+    # (see humanize_auto_update), ~/.claude/skills/humanizer/SKILL.md when
+    # installed, and the copy bundled in courseforge/knowledge/humanizer.md.
+    # A path pins one file and stops the automatic choice.
+    humanize_skill_path: str = ""
+    # Once a day, fetch the current humanizer SKILL.md from its GitHub repo
+    # into the per-user folder, keep it only if it is a valid, newer skill
+    # file, and use it from the next grade on. No click, no restart. Off means
+    # the skill only changes when a person installs a new copy.
+    humanize_auto_update: bool = True
+    humanize_update_s: int = 86400
     # College-specific syllabus statements. Empty = courseforge/knowledge/syllabus-policies.json.
     syllabus_policies_path: str = ""
     # The account of what the Studio did (audit.py), kept in your own Canvas

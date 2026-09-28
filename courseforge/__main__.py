@@ -12,7 +12,7 @@ from __future__ import annotations
 import argparse
 import sys
 
-from . import blender, llm
+from . import blender, humanize, llm
 from .canvas import CanvasClient
 from .config import Config
 from .server import serve
@@ -72,6 +72,33 @@ def cmd_doctor(cfg: Config) -> int:
         print("\n                 Fix: open a normal terminal, run `claude`, then `/login`.")
         print("                 If you launched this from inside a Claude Code session,")
         print("                 start it from a plain terminal instead.")
+
+    print()
+    # Check GitHub first, so the line below names the copy that will actually
+    # be used from now on, not the one that was current a minute ago.
+    fresh: dict = {}
+    if humanize.enabled(cfg) and humanize.auto_update_enabled(cfg):
+        fresh = humanize.refresh(cfg)
+    hz = humanize.doctor(cfg)
+    if not hz.get("enabled"):
+        print("Humanizer      : OFF (humanize is false in config.json)")
+    elif hz.get("ok"):
+        print(f"Humanizer      : on, {hz['model']} edits with {hz['label']}")
+        if not hz.get("auto_update"):
+            print("                 automatic updates are off (humanize_auto_update);")
+            print("                 the skill changes only when a new copy is installed.")
+        elif fresh.get("result") in ("updated", "unchanged"):
+            print(f"                 kept current from GitHub: v{fresh.get('version') or '?'} "
+                  f"({fresh['result']} just now; checked again once a day)")
+        else:
+            print(f"                 GitHub check failed: {fresh.get('error') or fresh.get('result') or '?'}")
+            print("                 Grading goes on with the copy named above.")
+    else:
+        ok = False
+        print(f"Humanizer      : {hz['label']}")
+        print("                 Every comment, rationale and summary would be shown as")
+        print("                 the grading model wrote it. Reinstall the app, or set")
+        print('                 "humanize_skill_path" in config.json to a SKILL.md.')
 
     print()
     bl = blender.probe(cfg.blender_path)

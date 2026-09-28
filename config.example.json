@@ -39,6 +39,15 @@
   "vision_model": "sonnet",
   "max_images_per_student": 8,
 
+  "_humanize": "The second pass. Every piece of prose the Studio writes -- the comment a student reads, the per-criterion rationales, the class summary, the teaching read, the overlap triage, an answered question, an announcement draft, an inbox reply -- goes back through the humanizer skill before it is shown, so it reads as a person wrote it. humanize_model is the editing model; sonnet is enough. humanize_skill_path empty means your installed ~/.claude/skills/humanizer/SKILL.md when present, else the copy bundled in courseforge/knowledge/humanizer.md. A pass that fails keeps the original words.",
+  "humanize": true,
+  "humanize_model": "sonnet",
+  "humanize_timeout_s": 180,
+  "humanize_skill_path": "",
+  "_humanize_auto_update": "Once a day the Studio fetches the current humanizer SKILL.md from its GitHub repository into your per-user folder and keeps it only if it is a valid, newer skill file. The next grade uses it: no click, no restart. Turn this off to freeze the skill at whatever copy is installed. humanize_update_s is the check interval in seconds.",
+  "humanize_auto_update": true,
+  "humanize_update_s": 86400,
+
   "_schedule_max_age_min": "The term schedule refetches from Canvas in the background when the cached copy is older than this many minutes. The cache is shown immediately either way, with its age in the footer.",
   "schedule_max_age_min": 30,
 

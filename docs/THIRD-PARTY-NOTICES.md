@@ -121,6 +121,47 @@ Practical readings, in order of least effort:
 
 ---
 
+## Bundled as text inside the Studio (no build step involved)
+
+### Humanizer skill — MIT
+
+| | |
+|---|---|
+| Version | 2.7.0 (`courseforge/knowledge/humanizer.md`, a verbatim copy of the skill's `SKILL.md`) |
+| Source | https://github.com/blader/humanizer |
+| Licence | MIT, copyright (c) 2025 Siqi Chen |
+
+The editor's brief for the second pass over everything the grader writes
+(`courseforge/humanize.py`). It is a Markdown prompt, not code, and it is not
+modified: the file is byte-for-byte the upstream `SKILL.md`, frontmatter
+included, and `humanize.py` strips the frontmatter when it reads it. When the
+person has the skill installed in `~/.claude/skills/humanizer/`, that copy is
+used instead and this one is the fallback.
+
+The MIT licence asks that the copyright and permission notice travel with the
+copy, so here it is:
+
+> MIT License. Copyright (c) 2025 Siqi Chen.
+>
+> Permission is hereby granted, free of charge, to any person obtaining a copy
+> of this software and associated documentation files (the "Software"), to deal
+> in the Software without restriction, including without limitation the rights
+> to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+> copies of the Software, and to permit persons to whom the Software is
+> furnished to do so, subject to the following conditions: The above copyright
+> notice and this permission notice shall be included in all copies or
+> substantial portions of the Software. THE SOFTWARE IS PROVIDED "AS IS",
+> WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED
+> TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+> NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE
+> FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,
+> TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR
+> THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+Nothing to do: MIT places no obligation on distribution beyond this notice.
+
+---
+
 ## Summary of what is still to do
 
 | Item | Blocking public binaries? | Blocking a source-only push? |

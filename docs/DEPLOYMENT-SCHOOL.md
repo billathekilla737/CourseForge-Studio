@@ -93,8 +93,9 @@ routed by queue name so PDF jobs can be pinned to bigger hosts later.
 **Egress.** Docker networks cannot filter by hostname, so app and worker get
 `HTTPS_PROXY` pointing at a squid container with an allowlist: the Canvas host,
 the file hosts Canvas redirects downloads to (capture the real set during the
-pilot), `api.anthropic.com`, and the school IdP. Everything else is refused and
-logged. The client already refuses to send the token anywhere but the Canvas
+pilot), `api.anthropic.com`, `raw.githubusercontent.com` (the humanizer skill
+refreshes itself from there once a day; refused, it keeps the copy it has), and
+the school IdP. Everything else is refused and logged. The client already refuses to send the token anywhere but the Canvas
 host (`courseforge/canvas_policy.py`); the proxy is the second layer.
 
 ## 3. Identity

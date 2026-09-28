@@ -27,7 +27,8 @@ from pathlib import Path
 from socketserver import ThreadingMixIn
 from urllib.parse import parse_qs, urlparse
 
-from . import (accommodations, areas, audit, blender, confirm, curve, grader,
+from . import (accommodations, areas, audit, blender, confirm, curve, extract,
+               grader, humanize,
                latepolicy, llm, gradesync, handoff, htmlclean, instruct,
                nicknames, overlap, quizgrade, quizedit, routing, schedule,
                statesync, teaching, terms)
@@ -376,6 +377,12 @@ class App:
         audit.set_actor_source(lambda: self.client.whoami() or {}, self.machine)
         self.audit_sync = audit.Syncer(self, getattr(cfg, "audit_sync_s", 180))
         self.audit_sync.start()
+        # The humanizer brief keeps itself current from its GitHub repository,
+        # once a day, on its own thread. Off in config.json means the skill
+        # never leaves this PC to ask.
+        self.humanize_refresh = humanize.Refresher(cfg)
+        if humanize.auto_update_enabled(cfg):
+            self.humanize_refresh.start()
         # The other areas hang their state and routes off the App here.
         self.area_status: dict = {}
         areas.install_all(self)
@@ -1094,6 +1101,15 @@ class App:
         data = result.data if isinstance(result.data, dict) else {}
         title = str(data.get("title") or f"Reminder: {detail.get('name')}")
         message = str(data.get("message") or result.text.strip())
+        # The second pass: students read this on a phone, and a reminder that
+        # reads like a chatbot gets skimmed. Every date, time and points value
+        # is checked after the rewrite; a draft that lost one keeps its words.
+        edited: dict = {}
+        if humanize.enabled(self.cfg):
+            log(f"{humanize.model_for(self.cfg)} is editing the announcement")
+            fields, edited = humanize.humanize_fields(
+                {"title": title, "message": message}, self.cfg, humanize.KIND_ANNOUNCE)
+            title, message = fields.get("title", title), fields.get("message", message)
         look = getattr(self.cfg, "a11y_look", "hybrid") or "hybrid"
         from .content.generate import load_brand
         brand = load_brand(getattr(self.cfg, "brand_path", None))
@@ -1109,8 +1125,10 @@ class App:
             "look": look,
             "brand": {"colors": brand["colors"], "fonts": brand["fonts"]},
             "model": self.cfg.model,
-            "cost_usd": round(result.cost_usd or 0.0, 4),
+            "cost_usd": round(float(result.cost_usd or 0.0)
+                              + float(edited.get("cost_usd") or 0.0), 4),
             "parse_error": result.parse_error if not data else "",
+            "humanized": edited,
             "writes_enabled": bool(self.cfg.allow_canvas_writes),
         }
 
@@ -3594,6 +3612,8 @@ def serve(cfg: Config) -> None:
             _app.state_sync.close()
         if getattr(_app, "audit_sync", None):
             _app.audit_sync.close()
+        if getattr(_app, "humanize_refresh", None):
+            _app.humanize_refresh.close()
         killed = llm.shutdown_all()
         if killed:
             print(f"  cancelled {killed} in-flight Claude call(s)", flush=True)

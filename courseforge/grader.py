@@ -9,8 +9,8 @@ from pathlib import Path
 from typing import Protocol
 from urllib.parse import unquote_plus
 
-from . import (audit, blender, curve, gradesync, latepolicy, llm, nicknames,
-               overlap, quizgrade, teaching)
+from . import (audit, blender, curve, gradesync, humanize, latepolicy, llm,
+               nicknames, overlap, quizgrade, teaching)
 from .canvas import CanvasClient
 from .config import Config
 from .extract import (ARCHIVE_EXT, Extracted, Submission, expand_archive,
@@ -883,6 +883,25 @@ def grade_one(cfg: Config, assignment: dict, rubric: list[dict], entry: dict,
         total = float(curve.whole_points(folded["total"]))
         flags = folded["flags"]
 
+    # The second pass. The prompt already carries the house style, but a model
+    # that has just scored a rubric still lets tells through, so the comment
+    # and every rationale go back through the humanizer skill before they are
+    # stored. The tags are still in place here (S-001), so no name reaches the
+    # editor either. A pass that fails keeps the original words: humanize.py
+    # checks every rewrite for the same numbers, tags and quoted phrases and
+    # never raises, so the score above cannot be lost to the editing.
+    edited: dict = {}
+    if humanize.enabled(cfg) and (comment.strip()
+                                  or any(v.strip() for v in rationales.values())):
+        _item(progress, label, f"{humanize.model_for(cfg)} is editing the feedback", "")
+        fields = {"comment": comment}
+        fields.update({f"rationale:{cid}": text for cid, text in rationales.items()})
+        fields, edited = humanize.humanize_fields(fields, cfg, humanize.KIND_GRADE)
+        comment = fields.get("comment", comment)
+        rationales = {cid: fields.get(f"rationale:{cid}", text)
+                      for cid, text in rationales.items()}
+        spend += float(edited.get("cost_usd") or 0.0)
+
     _item(progress, label, "scored", f"{total} pts", finished=True)
     out = {
         **base,
@@ -898,6 +917,7 @@ def grade_one(cfg: Config, assignment: dict, rubric: list[dict], entry: dict,
         "cost_usd": round(spend, 4),
         "model": model,
         "images_sent": len(images),
+        "humanized": edited,
     }
     if grade_written:
         out["quiz_auto_score"] = quiz.get("auto_score")
@@ -977,9 +997,16 @@ def ask_about(cfg: Config, store: Store, course_id, assignment_id, user_id: str,
     result = llm.run("\n".join(lines), model=cfg.model,
                             timeout_s=cfg.claude_timeout_s, system=ASK_SYSTEM,
                             expect_json=False)
+    answer, edited = result.text.strip(), {}
+    if humanize.enabled(cfg):
+        _item(progress, screen, f"{humanize.model_for(cfg)} is editing the answer", "")
+        answer, edited = humanize.humanize_text(answer, cfg, humanize.KIND_ANSWER)
     _item(progress, screen, "done", "", finished=True)
-    return {"answer": result.text.strip(), "cost_usd": result.cost_usd,
-            "model": cfg.model, "asked_at": datetime.now().isoformat(timespec="seconds")}
+    return {"answer": answer,
+            "cost_usd": round(float(result.cost_usd or 0.0)
+                              + float(edited.get("cost_usd") or 0.0), 4),
+            "model": cfg.model, "humanized": edited,
+            "asked_at": datetime.now().isoformat(timespec="seconds")}
 
 
 CLASS_SYSTEM = f"""You are helping a community college instructor read a whole class's
@@ -1120,9 +1147,17 @@ def class_summary(cfg: Config, store: Store, course_id, assignment_id,
                             timeout_s=cfg.claude_timeout_s, system=CLASS_SYSTEM,
                             expect_json=False)
 
+    text = result.text.strip()
+    # The second pass runs while the tags are still in place, so the editor
+    # never sees a name either. A pass that fails keeps the words as written.
+    edited: dict = {}
+    if humanize.enabled(cfg):
+        _item(progress, "class summary",
+              f"{humanize.model_for(cfg)} is editing the summary", "")
+        text, edited = humanize.humanize_text(text, cfg, humanize.KIND_SUMMARY)
+
     # Claude only ever saw pseudonyms. The instructor reading this wants names,
     # and the map is local, so swap them back here on the way out.
-    text = result.text.strip()
     if cfg.pseudonymize:
         for uid, info in extracted.items():
             tag, name = info.get("pseudonym"), info.get("name")
@@ -1139,8 +1174,10 @@ def class_summary(cfg: Config, store: Store, course_id, assignment_id,
         "model": cfg.model,
         "n": len(pool),
         "include_missing": include_missing,
-        "cost_usd": result.cost_usd,
+        "cost_usd": round(float(result.cost_usd or 0.0)
+                          + float(edited.get("cost_usd") or 0.0), 4),
         "scope": "selection" if picked else "class",
+        "humanized": edited,
     }
     _item(progress, "class summary", "done", "", finished=True)
     draft = store.draft(course_id, assignment_id)
@@ -1438,6 +1475,25 @@ def overlap_check(cfg: Config, store: Store, course_id, assignment_id,
                        "the evidence either way.")
         out["parse_error"] = result.parse_error
 
+    # The second pass, while the tags are still in place. Every quoted passage
+    # is evidence and the editor is told to keep it verbatim; humanize.py
+    # checks that it did and keeps the original reading otherwise.
+    if data and humanize.enabled(cfg):
+        _item(progress, "overlap check",
+              f"{humanize.model_for(cfg)} is editing the read", "")
+        fields = {"note": out["read"]}
+        for index, pair in enumerate(notable, start=1):
+            fields[f"pair:{index}:what_i_see"] = pair.get("what_i_see") or ""
+            fields[f"pair:{index}:innocent_explanation"] = (
+                pair.get("innocent_explanation") or "")
+        fields, edited = humanize.humanize_fields(fields, cfg, humanize.KIND_OVERLAP)
+        out["read"] = fields.get("note", out["read"])
+        for index, pair in enumerate(notable, start=1):
+            for field in ("what_i_see", "innocent_explanation"):
+                pair[field] = fields.get(f"pair:{index}:{field}", pair[field])
+        out["humanized"] = edited
+        out["cost_usd"] = round(out["cost_usd"] + float(edited.get("cost_usd") or 0.0), 4)
+
     if cfg.pseudonymize:
         # The model only ever saw S-0xx. Put the names back for the instructor.
         for pair in notable:
@@ -1669,6 +1725,31 @@ def teaching_read(cfg: Config, store: Store, course_id, assignment_id,
         out["parse_error"] = result.parse_error
         out["headline"] = ("Claude's reading could not be parsed. The measured "
                            "numbers and the student quotes below are unaffected.")
+
+    # The second pass, while the tags are still in place. Numbers and quotes
+    # in the evidence are checked after the rewrite; a field that lost one
+    # keeps its original wording.
+    if data and humanize.enabled(cfg):
+        progress(f"{humanize.model_for(cfg)} is editing the teaching read")
+        fields = {"headline": out["headline"], "worked": out["worked"],
+                  "watch_next_time": out["watch_next_time"]}
+        for i, item in enumerate(out["reteach"]):
+            for k in ("what", "evidence", "action"):
+                fields[f"reteach:{i}:{k}"] = item[k]
+        for i, item in enumerate(out["assignment_fixes"]):
+            for k in ("what", "why"):
+                fields[f"fix:{i}:{k}"] = item[k]
+        fields, edited = humanize.humanize_fields(fields, cfg, humanize.KIND_TEACHING)
+        for k in ("headline", "worked", "watch_next_time"):
+            out[k] = fields.get(k, out[k])
+        for i, item in enumerate(out["reteach"]):
+            for k in ("what", "evidence", "action"):
+                item[k] = fields.get(f"reteach:{i}:{k}", item[k])
+        for i, item in enumerate(out["assignment_fixes"]):
+            for k in ("what", "why"):
+                item[k] = fields.get(f"fix:{i}:{k}", item[k])
+        out["humanized"] = edited
+        out["cost_usd"] = round(out["cost_usd"] + float(edited.get("cost_usd") or 0.0), 4)
 
     if cfg.pseudonymize:
         # The model saw pseudonyms in the grading notes; put names back.

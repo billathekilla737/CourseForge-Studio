@@ -110,6 +110,15 @@ def distribution(percents: list[float], scale: dict | None = None) -> list[dict]
 
 
 # ------------------------------------------------------------------- totals
+def whole_points(value: float) -> int:
+    """Nearest whole point. A half rounds up, which is how a gradebook does it.
+
+    A number the instructor or Canvas already typed with a decimal is left
+    alone by the caller. This is only for a score this app worked out.
+    """
+    return int(math.floor(float(value) + 0.5))
+
+
 def criterion_max(rubric: list[dict], cid: str) -> float:
     for crit in rubric:
         if str(crit.get("id")) == str(cid):
@@ -159,7 +168,11 @@ def final_total(entry: dict, rubric: list[dict], possible: float | None = None) 
     total = max(0.0, total - latepolicy.deduction(entry, earned))
     if possible:
         total = min(total, float(possible))
-    return round(total, 2)
+    # A grade pulled straight from the gradebook keeps its decimal. Anything
+    # this app graded or curved becomes a whole number.
+    if entry.get("total_only") and not curve:
+        return round(total, 2)
+    return float(whole_points(total))
 
 
 def _stats(values: list[float], possible: float, scale: dict | None) -> dict:
@@ -256,6 +269,9 @@ def plan(kind: str, *, rubric: list[dict], entries: dict, possible: float,
         raw = _curved(kind, before, top, amount=amount, target=target,
                       group_max=group_max, group_mean=group_mean)
         after = min(max(raw, before), top)      # never lower, never above max
+        after = float(whole_points(after))
+        if after < before:
+            after = before
         if raw < before:
             lowered += 1
         if raw > top:

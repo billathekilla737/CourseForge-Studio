@@ -93,6 +93,14 @@ class EditStudentKeepsTheCurvedTotalInStep(unittest.TestCase):
 
 
 class ATypedCanvasTotalKeepsItsCurve(unittest.TestCase):
+    def test_a_worked_out_grade_is_a_whole_number(self):
+        earned = {"total": 10, "scores": {"c1": 10}, "curve": {"flat": 3.6}}
+        self.assertEqual(curve.final_total(earned, [{"id": "c1", "points": 20}], 20), 14)
+        half = {"total": 10.5, "scores": {"c1": 10.5}}
+        self.assertEqual(curve.final_total(half, [{"id": "c1", "points": 20}], 20), 11)
+        typed = {"total": 85.5, "total_only": True, "scores": {}}
+        self.assertEqual(curve.final_total(typed, [{"id": "c1", "points": 100}], 100), 85.5)
+
     def test_final_total_does_not_sum_empty_rubric_cells(self):
         entry = {"total": 85, "total_only": True, "scores": {},
                  "curve": {"flat": 5, "by_criterion": {}}}
@@ -316,7 +324,7 @@ class GradeJsKeepsToTheContract(unittest.TestCase):
         # Bulk bar and context menu share one action list, so a new verb cannot
         # land on shift-click and be missing from right-click (or the reverse).
         self.assertIn("selectionItems(st)", self.src)
-        self.assertIn("js/grade.js?v=tograde-2",
+        self.assertIn("js/grade.js?v=pdf-1",
                       (WEB / "index.html").read_text(encoding="utf-8"))
         self.assertIn('step="1"', self.src)
         self.assertNotIn("data-tiers", self.src)
@@ -367,6 +375,36 @@ class GradeJsKeepsToTheContract(unittest.TestCase):
         self.assertIn("How it will read", self.src)
         self.assertIn("paperFrame canvasPage", self.src)
         self.assertIn("id=\"anPreview\"", self.src)
+
+    def test_a_word_file_is_drawn_instead_of_flattened(self):
+        """The work pane used to dump docx_to_text into one prose block, which
+        threw away headings, tables, pictures and charts."""
+        body = self.src[self.src.index("function renderWork("):
+                        self.src.index("/* ----------------------------------------------------------------- events */")]
+        self.assertIn("function docxCard(", self.src)
+        self.assertIn("docxCard(p, reused)", body)
+        self.assertIn("DocxView.take", body)
+        self.assertLess(body.index("DocxView.take"), body.index("host.innerHTML"))
+        self.assertIn('class="docxHost"', self.src)
+        self.assertIn("Text only", self.src)
+        self.assertIn("wireDocx(host)", body)
+        page = (WEB / "index.html").read_text(encoding="utf-8")
+        self.assertIn("js/docview.js?v=docx-1", page)
+        self.assertIn("js/pdfview.js?v=pdf-1", page)
+        self.assertIn("style.css?v=pdf-1", page)
+        self.assertIn("function pdfCard(", self.src)
+        self.assertIn("pdfCard(p, url, reused)", body)
+        self.assertIn("PdfView.take", body)
+        self.assertLess(body.index("PdfView.take"), body.index("host.innerHTML"))
+        self.assertIn('class="pdfHost"', self.src)
+        pdf = (WEB / "js" / "pdfview.js").read_text(encoding="utf-8")
+        self.assertIn("enableScripting: false", pdf)
+        self.assertNotIn("cdn", pdf.lower())
+        self.assertNotIn("mozilla.github.io", pdf)
+        viewer = (WEB / "js" / "docview.js").read_text(encoding="utf-8")
+        self.assertIn("useGoogleFonts: false", viewer)
+        self.assertNotIn("useGoogleFonts: true", viewer)
+        self.assertIn("DocxScrollViewer", viewer)
 
     def test_the_work_pane_close_is_not_an_inline_handler(self):
         """Inline onclick is blocked by the page policy, so Close did nothing

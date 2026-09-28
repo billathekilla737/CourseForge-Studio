@@ -839,7 +839,7 @@ def grade_one(cfg: Config, assignment: dict, rubric: list[dict], entry: dict,
             points = float(item.get("points"))
         except (TypeError, ValueError):
             continue                # no number came back; counted as missing below
-        scores[cid] = max(0.0, min(points, crit["points"]))
+        scores[cid] = float(curve.whole_points(max(0.0, min(points, crit["points"]))))
         rationales[cid] = str(item.get("rationale") or "")
 
     # A criterion the reply never scored used to land on 0 with nothing said
@@ -866,7 +866,7 @@ def grade_one(cfg: Config, assignment: dict, rubric: list[dict], entry: dict,
         reason = reason or (f"Claude returned no score for: {names}. "
                             "Those are showing 0 but were never actually graded.")
 
-    total = round(sum(scores.values()), 2)
+    total = float(curve.whole_points(sum(scores.values())))
     comment = str(data.get("comment") or "")
     # Full marks are told nothing. With no points to account for, a comment has
     # to find something to improve, and what it reaches for is whatever the
@@ -880,7 +880,7 @@ def grade_one(cfg: Config, assignment: dict, rubric: list[dict], entry: dict,
         folded = quizgrade.fold_auto(
             {"scores": scores, "total": total, "flags": flags}, quiz)
         scores = folded["scores"]
-        total = folded["total"]
+        total = float(curve.whole_points(folded["total"]))
         flags = folded["flags"]
 
     _item(progress, label, "scored", f"{total} pts", finished=True)

@@ -1,0 +1,4 @@
+pdfjs-dist 6.3.289
+https://github.com/mozilla/pdf.js
+Apache-2.0
+Rendering only. PDF JavaScript is not enabled.

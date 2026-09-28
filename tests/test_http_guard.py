@@ -44,6 +44,26 @@ class HostAndKeyHelpers(unittest.TestCase):
         self.assertEqual(ctype, "application/octet-stream")
         self.assertTrue(attach)
 
+    def test_a_page_image_stays_inside_the_files_folder(self):
+        """Scanned PDF pages live in <stem>-pages/. A .. segment must not
+        walk out of that folder, and a random subfolder is not a page."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            folder = root / "essay-pages"
+            folder.mkdir()
+            page = folder / "page-1.png"
+            page.write_bytes(b"\x89PNG")
+            (root / "pic.png").write_bytes(b"\x89PNG")
+            self.assertEqual(server.submission_file(root, "pic.png"),
+                             (root / "pic.png").resolve())
+            self.assertEqual(server.submission_file(root, "essay-pages/page-1.png"),
+                             page.resolve())
+            self.assertIsNone(server.submission_file(root, "essay-pages/../pic.png"))
+            self.assertIsNone(server.submission_file(root, "../pic.png"))
+            (folder / "notes.html").write_text("<script>x</script>", encoding="utf-8")
+            self.assertIsNone(server.submission_file(root, "other/page-1.png"))
+            self.assertIsNone(server.submission_file(root, "essay-pages/notes.html"))
+
     def test_set_settings_allow_list_stays_narrow(self):
         src = inspect.getsource(server.App.set_settings)
         self.assertIn(
@@ -91,6 +111,9 @@ class LiveApiGuard(unittest.TestCase):
         files.mkdir(parents=True, exist_ok=True)
         (files / "x.html").write_text("<script>alert(1)</script>", encoding="utf-8")
         (files / "pic.png").write_bytes(b"\x89PNG\r\n\x1a\n")
+        page = files / "essay-pages"
+        page.mkdir()
+        (page / "page-1.png").write_bytes(b"\x89PNG\r\n\x1a\n")
 
     def _call(self, method, path, headers=None, body=None):
         conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
@@ -131,7 +154,13 @@ class LiveApiGuard(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertIn(b"CourseForge Studio", raw)
         self.assertEqual(headers.get("x-content-type-options"), "nosniff")
-        self.assertIn("default-src 'self'", headers.get("content-security-policy", ""))
+        policy = headers.get("content-security-policy", "")
+        self.assertIn("default-src 'self'", policy)
+        # The Word viewer compiles a parser in the page. That is not permission
+        # to eval script, and the worker that parses the file stays local.
+        self.assertIn("'wasm-unsafe-eval'", policy)
+        self.assertIn("worker-src 'self' blob: data:", policy)
+        self.assertNotIn("unsafe-eval", policy.replace("'wasm-unsafe-eval'", ""))
 
     def test_html_file_is_attachment_octet_stream(self):
         status, headers, raw = self._call("GET", "/api/a/1/2/file?name=x.html", {
@@ -142,6 +171,19 @@ class LiveApiGuard(unittest.TestCase):
         self.assertIn("attachment", headers.get("content-disposition", ""))
         self.assertEqual(headers.get("x-content-type-options"), "nosniff")
         self.assertIn(b"<script>", raw)
+
+    def test_a_rendered_pdf_page_is_inline(self):
+        status, headers, _ = self._call(
+            "GET", "/api/a/1/2/file?name=essay-pages/page-1.png", {
+                "Cookie": f"{server.STUDIO_COOKIE}={self.key}",
+            })
+        self.assertEqual(status, 200)
+        self.assertEqual(headers.get("content-type"), "image/png")
+        status, _, _ = self._call(
+            "GET", "/api/a/1/2/file?name=essay-pages/../pic.png", {
+                "X-Studio-Key": self.key,
+            })
+        self.assertEqual(status, 404)
 
     def test_png_is_inline(self):
         status, headers, _ = self._call("GET", "/api/a/1/2/file?name=pic.png", {

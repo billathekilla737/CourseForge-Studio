@@ -61,6 +61,39 @@ def student_file_response(name: str, download: bool = False) -> tuple[str, bool]
     return "application/octet-stream", True
 
 
+_PAGE_DIR = re.compile(r"^[A-Za-z0-9._-]{1,160}-(?:pages|media)$")
+_PAGE_FILE = re.compile(r"^[A-Za-z0-9._-]{1,120}$")
+
+
+def submission_file(files_dir: Path, raw: str) -> Path | None:
+    """A file under an assignment's files folder, or None.
+
+    The usual name is one segment. A rendered PDF page or a picture pulled out
+    of a Word file lives one folder down, named ``<stem>-pages`` or
+    ``<stem>-media``. Anything else, including ``..``, is refused.
+    """
+    text = (raw or "").replace("\\", "/").strip().strip("/")
+    if not text or "\x00" in text:
+        return None
+    parts = text.split("/")
+    if any(part in ("", ".", "..") for part in parts):
+        return None
+    if len(parts) == 1:
+        if not _PAGE_FILE.match(parts[0]):
+            return None
+    elif (len(parts) == 2 and _PAGE_DIR.match(parts[0])
+            and _PAGE_FILE.match(parts[1])
+            and Path(parts[1]).suffix.lower() in INLINE_STUDENT_TYPES):
+        pass
+    else:
+        return None
+    root = Path(files_dir).resolve()
+    target = root.joinpath(*parts).resolve()
+    if target != root and root not in target.parents:
+        return None
+    return target if target.is_file() else None
+
+
 def keys_match(got: str, expected: str) -> bool:
     if not got or not expected:
         return False
@@ -3129,10 +3162,15 @@ def make_handler(app: App):
             self.send_header("Referrer-Policy", "no-referrer")
             nonce = getattr(self, "_csp_nonce", "")
             script = f"'self' 'nonce-{nonce}'" if nonce else "'self'"
+            # wasm-unsafe-eval lets the local Word viewer compile its parser.
+            # It does not allow eval of script. The viewer draws .docx pages in
+            # the browser; the file is not sent anywhere.
             self.send_header(
                 "Content-Security-Policy",
                 "default-src 'self'; img-src 'self' blob: data:; "
-                "media-src 'self' blob:; script-src %s; style-src 'self' "
+                "media-src 'self' blob:; font-src 'self' data:; "
+                "script-src %s 'wasm-unsafe-eval'; "
+                "worker-src 'self' blob: data:; style-src 'self' "
                 "'unsafe-inline'; connect-src 'self'; frame-ancestors 'none'; "
                 "base-uri 'none'; form-action 'self'" % script)
             super().end_headers()
@@ -3220,12 +3258,14 @@ def make_handler(app: App):
 
                 # /api/a/<cid>/<aid>/file?name=...
                 if len(parts) == 5 and parts[1] == "a" and parts[4] == "file":
-                    name = os.path.basename(query.get("name", [""])[0])
-                    target = app.store.assignment_dir(parts[2], parts[3]) / "files" / name
-                    if not name or not target.is_file():
+                    raw_name = query.get("name", [""])[0]
+                    target = submission_file(
+                        app.store.assignment_dir(parts[2], parts[3]) / "files",
+                        raw_name)
+                    if target is None:
                         return self._json({"error": "not found"}, 404)
                     want_dl = query.get("dl", ["0"])[0] in ("1", "true")
-                    ctype, as_attachment = student_file_response(name, want_dl)
+                    ctype, as_attachment = student_file_response(target.name, want_dl)
                     return self._send_file(target, ctype, download=as_attachment)
                 return self._json({"error": "unknown endpoint"}, 404)
             except confirm.ConfirmRequired as exc:

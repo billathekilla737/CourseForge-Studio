@@ -3893,12 +3893,23 @@ function lateOff(e) {
   if (!lp || !lp.applied) return 0;
   return +(lp.points || 0);
 }
+function wholePoints(n) {
+  const x = Number(n);
+  if (!isFinite(x)) return n;
+  return Math.floor(x + 0.5);
+}
 function finalOf(e) {
   if (!isScored(e)) return null;
-  if (e.final_total != null) return e.final_total;
-  const earned = e.total;
-  const off = lateOff(e);
-  return off ? Math.round((earned - off) * 100) / 100 : earned;
+  let value;
+  if (e.final_total != null) value = +e.final_total;
+  else {
+    const off = lateOff(e);
+    value = off ? (+e.total - off) : +e.total;
+  }
+  const curved = e.curve && (e.curve.flat || (e.curve.by_criterion
+    && Object.keys(e.curve.by_criterion).length));
+  if (e.total_only && !curved) return value;
+  return wholePoints(value);
 }
 function earnedOf(e) { return isScored(e) ? e.total : null; }
 function scoreAdjustNote(e, earned, bump) {
@@ -4549,6 +4560,8 @@ function renderInsights() {
     host.innerHTML = `<div class="who"><h2>Insights</h2></div>
       <p style="color:var(--muted);max-width:60ch">Nothing is graded yet. Run
       <b>Auto-grade all</b>, or score a few students by hand, and the charts will fill in.</p>`;
+    disposeDocx();
+    disposePdf();
     $('#workPane').innerHTML = '';
     return;
   }
@@ -4632,6 +4645,8 @@ function renderInsights() {
     </figure>`;
 
   host.scrollTop = 0;
+  disposeDocx();
+  disposePdf();
   $('#workPane').innerHTML = '';
   const scopeBtn = $('#scopeAll');
   if (scopeBtn) scopeBtn.onclick = () => { S.insightsScope = 'class'; render(); };
@@ -4698,6 +4713,8 @@ function renderDetail() {
       <h2 style="margin-top:0">${esc(S.assignment.name || '')}</h2>
       <p style="color:var(--muted);max-width:60ch">Nothing has been pulled from Canvas for this assignment yet.
       Hit <b>Sync from Canvas</b> to download submissions and extract their text, then <b>Auto-grade all</b>.</p></div>`;
+    disposeDocx();
+    disposePdf();
     $('#workPane').innerHTML = '';
     return;
   }
@@ -5064,6 +5081,19 @@ function fileUrl(name) {
   return `/api/a/${S.ids.courseId}/${S.ids.assignmentId}/file?name=${encodeURIComponent(name)}`;
 }
 
+/* Pictures pulled out of a Word file, and pages of a scanned PDF, sit one
+   folder under files/. The name has to keep that folder or the picture 404s. */
+function fileRel(path) {
+  const norm = String(path || '').replace(/\\/g, '/');
+  const mark = '/files/';
+  const at = norm.toLowerCase().lastIndexOf(mark);
+  if (at >= 0) {
+    const rel = norm.slice(at + mark.length);
+    if (rel && !rel.includes('..') && rel.split('/').length <= 2) return rel;
+  }
+  return norm.split('/').pop() || '';
+}
+
 const CHIPS = [
   ['objects', 'objects', v => v > 0],
   ['faces', 'faces', v => v > 0],
@@ -5287,6 +5317,190 @@ function localWrittenNote(q, e) {
     + (why ? `<br>${esc(why)}` : '') + '</div>';
 }
 
+/* The extracted text is one flat string, which is what grading reads. It drops
+   headings, tables, text boxes, pictures and charts. A .docx is drawn from
+   the file itself; the flat string stays behind "Text only". */
+function isDocxPart(p) {
+  return !!(p && p.path && /\.docx$/i.test(p.path) && p.kind !== 'error');
+}
+
+function docxStem(p) {
+  const base = (p.path || '').split(/[\\/]/).pop() || '';
+  return base.replace(/\.docx$/i, '');
+}
+
+function docxUrl(p) {
+  return fileUrl((p.path || '').split(/[\\/]/).pop() || '');
+}
+
+function docxMediaStem(p, stems) {
+  if (!p || p.kind !== 'image' || !p.path) return '';
+  const path = String(p.path).replace(/\\/g, '/');
+  for (const stem of stems) {
+    if (stem && path.includes('/' + stem + '-media/')) return stem;
+  }
+  return '';
+}
+
+let docxWire = 0;
+
+function disposeDocx(keep) {
+  docxWire += 1;
+  if (window.DocxView) window.DocxView.dispose(keep);
+}
+
+function docxCard(p, reused) {
+  const url = docxUrl(p);
+  const stem = docxStem(p);
+  const again = reused && reused.has(url);
+  const plain = (p.text && String(p.text).trim())
+    ? `<details class="docxPlain"><summary>Text only</summary>${renderProse(p.text)}</details>`
+    : '';
+  const mount = again
+    ? `<div class="docxSlot" data-src="${esc(url)}"></div>`
+    : `<div class="docxHost" data-src="${esc(url)}" data-stem="${esc(stem)}"
+         role="region" aria-label="Word document" aria-busy="true"></div>
+       <p class="docxStatus">Opening the document…</p>`;
+  return `<div class="workSec docxCard"><h4>${esc(p.label)}
+      <span class="wc">Word document</span></h4>
+    ${mount}
+    <div class="docxBar"><a class="btn sm" href="${esc(url)}&amp;dl=1" download>Download</a></div>
+    ${plain}</div>`;
+}
+
+function docxFailed(el) {
+  if (!el.isConnected) return;
+  const status = el.parentElement && el.parentElement.querySelector('.docxStatus');
+  if (status) {
+    status.className = 'callout';
+    status.textContent = 'This Word file could not be drawn. The text below is only the words, not the layout or the figures. Download it to open it in Word.';
+  }
+  const plain = el.parentElement && el.parentElement.querySelector('.docxPlain');
+  if (plain) plain.open = true;
+  el.remove();
+}
+
+function pdfNameOf(p) {
+  if (!p || !p.path || p.kind === 'error') return '';
+  const norm = String(p.path).replace(/\\/g, '/');
+  const base = norm.split('/').pop() || '';
+  if (/\.pdf$/i.test(base)) return base;
+  const folder = norm.match(/\/([^/]+)-pages\/page-\d+\.png$/i);
+  return folder ? folder[1] + '.pdf' : '';
+}
+
+let pdfWire = 0;
+
+function disposePdf(keep) {
+  pdfWire += 1;
+  if (window.PdfView) window.PdfView.dispose(keep);
+}
+
+function pdfCard(p, url, reused) {
+  const again = reused && reused.has(url);
+  const fromFile = /\.pdf$/i.test(String(p.path || ''));
+  let label = p.label;
+  if (!fromFile) {
+    try {
+      label = decodeURIComponent((url.split('name=').pop() || '').split('&')[0]);
+    } catch (_) { label = 'PDF'; }
+  }
+  const plain = (fromFile && p.text && String(p.text).trim())
+    ? `<details class="docxPlain"><summary>Text only</summary>${renderProse(p.text)}</details>`
+    : '';
+  const mount = again
+    ? `<div class="pdfSlot" data-src="${esc(url)}"></div>`
+    : `<div class="pdfHost" data-src="${esc(url)}" role="region"
+         aria-label="PDF" aria-busy="true"></div>
+       <p class="pdfStatus">Opening the document…</p>`;
+  return `<div class="workSec pdfCard"><h4>${esc(label)}
+      <span class="wc">PDF</span></h4>
+    ${mount}
+    <div class="docxBar"><a class="btn sm" href="${esc(url)}&amp;dl=1" download>Download</a></div>
+    ${plain}</div>`;
+}
+
+function pdfFailed(el) {
+  if (!el.isConnected) return;
+  const status = el.parentElement && el.parentElement.querySelector('.pdfStatus');
+  if (status) {
+    status.className = 'callout';
+    status.textContent = 'This PDF could not be drawn. The text below is only the words, not the layout or the figures. Download it to open it.';
+  }
+  const plain = el.parentElement && el.parentElement.querySelector('.docxPlain');
+  if (plain) plain.open = true;
+  const url = el.dataset.src || '';
+  const pane = el.closest('#workPane');
+  if (pane) {
+    pane.querySelectorAll('.pdfPageImg').forEach(node => {
+      if (node.dataset.pdf === url) node.hidden = false;
+    });
+  }
+  el.remove();
+}
+
+function wirePdf(host) {
+  const token = ++pdfWire;
+  host.querySelectorAll('.pdfHost').forEach(el => {
+    if (el.dataset.ready === '1' && el.querySelector('canvas')) return;
+    const url = el.dataset.src;
+    let tries = 0;
+    const run = () => {
+      if (token !== pdfWire || !el.isConnected) return;
+      const V = window.PdfView;
+      if (!V) {
+        if (++tries > 40) { pdfFailed(el); return; }
+        setTimeout(run, 150);
+        return;
+      }
+      V.mount(el, url).then(viewer => {
+        if (token !== pdfWire || !el.isConnected || !viewer) return;
+        const status = el.parentElement && el.parentElement.querySelector('.pdfStatus');
+        if (status) status.remove();
+        host.querySelectorAll('.pdfPageImg').forEach(node => {
+          if (node.dataset.pdf === url) node.remove();
+        });
+      }).catch(() => {
+        if (token !== pdfWire || !el.isConnected) return;
+        pdfFailed(el);
+      });
+    };
+    run();
+  });
+}
+
+function wireDocx(host) {
+  const token = ++docxWire;
+  host.querySelectorAll('.docxHost').forEach(el => {
+    if (el.dataset.ready === '1' && el.querySelector('canvas')) return;
+    const url = el.dataset.src;
+    const stem = el.dataset.stem || '';
+    let tries = 0;
+    const run = () => {
+      if (token !== docxWire || !el.isConnected) return;
+      const V = window.DocxView;
+      if (!V) {
+        if (++tries > 40) { docxFailed(el); return; }
+        setTimeout(run, 150);
+        return;
+      }
+      V.mount(el, url).then(viewer => {
+        if (token !== docxWire || !el.isConnected || !viewer) return;
+        const status = el.parentElement && el.parentElement.querySelector('.docxStatus');
+        if (status) status.remove();
+        host.querySelectorAll('.docxMedia').forEach(node => {
+          if (node.dataset.stem === stem) node.remove();
+        });
+        if (V.relayout) V.relayout(url);
+      }).catch(() => {
+        if (token !== docxWire || !el.isConnected) return;
+        docxFailed(el);
+      });
+    };
+    run();
+  });
+}
+
 function renderWork(s, e) {
   // Free the previous WebGL context before innerHTML orphans its canvas, and
   // drop any auto-load that was queued for the student we just left.
@@ -5296,6 +5510,35 @@ function renderWork(s, e) {
   // innerHTML alone leaves an orphaned <video> downloading in the background,
   // and j/k through the roster would stack up a fetch per student.
   host.querySelectorAll('video').forEach(v => { v.pause(); v.removeAttribute('src'); v.load(); });
+  // Keep a Word document that is already drawn. Rebuilding the pane on every
+  // keystroke would otherwise parse the file again and the pages would flash.
+  const drawDocs = S.showWork
+    && !(s.external_tool && !(s.quiz_review && s.quiz_review.length))
+    && !(s.status === 'unsubmitted' && !(s.quiz_review && s.quiz_review.length));
+  const stemUrl = new Map();
+  const pdfUrls = [];
+  const reused = new Map();
+  if (drawDocs) {
+    (s.parts || []).forEach(p => {
+      if (isDocxPart(p)) stemUrl.set(docxStem(p), docxUrl(p));
+      const pdfName = pdfNameOf(p);
+      if (pdfName && !pdfUrls.includes(fileUrl(pdfName))) pdfUrls.push(fileUrl(pdfName));
+    });
+    if (window.DocxView) {
+      stemUrl.forEach(url => {
+        const el = window.DocxView.take(url);
+        if (el) reused.set(url, el);
+      });
+    }
+    if (window.PdfView) {
+      pdfUrls.forEach(url => {
+        const el = window.PdfView.take(url);
+        if (el) reused.set(url, el);
+      });
+    }
+  }
+  disposeDocx([...stemUrl.values()].filter(url => reused.has(url)));
+  disposePdf(pdfUrls.filter(url => reused.has(url)));
   const meta = [];
   if (s.submitted_at) meta.push('submitted ' + fmtDate(s.submitted_at));
   if (s.late) meta.push(lateText(s).toUpperCase());
@@ -5347,19 +5590,48 @@ function renderWork(s, e) {
         <div style="font:11.5px var(--mono);color:var(--muted);word-break:break-all">
         ${s.filenames.map(f => esc(decodeURIComponent(f))).join('<br>')}</div></div>`;
     }
+    const seenPdf = new Set();
     (s.parts || []).forEach(p => {
       if (s.quiz_review && s.quiz_review.length) {
         const stub = (p.text || '').trim();
         if (stub.indexOf('- user:') === 0 && stub.indexOf('quiz:') >= 0) return;
       }
+      if (isDocxPart(p)) {
+        if (drawDocs) body += docxCard(p, reused);
+        return;
+      }
+      const pdfName = pdfNameOf(p);
+      if (pdfName) {
+        const url = fileUrl(pdfName);
+        const norm = String(p.path || '').replace(/\\/g, '/');
+        const isPdf = /\.pdf$/i.test(norm);
+        if (drawDocs && !seenPdf.has(url)) {
+          seenPdf.add(url);
+          body += pdfCard(p, url, reused);
+        }
+        if (isPdf) return;
+        if (reused.has(url) || !drawDocs) return;
+        const rel = fileRel(p.path);
+        body += `<div class="workSec pdfPageImg" data-pdf="${esc(url)}" hidden><h4>${esc(p.label)}</h4>
+          <img class="workImg" loading="lazy" alt="${esc(p.label)}"
+            src="${esc(fileUrl(rel))}"></div>`;
+        return;
+      }
+      const mediaStem = docxMediaStem(p, stemUrl.keys());
+      if (mediaStem) {
+        if (reused.has(stemUrl.get(mediaStem))) return;
+        body += `<div class="workSec docxMedia" data-stem="${esc(mediaStem)}"><h4>${esc(p.label)}</h4>
+          <img class="workImg" loading="lazy" alt="${esc(p.label)}"
+            src="${esc(fileUrl(fileRel(p.path)))}"></div>`;
+        return;
+      }
       if (p.kind === 'text' && p.text && p.text.trim()) {
         body += `<div class="workSec"><h4>${esc(p.label)} <span class="wc">${p.words} words</span></h4>
           ${renderProse(p.text)}</div>`;
       } else if (p.kind === 'image') {
-        const name = (p.path || '').split(/[\\/]/).pop();
         body += `<div class="workSec"><h4>${esc(p.label)}</h4>
           <img class="workImg" loading="lazy" alt="${esc(p.label)}"
-            src="/api/a/${S.ids.courseId}/${S.ids.assignmentId}/file?name=${encodeURIComponent(name)}"></div>`;
+            src="${esc(fileUrl(fileRel(p.path)))}"></div>`;
       } else if (isVideoPart(p)) {
         body += videoCard(p);
       } else if (p.kind === 'blend') {
@@ -5392,6 +5664,15 @@ function renderWork(s, e) {
     <div class="workBody">${body}</div>`;
   const closeWork = host.querySelector('#btnWorkClose');
   if (closeWork) closeWork.onclick = toggleWork;
+  host.querySelectorAll('.docxSlot, .pdfSlot').forEach(slot => {
+    const url = slot.dataset.src;
+    const el = reused.get(url);
+    if (!el) return;
+    slot.replaceWith(el);
+    if (slot.classList.contains('docxSlot') && window.DocxView) window.DocxView.relayout(url);
+  });
+  wireDocx(host);
+  wirePdf(host);
   wireViewers(host);
   wireVideos(host);
   host.scrollTop = 0;

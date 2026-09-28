@@ -1,0 +1,4 @@
+@silurus/ooxml 0.88.0
+https://github.com/yukiyokotani/office-open-xml-viewer
+MIT
+Docx files only. useGoogleFonts stays off; nothing is fetched off this machine.

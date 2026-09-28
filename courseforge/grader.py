@@ -4,6 +4,7 @@ from __future__ import annotations
 import concurrent.futures
 import json
 import re
+import threading
 from datetime import datetime
 from pathlib import Path
 from typing import Protocol
@@ -20,6 +21,48 @@ from .store import Store
 from .style import HUMANIZE_RULES
 
 MAX_WORK_CHARS = 60_000        # keep one student's work well inside a single turn
+
+# One sync of one assignment at a time. Opening an assignment syncs it, and
+# so does the Re-sync button; the two used to run side by side, one writing a
+# student's Word file while the other read it half-written, recorded it as
+# "not a zip file", and graded that student from the one picture inside it.
+# The second sync now waits for the first and then runs, which is cheap: files
+# already on disk are not fetched again.
+_SYNC_LOCKS: dict[str, threading.Lock] = {}
+_SYNC_LOCKS_GUARD = threading.Lock()
+
+# Attachments a student's work lives in. One of these that could not be read
+# is a reason to stop, not a detail to grade around.
+DOCUMENT_EXT = (".docx", ".doc", ".pptx", ".ppt", ".xlsx", ".xlsm", ".xls", ".pdf",
+                ".odt", ".pages", ".rtf")
+
+
+def sync_lock(course_id, assignment_id) -> threading.Lock:
+    key = f"{course_id}:{assignment_id}"
+    with _SYNC_LOCKS_GUARD:
+        lock = _SYNC_LOCKS.get(key)
+        if lock is None:
+            lock = _SYNC_LOCKS[key] = threading.Lock()
+        return lock
+
+
+def unreadable_documents(entry: dict) -> list[str]:
+    """The attachments in an extracted entry that hold a document but could
+    not be turned into text: their labels, with the reason where one was kept."""
+    out: list[str] = []
+    for part in entry.get("parts") or []:
+        if not isinstance(part, dict) or part.get("kind") not in ("error", "binary"):
+            continue
+        label = str(part.get("label") or "")
+        name = label.split(" (")[0].strip().lower()
+        if name.endswith(DOCUMENT_EXT) or label.startswith("download failed:"):
+            note = str(part.get("note") or "").strip()
+            out.append(f"{label} ({note})" if note else label)
+    if not out:
+        for label in entry.get("unreadable") or []:
+            if str(label).lower().split(" (")[0].strip().endswith(DOCUMENT_EXT):
+                out.append(str(label))
+    return out
 
 
 def _file_name(name: str) -> str:
@@ -208,7 +251,26 @@ def sync_assignment(cfg: Config, client: CanvasClient, store: Store,
 
     `me_id` is this token's Canvas user id, used to tell the instructor's own
     submission comments apart from the students' when a grade is pulled back.
+
+    One sync per assignment at a time (see _SYNC_LOCKS): a second one started
+    while the first is running waits its turn instead of reading files the
+    first is still writing.
     """
+    lock = sync_lock(course_id, assignment_id)
+    if not lock.acquire(blocking=False):
+        progress("another sync of this assignment is running; waiting for it")
+        lock.acquire()
+    try:
+        return _sync_assignment(cfg, client, store, course_id, assignment_id,
+                                progress, me_id)
+    finally:
+        lock.release()
+
+
+def _sync_assignment(cfg: Config, client: CanvasClient, store: Store,
+                     course_id, assignment_id,
+                     progress: Progress = _noop,
+                     me_id: str | int | None = None) -> dict:
     adir = store.assignment_dir(course_id, assignment_id)
 
     progress("fetching assignment")
@@ -272,7 +334,15 @@ def sync_assignment(cfg: Config, client: CanvasClient, store: Store,
             for att in (sub.get("attachments") or []):
                 safe = _file_name(att.get("filename") or "") or "file"
                 dest = adir / "files" / f"{uid}_{safe}"
-                if not dest.exists() and att.get("url"):
+                # A file on disk is trusted only when it is complete. Canvas
+                # says how big it should be; an empty or short copy (a fetch
+                # that died part way) is fetched again, never read as the work.
+                have = dest.stat().st_size if dest.is_file() else 0
+                want = int(att.get("size") or 0)
+                incomplete = dest.is_file() and (have == 0 or (want and have < want))
+                if incomplete:
+                    progress(f"  {safe} on disk is incomplete ({have} of {want} bytes); fetching it again")
+                if (not dest.exists() or incomplete) and att.get("url"):
                     try:
                         client.download(att["url"], dest)
                     except Exception as exc:  # noqa: BLE001
@@ -732,6 +802,32 @@ def grade_one(cfg: Config, assignment: dict, rubric: list[dict], entry: dict,
                                    else reason + " - decide yourself whether it scores zero"),
         }
 
+    # A document the sync could not read is not "no work": it is work the
+    # model cannot see. Grading whatever else was there, typically the one
+    # picture pulled out of the same file, produced a 28 out of 100 with high
+    # confidence and four "missing part" flags for parts that were sitting in
+    # the Word file. So: with little else to read there is no score at all,
+    # only a plain reason; with real text beside the broken file the score is
+    # drafted but held for a person (see below), and the push will not send it.
+    broken = unreadable_documents(entry)
+    if broken and len((entry.get("text") or "").split()) < 40:
+        reason = ("could not read " + "; ".join(broken)
+                  + " - re-sync the assignment, then re-grade this student")
+        _item(progress, label, "skipped", reason[:80], finished=True)
+        return {
+            **base,
+            "source": "auto-skip",
+            "scores": {},
+            "total": None,
+            "unscored_reason": reason,
+            "rationales": {},
+            "comment": "",
+            "flags": ["document could not be read"],
+            "confidence": "low",
+            "needs_human": True,
+            "needs_human_reason": reason,
+        }
+
     quiz = entry.get("quiz") or {}
     grade_written = bool(quiz.get("questions")) and not quiz.get("written_included")
     if grade_written:
@@ -865,6 +961,15 @@ def grade_one(cfg: Config, assignment: dict, rubric: list[dict], entry: dict,
         needs_human = True
         reason = reason or (f"Claude returned no score for: {names}. "
                             "Those are showing 0 but were never actually graded.")
+    if broken:
+        # There was enough other text to draft a score, but part of the work
+        # was never read. The draft stays; the push will not send it until a
+        # person has looked, and the reason says what to do.
+        flags.append("document could not be read")
+        needs_human = True
+        reason = ("Part of this submission could not be read: " + "; ".join(broken)
+                  + ". Re-sync the assignment and re-grade before trusting this score."
+                  + (" " + reason if reason else ""))
 
     total = float(curve.whole_points(sum(scores.values())))
     comment = str(data.get("comment") or "")

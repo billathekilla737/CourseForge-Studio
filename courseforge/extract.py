@@ -11,6 +11,7 @@ from __future__ import annotations
 import html as htmllib
 import re
 import shutil
+import time
 import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -432,7 +433,33 @@ def _prepare_image(path: Path) -> Path:
 
 
 # --------------------------------------------------------------------- file
+ZIP_DOCUMENT_EXT = (".docx", ".pptx", ".xlsx", ".xlsm")
+_TRANSIENT = ("BadZipFile", "EOFError", "PermissionError", "OSError")
+
+
 def extract_file(path: Path, label: str | None = None) -> Extracted:
+    """One file to text, with one retry for a document that was not ready.
+
+    A Word file read while something else was still writing it (another sync,
+    a cloud-sync client, an antivirus scan holding it) comes back "not a zip
+    file" and stays that way in the record, and the student is graded from
+    whatever else was in the submission. Waiting a second and reading again
+    settles that case; a file that is truly broken fails twice and is reported
+    as before.
+    """
+    first = _extract_file_once(path, label)
+    if (first.kind == "error" and path.suffix.lower() in ZIP_DOCUMENT_EXT
+            and first.note.split(":")[0] in _TRANSIENT):
+        time.sleep(1.0)
+        second = _extract_file_once(path, label)
+        if second.kind != "error":
+            return second
+        second.note = second.note + " (read twice, one second apart)"
+        return second
+    return first
+
+
+def _extract_file_once(path: Path, label: str | None = None) -> Extracted:
     label = label or path.name
     ext = path.suffix.lower()
     try:

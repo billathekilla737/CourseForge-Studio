@@ -242,13 +242,33 @@ class Jobs:
         for job_id in stale:
             self._jobs.pop(job_id, None)
 
-    def start(self, kind: str, fn) -> str:
+    def running(self, key: str) -> str | None:
+        """The id of the running job started with this key, if there is one."""
+        if not key:
+            return None
+        with self._lock:
+            for job in self._jobs.values():
+                if job.get("key") == key and job.get("state") == "running":
+                    return job["id"]
+        return None
+
+    def start(self, kind: str, fn, key: str = "") -> str:
+        """Run fn on a thread and return its job id.
+
+        With `key`, a job already running under the same key is returned
+        instead of a second one being started: opening an assignment and
+        pressing Re-sync in the same minute used to run two syncs of it side
+        by side, and the second read files the first was still writing.
+        """
+        existing = self.running(key)
+        if existing:
+            return existing
         job_id = uuid.uuid4().hex[:12]
         now = time.time()
         with self._lock:
             self._sweep(now)
             self._jobs[job_id] = {"id": job_id, "kind": kind, "state": "running",
-                                  "log": [], "items": {}, "updated": now,
+                                  "log": [], "items": {}, "updated": now, "key": key,
                                   "started_at": datetime.now().isoformat(timespec="seconds")}
         sink = JobSink(self, job_id)
 
@@ -3407,8 +3427,11 @@ def make_handler(app: App):
                     cid, aid, action = parts[2], parts[3], parts[4]
 
                     if action == "sync":
+                        # One sync per assignment at a time: a second request
+                        # while one is running joins it (see Jobs.start).
                         job = app.jobs.start("sync", lambda log: grader.sync_assignment(
-                            app.cfg, app.client, app.store, cid, aid, log, me_id=app.me_id))
+                            app.cfg, app.client, app.store, cid, aid, log, me_id=app.me_id),
+                            key=f"sync:{cid}:{aid}")
                         return self._json({"job": job})
 
                     if action == "pull":

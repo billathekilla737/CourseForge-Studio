@@ -176,7 +176,18 @@ class CanvasClient(ContentOps, FilesOps, CourseOps):
         AWS.
         """
         dest.parent.mkdir(parents=True, exist_ok=True)
-        dest.write_bytes(self._fetch_bytes(url, timeout=max(self.timeout, 120)))
+        payload = self._fetch_bytes(url, timeout=max(self.timeout, 120))
+        if not payload:
+            raise RuntimeError("the download was empty")
+        # Written beside the destination and renamed into place, so `dest`
+        # exists only once it is complete. Written straight to `dest`, a second
+        # sync running at the same time saw the file exist, skipped the fetch,
+        # and read the half of it that was on disk: a Word file that opened
+        # fine a moment later was recorded as "not a zip file" and graded from
+        # its one picture.
+        part = dest.with_name(dest.name + ".part")
+        part.write_bytes(payload)
+        part.replace(dest)
         return dest
 
     # --------------------------------------------------------------- reading

@@ -342,6 +342,18 @@ Claude returns strict JSON: per-criterion points and rationale, a comment, flags
 a confidence level, and a `needs_human` boolean. Anything unparseable is recorded
 as an error against that student rather than silently scored.
 
+A document that could not be read is never graded from what was left. If a
+Word, PowerPoint, Excel or PDF attachment fails to open, and there is little
+else to read, the student gets no score and a reason ("could not read
+MDA_Teardown.docx ... re-sync the assignment, then re-grade"); if there is
+real text beside the broken file, a score is drafted but held for review, and
+the push will not send it. Behind that, the sync writes each download beside
+its destination and renames it into place, fetches again any copy that is
+empty or shorter than Canvas says, reads a document twice a second apart
+before calling it unreadable, and runs one sync per assignment at a time.
+Each of those exists because a Word file read while another sync was still
+writing it was once scored from the single picture inside it.
+
 The rationale is written for you, one per criterion. The comment is written to the
 student and is capped at two sentences and 45 words: what cost the points, and the
 one thing to do differently. No opening praise, no recap of what they submitted, no

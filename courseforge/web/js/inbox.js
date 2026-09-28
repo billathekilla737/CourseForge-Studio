@@ -122,8 +122,8 @@
     watchKeys();
     inboxChip();
     if (threadId) openThread(threadId);
-    else $('#ibPane').appendChild(emptyState('Pick a thread on the left. Reading one '
-      + 'never marks it read in Canvas.'));
+    else $('#ibPane').appendChild(emptyState('Pick a thread on the left. Opening one '
+      + 'marks it read.'));
   }
 
   function drawList() {
@@ -294,7 +294,19 @@
       return;
     }
     if (String(mem().open) !== String(id)) return;
+    markLocalRead(id);
     drawThread(t);
+  }
+
+  function markLocalRead(id) {
+    const row = mem().threads.find(t => String(t.id) === String(id));
+    if (row) row.unread = false;
+    const n = mem().threads.filter(t => t.unread).length;
+    const hint = $('#ibHint');
+    if (hint) hint.textContent = `${mem().threads.length} thread${
+      mem().threads.length === 1 ? '' : 's'}` + (n ? ` · ${n} unread` : '');
+    drawList();
+    if (typeof inboxChip === 'function') inboxChip();
   }
 
   /* The name in the thread heading opens that student's page. The course is

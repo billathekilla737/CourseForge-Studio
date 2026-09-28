@@ -40,6 +40,7 @@ class FakeClient:
     def __init__(self):
         self.sent = []
         self.marked = []
+        self.states = []
 
     def conversations(self, scope="", course_id=None, limit=50):
         return [THREAD]
@@ -47,6 +48,10 @@ class FakeClient:
     def conversation(self, cid, mark_read=False):
         self.marked.append(mark_read)
         return THREAD
+
+    def set_conversation_state(self, cid, state):
+        self.states.append((str(cid), state))
+        return {"id": cid, "workflow_state": state}
 
     def reply_to_conversation(self, cid, body, recipients=None):
         self.sent.append((str(cid), body))
@@ -297,16 +302,15 @@ class OneTagPerPerson(Base):
 
 
 class ReadingChangesNothing(Base):
-    def test_opening_a_thread_does_not_mark_it_read(self):
-        """Skimming is not answering, and Canvas clearing the unread flag would
-        take away the only mark the instructor had."""
+    def test_opening_a_thread_marks_it_read(self):
         inbox.thread(self.app, 77)
-        self.assertEqual(self.app.client.marked, [False])
+        self.assertEqual(self.app.client.marked, [True])
 
-    def test_the_listing_says_what_it_will_not_do(self):
+    def test_the_listing_does_not_mark_the_inbox_read(self):
         out = inbox.listing(self.app)
-        self.assertIn("Nothing here is marked read", out["note"])
+        self.assertIn("Opening a thread marks it read", out["note"])
         self.assertEqual(out["unread"], 1)
+        self.assertEqual(self.app.client.marked, [])
 
 
 class SendingTakesTwo(Base):
@@ -314,6 +318,7 @@ class SendingTakesTwo(Base):
         with self.assertRaises(PermissionError):
             inbox.send_reply(self.app, 77, "Send me what you have.")
         self.assertEqual(self.app.client.sent, [], "it sent on the first pass")
+        self.assertEqual(self.app.client.states, [])
 
     def test_the_sentence_names_the_student_and_the_thread(self):
         try:
@@ -328,6 +333,7 @@ class SendingTakesTwo(Base):
         out = inbox.send_reply(self.app, 77, "Send me what you have.", confirm_token="t")
         self.assertEqual(len(self.app.client.sent), 1)
         self.assertEqual(out["sent_to"], ["Jordan Alvarez"])
+        self.assertEqual(self.app.client.states, [("77", "read")])
 
     def test_a_tag_left_in_the_box_becomes_a_name_before_it_goes(self):
         """The student must never receive "Student-1"."""

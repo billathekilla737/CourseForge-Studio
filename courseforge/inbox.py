@@ -4,9 +4,7 @@ Three things happen here and they are worth keeping apart.
 
 **Reading** is a Canvas call on the grading-scoped client, because
 `/conversations` is student data and `canvas_policy` refuses it to everything
-else. Nothing is marked read: somebody skimming this screen has not answered
-anybody, and clearing the unread flag on their behalf would take away the only
-mark they had.
+else. Opening one thread marks that thread read. The list itself does not.
 
 **Thinking** happens with the names taken out. A student's message goes to
 Claude as `Student-14 wrote`, and the body is scrubbed of names, emails, ids
@@ -414,8 +412,8 @@ def listing(app, scope: str = "", course_id=None, limit: int = 40) -> dict:
         "course_id": str(course_id) if course_id else None,
         "threads": threads,
         "unread": sum(1 for t in threads if t["unread"]),
-        "note": "Read only. Nothing here is marked read, and no reply is sent "
-                "until you press Send on it.",
+        "note": "Opening a thread marks it read. Nothing is sent until you "
+                "press Send on a reply.",
     }
 
 
@@ -425,7 +423,7 @@ def canvas_base(app) -> str:
 
 
 def thread(app, conversation_id) -> dict:
-    row = app.client.conversation(conversation_id, mark_read=False)
+    row = app.client.conversation(conversation_id, mark_read=True)
     t = Thread(app, row, app.me_id)
     out = t.view()
     out["transcript"] = t.transcript(row, mask=False, base=canvas_base(app))
@@ -636,6 +634,10 @@ def send_reply(app, conversation_id, body: str, confirm_token: str | None = None
         count=1, course_id=t.course_id or "",
         detail={"conversation_id": str(conversation_id), "body": final[:2000]})
     log("sent")
+    try:
+        app.client.set_conversation_state(conversation_id, "read")
+    except Exception as exc:  # noqa: BLE001
+        log("sent, but the unread mark could not be cleared (%s)" % exc)
     return {"ok": True, "conversation_id": str(conversation_id),
             "sent_to": [p["name"] or p["tag"] for p in out_people(t)],
             "body": final, "canvas": out}

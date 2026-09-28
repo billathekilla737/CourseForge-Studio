@@ -603,9 +603,8 @@ class CanvasClient(ContentOps, FilesOps, CourseOps):
     def conversation(self, conversation_id: int | str, mark_read: bool = False) -> dict:
         """One thread with its messages.
 
-        Reading does not mark it read unless asked. Somebody skimming this
-        screen has not answered the student, and Canvas quietly clearing the
-        unread flag would take away the only mark they had.
+        Opening a thread asks Canvas to mark it read. A reply does the same
+        afterwards, because sending does not clear the flag on its own.
         """
         return self.get(f"/conversations/{conversation_id}",
                         auto_mark_as_read=("true" if mark_read else "false"))

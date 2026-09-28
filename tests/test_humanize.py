@@ -49,13 +49,32 @@ class Cfg:
     humanize_update_s = 86400
 
 
+MISSING = Path(tempfile.gettempdir()) / "cf-humanizer-missing" / "SKILL.md"
+
+
+def only_the_bundled_copy(test: unittest.TestCase) -> None:
+    """Point the per-user and installed lookups at nothing, so a test reads the
+    same brief on every machine regardless of what that machine holds."""
+    test.addCleanup(setattr, humanize, "AUTO", humanize.AUTO)
+    test.addCleanup(setattr, humanize, "INSTALLED", humanize.INSTALLED)
+    humanize.AUTO = MISSING
+    humanize.INSTALLED = MISSING
+
+
 class TheBriefIsFound(unittest.TestCase):
     def test_a_brief_exists_and_carries_a_version(self):
         src = humanize.skill_source(Cfg())
         self.assertTrue(src["ok"], src)
-        self.assertIn(src["kind"], ("installed", "bundled"))
+        self.assertIn(src["kind"], ("auto", "installed", "bundled"))
         self.assertRegex(src["version"], r"^\d+\.\d+")
         self.assertIn("humanizer", src["label"].lower())
+
+    def test_with_nothing_else_on_the_pc_the_bundled_copy_serves(self):
+        only_the_bundled_copy(self)
+        src = humanize.skill_source(Cfg())
+        self.assertEqual(src["kind"], "bundled")
+        self.assertEqual(src["path"], str(humanize.BUNDLED))
+        self.assertIn("bundled", src["label"])
 
     def test_the_frontmatter_is_stripped_and_the_rules_are_there(self):
         body = humanize.skill_text(Cfg())
@@ -75,28 +94,21 @@ class TheBriefIsFound(unittest.TestCase):
         self.assertRegex(version, r"^\d+\.\d+")
         self.assertIn("# Humanizer", body)
 
-    def test_the_bundled_copy_does_not_drift_from_the_installed_skill(self):
-        if not humanize.INSTALLED.is_file():
-            self.skipTest("no installed /humanizer skill on this machine")
-        installed, _ = humanize._split_frontmatter(
-            humanize.INSTALLED.read_text(encoding="utf-8-sig"))
-        bundled, _ = humanize._split_frontmatter(
-            humanize.BUNDLED.read_text(encoding="utf-8-sig"))
-        self.assertEqual(installed, bundled,
-                         "re-copy ~/.claude/skills/humanizer/SKILL.md to "
-                         "courseforge/knowledge/humanizer.md")
-
     def test_a_configured_path_wins(self):
         class C(Cfg):
             humanize_skill_path = str(humanize.BUNDLED)
         self.assertEqual(humanize.skill_source(C())["kind"], "configured")
 
     def test_the_doctor_row_says_which_brief(self):
+        only_the_bundled_copy(self)
         row = humanize.doctor(Cfg())
         self.assertTrue(row["enabled"])
         self.assertTrue(row["ok"])
+        self.assertTrue(row["auto_update"])
         self.assertEqual(row["model"], "sonnet")
+        self.assertEqual(row["kind"], "bundled")
         self.assertIn("humanizer", row["label"].lower())
+        self.assertIsInstance(row["state"], dict)
 
 
 class OneCallCarriesEveryField(unittest.TestCase):

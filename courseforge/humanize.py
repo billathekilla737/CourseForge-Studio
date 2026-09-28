@@ -222,10 +222,10 @@ def _describe(kind: str, path: Path) -> dict | None:
     except OSError:
         return None
     tag = f" v{version}" if version else ""
-    label = {"configured": f"the pinned file {path}{tag}",
-             "auto": f"the copy the Studio keeps current from GitHub{tag}",
+    label = {"configured": f"the pinned humanizer file {path}{tag}",
+             "auto": f"the humanizer copy the Studio keeps current from GitHub{tag}",
              "installed": f"your installed /humanizer skill{tag}",
-             "bundled": f"the copy bundled with the Studio{tag}"}[kind]
+             "bundled": f"the humanizer copy bundled with the Studio{tag}"}[kind]
     return {"path": str(path), "kind": kind, "version": version,
             "label": label, "ok": True, "mtime": mtime}
 

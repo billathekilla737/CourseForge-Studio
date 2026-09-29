@@ -1,9 +1,14 @@
 """Late-work rules read from a syllabus and applied after auto-grading."""
 from __future__ import annotations
 
+import tempfile
 import unittest
+from pathlib import Path
 
 from courseforge import curve, latepolicy
+from courseforge.config import Config
+from courseforge.grader import build_prompt, grade_assignment
+from courseforge.store import Store
 
 
 SYLLABUS = """
@@ -70,25 +75,87 @@ class InstructionsOverrideTheDock(unittest.TestCase):
         text = "Be lenient if they used a game that was not on the list."
         self.assertEqual(latepolicy.waiver(text, {"name": "Jane Doe"}), "")
 
+    def test_wave_and_a_first_name_waive_that_student(self):
+        text = "Wave Jane's late submission. Do not dock points for it."
+        student = {"name": "Jane Doe", "sortable_name": "Doe, Jane"}
+        self.assertFalse(latepolicy.waives_everyone(text))
+        self.assertIn("this student", latepolicy.waiver(text, student))
+        self.assertEqual(latepolicy.waiver(text, {"name": "Alex Kim"}), "")
+
+    def test_this_student_waives_only_a_picked_regrade(self):
+        text = "I told this student I would wave the late penalty."
+        student = {"name": "Jane Doe", "sortable_name": "Doe, Jane"}
+        self.assertFalse(latepolicy.waives_everyone(text))
+        self.assertEqual(latepolicy.waiver(text, student), "")
+        self.assertIn("this student", latepolicy.waiver(text, student, addressed=True))
+
 
 class ApplyToAScore(unittest.TestCase):
     def test_one_day_at_ten_percent(self):
         policy = latepolicy.parse("10% per day late.")
         graded = {"total": 20, "scores": {"c1": 20}, "flags": []}
-        out = latepolicy.attach(graded, {"late": True, "seconds_late": 86400}, policy)
+        out = latepolicy.attach(
+            graded, {"late": True, "seconds_late": 86400}, policy, 20)
         self.assertTrue(out["late_penalty"]["applied"])
-        self.assertEqual(out["late_penalty"]["units"], 1)
+        self.assertEqual(out["late_penalty"]["days"], 1)
         self.assertEqual(out["late_penalty"]["points"], 2.0)
         entry = {**out, "scores": {"c1": 20}}
         self.assertEqual(curve.final_total(entry, [{"id": "c1", "points": 20}], 20), 18)
 
-    def test_a_second_late_rounds_up_to_a_day(self):
+    def test_half_a_day_on_a_hundred_points_is_five_points(self):
         policy = latepolicy.parse("10% per day late.")
         out = latepolicy.attach(
-            {"total": 10, "flags": []},
-            {"late": True, "seconds_late": 30}, policy)
-        self.assertEqual(out["late_penalty"]["units"], 1)
-        self.assertEqual(out["late_penalty"]["points"], 1.0)
+            {"total": 80, "scores": {"c1": 80}, "flags": []},
+            {"late": True, "seconds_late": int(0.5 * 86400)}, policy, 100)
+        self.assertEqual(out["late_penalty"]["days"], 0.5)
+        self.assertEqual(out["late_penalty"]["points"], 5)
+        entry = {**out, "scores": {"c1": 80}}
+        self.assertEqual(curve.final_total(entry, [{"id": "c1", "points": 100}], 100), 75)
+
+    def test_point_seven_days_is_seven_points(self):
+        policy = latepolicy.parse("10% per day late.")
+        out = latepolicy.attach(
+            {"total": 90, "flags": []},
+            {"late": True, "seconds_late": int(0.7 * 86400)}, policy, 100)
+        self.assertEqual(out["late_penalty"]["days"], 0.7)
+        self.assertEqual(out["late_penalty"]["points"], 7)
+
+    def test_the_roster_tenth_is_what_comes_off(self):
+        # 0.74 days prints as 0.7, so the cut is 7 points, not 7.4.
+        policy = latepolicy.parse("10% per day late.")
+        out = latepolicy.attach(
+            {"total": 100, "flags": []},
+            {"late": True, "seconds_late": int(0.74 * 86400)}, policy, 100)
+        self.assertEqual(out["late_penalty"]["days"], 0.7)
+        self.assertEqual(out["late_penalty"]["points"], 7)
+
+    def test_a_day_and_a_half_is_not_rounded_up_to_two(self):
+        policy = latepolicy.parse("10% per day late.")
+        out = latepolicy.attach(
+            {"total": 100, "flags": []},
+            {"late": True, "seconds_late": int(1.5 * 86400)}, policy, 100)
+        self.assertEqual(out["late_penalty"]["days"], 1.5)
+        self.assertEqual(out["late_penalty"]["points"], 15)
+
+    def test_the_cut_is_a_percent_of_the_assignment_not_the_score(self):
+        policy = latepolicy.parse("10% per day late.")
+        out = latepolicy.attach(
+            {"total": 50, "flags": []},
+            {"late": True, "seconds_late": 86400}, policy, 100)
+        self.assertEqual(out["late_penalty"]["points"], 10)
+        # A later edit of the earned score does not resize the late cut.
+        edited = latepolicy.refresh(out, 40, 100)
+        self.assertEqual(edited["points"], 10)
+
+    def test_a_few_seconds_is_not_a_day(self):
+        policy = latepolicy.parse("10% per day late.")
+        out = latepolicy.attach(
+            {"total": 80, "flags": []},
+            {"late": True, "seconds_late": 30}, policy, 100)
+        self.assertFalse(out["late_penalty"]["applied"])
+        self.assertEqual(out["late_penalty"]["days"], 0)
+        self.assertEqual(curve.final_total(
+            {**out, "scores": {"c1": 80}}, [{"id": "c1", "points": 100}], 100), 80)
 
     def test_grace_period_does_not_dock(self):
         policy = latepolicy.parse("24 hour grace period. Then 10% per day late.")
@@ -167,6 +234,47 @@ class LoadFromAFakeCourse(unittest.TestCase):
         policy = latepolicy.load(Client(), "1", lambda html: html)
         self.assertTrue(policy["canvas_applies"])
         self.assertEqual(policy["kind"], "canvas")
+
+
+class OneStudentUsesTheInstructions(unittest.TestCase):
+    def test_the_prompt_for_that_student_carries_the_waiver(self):
+        prompt = build_prompt(
+            {"name": "Essay", "points_possible": 20, "description": ""},
+            [{"id": "c1", "label": "Idea", "points": 20, "detail": "", "ratings": []}],
+            {"user_id": "9", "name": "Jane Doe", "sortable_name": "Doe, Jane",
+             "status": "submitted", "late": True, "words": 12, "text": "A game has rules."},
+            "Wave Jane's late submission. Do not dock points for it.",
+            "Jane Doe", addressed=True)
+        self.assertIn("Wave Jane's late submission.", prompt)
+        self.assertIn("re-grade of one student", prompt)
+        self.assertIn("penalty waived", prompt.lower())
+        self.assertNotIn("Studio applies the syllabus", prompt)
+
+    def test_regrading_one_student_replaces_a_canvas_score(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp))
+            cid, aid = "1", "2"
+            adir = store.assignment_dir(cid, aid)
+            store.write(adir / "assignment.json",
+                        {"name": "Essay", "points_possible": 10, "rubric": []})
+            store.write(adir / "extracted.json", {
+                "9": {"user_id": "9", "name": "Jane Doe",
+                      "sortable_name": "Doe, Jane", "status": "submitted",
+                      "late": True, "seconds_late": 90000, "text": "", "words": 0}})
+            store.write(adir / "draft.json", {
+                "points_possible": 10, "rubric": [],
+                "students": {"9": {"user_id": "9", "source": "canvas", "total": 4,
+                                   "scores": {}, "total_only": True,
+                                   "late_penalty": {"applied": True, "points": 4}}}})
+            store.save_instructions(cid, aid, "Wave Jane's late submission.")
+            grade_assignment(Config(), store, cid, aid, only=["9"], late_policy={
+                "kind": "percent_per_day", "percent": 10, "interval": "day",
+                "summary": "10% a day",
+            })
+            entry = store.draft(cid, aid)["students"]["9"]
+        self.assertNotEqual(entry.get("source"), "canvas")
+        self.assertTrue(entry["late_penalty"]["waived"])
+        self.assertFalse(entry["late_penalty"]["applied"])
 
 
 if __name__ == "__main__":

@@ -929,6 +929,8 @@ html.busy .btn, html.busy button{cursor:progress}
    colours and fonts must not fight the app around it. */
 .canvasHtml{font-size:13.5px;line-height:1.6;color:var(--ink);
   overflow-wrap:break-word}
+.canvasHtml.workEntry{background:var(--panel);border:1px solid var(--line);
+  border-radius:var(--radius);padding:15px 17px;overflow-x:auto}
 .canvasHtml *{max-width:100%!important}
 .canvasHtml div[style]{margin-left:0!important;margin-right:0!important}
 /* Headings in a Canvas body are forced to the app's ink so a description
@@ -945,10 +947,10 @@ html.busy .btn, html.busy button{cursor:progress}
 .canvasHtml img{height:auto;border-radius:6px;margin:6px 0}
 .canvasHtml ul,.canvasHtml ol{margin:0 0 11px;padding-left:22px}
 .canvasHtml li{margin-bottom:4px}
-.canvasHtml table{border-collapse:collapse;margin:10px 0;display:block;
-  overflow-x:auto}
+.canvasHtml table{border-collapse:collapse;margin:10px 0;width:100%;
+  display:table}
 .canvasHtml th,.canvasHtml td{border:1px solid var(--line);padding:6px 9px;
-  text-align:left;font-size:12.5px}
+  text-align:left;font-size:12.5px;vertical-align:top;max-width:none!important}
 .canvasHtml th{background:var(--bg);font-weight:650}
 .canvasHtml pre{background:var(--bg);padding:10px 12px;border-radius:6px;
   overflow-x:auto;font:12px var(--mono)}
@@ -1516,7 +1518,9 @@ a.card,a.card:visited{color:var(--ink);text-decoration:none}
 
    Only the course list wears this. The assignment list shares the section and
    must stay a single column. */
+#viewPicker > .sectionHead{flex-wrap:wrap;align-items:center}
 #viewPicker.pickerHome{display:grid;align-content:start;align-items:start;
+  padding-top:10px;
   grid-template-columns:minmax(0,1.4fr) minmax(0,1fr);
   column-gap:22px;row-gap:0}
 /* Rows are named rather than left to auto-placement so the two columns start
@@ -1525,6 +1529,8 @@ a.card,a.card:visited{color:var(--ink);text-decoration:none}
    width instead, it sat a row above the other column's and the right-hand side
    looked like it began somewhere else. */
 #viewPicker.pickerHome > #pickerResume{grid-column:1/-1;grid-row:1}
+#viewPicker.pickerHome > .sectionHead,
+#viewPicker.pickerHome > #pickerStrip > .sectionHead{margin-bottom:8px}
 #viewPicker.pickerHome > .sectionHead{grid-column:1;grid-row:2}
 #viewPicker.pickerHome > #pickerBody{grid-column:1;grid-row:3}
 /* display:contents, so the right-hand heading and its list are grid items in
@@ -1533,32 +1539,28 @@ a.card,a.card:visited{color:var(--ink);text-decoration:none}
    column's -- the two headings level and everything under them not. */
 #viewPicker.pickerHome > #pickerStrip{display:contents}
 #viewPicker.pickerHome > #pickerStrip > .sectionHead{grid-column:2;grid-row:2}
-#viewPicker.pickerHome > #pickerStrip > .acrossStack{grid-column:2;grid-row:3}
+#viewPicker.pickerHome > #pickerStrip > .acrossCol{grid-column:2;grid-row:3}
 @media (max-width:900px){
   #viewPicker.pickerHome{grid-template-columns:minmax(0,1fr)}
   #viewPicker.pickerHome > #pickerResume,
   #viewPicker.pickerHome > .sectionHead,
   #viewPicker.pickerHome > #pickerBody{grid-column:1;grid-row:auto}
   #viewPicker.pickerHome > #pickerStrip > .sectionHead,
-  #viewPicker.pickerHome > #pickerStrip > .acrossStack{grid-column:1;grid-row:auto}
+  #viewPicker.pickerHome > #pickerStrip > .acrossCol{grid-column:1;grid-row:auto}
   #viewPicker.pickerHome > #pickerStrip > .sectionHead{margin-top:24px}
 }
 
 /* Where you left off. Navy with the gold rule, the same band the hub wears, so
    the two screens read as one tool. */
-.resumeBand{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:18px;
-  align-items:center;padding:17px 20px;margin:0 0 20px;
+.resumeBand{display:flex;align-items:center;justify-content:space-between;gap:12px;
+  padding:5px 12px;margin:0 0 8px;
   border-radius:var(--radius);border-top:3px solid var(--gold);
   background:var(--navy);color:#fff}
-@media (max-width:640px){.resumeBand{grid-template-columns:minmax(0,1fr)}}
-.resumeBand .kicker{font-size:10.5px;font-weight:600;letter-spacing:.1em;
-  text-transform:uppercase;color:var(--gold);margin-bottom:6px}
-.resumeBand h2{margin:0 0 5px;font-size:19px;font-weight:650;text-wrap:balance}
-.resumeBand p{margin:0;font-size:12.5px;color:#b9c6d8}
-.resumeBand .go{display:flex;gap:8px;flex-wrap:wrap}
-.resumeBand .btn{background:rgba(255,255,255,.1);border-color:rgba(255,255,255,.26);
-  color:#fff}
-.resumeBand .btn:hover{background:rgba(255,255,255,.18)}
+.resumeBand .resumeLine{display:flex;align-items:baseline;gap:10px;min-width:0;margin:0}
+.resumeBand .kicker{margin:0;font-size:10px;font-weight:600;letter-spacing:.08em;
+  text-transform:uppercase;color:var(--gold);white-space:nowrap}
+.resumeBand .resumeName{min-width:0;overflow:hidden;text-overflow:ellipsis;
+  white-space:nowrap;font-size:14px;font-weight:650}
 .resumeBand .btn.primary{background:var(--gold);border-color:var(--gold);
   color:#231a04;font-weight:650}
 .resumeBand .btn.primary:hover{background:#f2b53d}
@@ -1567,7 +1569,7 @@ a.card,a.card:visited{color:var(--ink);text-decoration:none}
 .pickList{display:flex;flex-direction:column;border:1px solid var(--line);
   border-radius:var(--radius);overflow:hidden;background:var(--panel)}
 .pickRow{display:grid;grid-template-columns:auto minmax(0,1fr) auto;gap:11px;
-  align-items:center;width:100%;padding:11px 14px;text-align:left;font:inherit;
+  align-items:center;width:100%;padding:10px 14px;text-align:left;font:inherit;
   color:var(--ink);background:var(--panel);cursor:pointer;
   border:0;border-top:1px solid var(--line)}
 .pickRow:first-child{border-top:0}
@@ -1587,22 +1589,42 @@ a.pickRow,a.pickRow:visited{color:var(--ink);text-decoration:none}
 
 /* The four things that are not about one course. A stack, so they are plainly
    a different kind of thing from the rows beside them. */
-.acrossStack{display:flex;flex-direction:column;gap:8px}
+.acrossStack{display:flex;flex-direction:column;gap:4px}
 .acrossItem{display:grid;grid-template-columns:auto minmax(0,1fr);gap:9px;
-  align-items:start;width:100%;text-align:left;font:inherit;color:var(--ink);
-  padding:10px 12px;background:var(--panel);border:1px solid var(--line);
+  align-items:center;width:100%;text-align:left;font:inherit;color:var(--ink);
+  padding:5px 10px;background:var(--panel);border:1px solid var(--line);
   border-radius:7px;cursor:pointer;text-decoration:none}
 .acrossItem:hover{border-color:var(--accent)}
-.acrossItem .ic{width:8px;height:8px;border-radius:2px;margin-top:5px;
+.acrossItem .ic{width:8px;height:8px;border-radius:2px;margin-top:0;
   background:var(--zone)}
 .acrossItem .ic.a11y{background:var(--a11y)}
 .acrossItem .ic.grade{background:var(--accent)}
 .acrossItem .t{display:block;font-size:12.5px;font-weight:600}
-.acrossItem .m{display:block;font-size:11px;color:var(--muted);margin-top:2px;
-  line-height:1.5}
+/* Kept for the hover title and screen readers. A visible second line is what
+   made Across your courses taller than the course list. */
+.acrossItem .m{position:absolute;width:1px;height:1px;padding:0;margin:-1px;
+  overflow:hidden;clip:rect(0 0 0 0);clip-path:inset(50%);white-space:nowrap;border:0}
 .acrossItem.off{opacity:.55;cursor:not-allowed}
 .acrossItem.off:hover{border-color:var(--line)}
 a.acrossItem,a.acrossItem:visited{color:var(--ink)}
+
+/* Directly under Across your courses, in that column, so a long course list
+   does not push it to the bottom of the page. */
+.behindGrade{margin-top:10px}
+.behindGrade h2{margin:0 0 6px;font-size:18px}
+.behindList{display:flex;flex-direction:column;gap:6px}
+.behindItem{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:10px;
+  align-items:center;width:100%;text-align:left;font:inherit;color:var(--ink);
+  padding:6px 10px;background:var(--panel);border:1px solid var(--line);
+  border-radius:7px;text-decoration:none}
+.behindItem:hover{border-color:var(--accent)}
+.behindItem .behindText{min-width:0}
+.behindItem .nm{display:block;font-size:13.5px;font-weight:600}
+.behindItem .m{display:block;font-size:11px;color:var(--muted);margin-top:2px;
+  line-height:1.4}
+.behindItem .n{font-size:12px;font-weight:600;color:var(--muted);white-space:nowrap}
+.behindEmpty{margin:0;font-size:12.5px;color:var(--muted)}
+a.behindItem,a.behindItem:visited{color:var(--ink)}
 
 /* ==================================================== the Canvas Inbox
    Mail waiting is true wherever you are standing, so the count sits in the

@@ -324,7 +324,7 @@ class GradeJsKeepsToTheContract(unittest.TestCase):
         # Bulk bar and context menu share one action list, so a new verb cannot
         # land on shift-click and be missing from right-click (or the reverse).
         self.assertIn("selectionItems(st)", self.src)
-        self.assertIn("js/grade.js?v=pdf-1",
+        self.assertIn("js/grade.js?v=home-2",
                       (WEB / "index.html").read_text(encoding="utf-8"))
         self.assertIn('step="1"', self.src)
         self.assertNotIn("data-tiers", self.src)
@@ -391,7 +391,7 @@ class GradeJsKeepsToTheContract(unittest.TestCase):
         page = (WEB / "index.html").read_text(encoding="utf-8")
         self.assertIn("js/docview.js?v=docx-1", page)
         self.assertIn("js/pdfview.js?v=pdf-1", page)
-        self.assertIn("style.css?v=pdf-1", page)
+        self.assertIn("style.css?v=todo-8", page)
         self.assertIn("function pdfCard(", self.src)
         self.assertIn("pdfCard(p, url, reused)", body)
         self.assertIn("PdfView.take", body)
@@ -405,6 +405,12 @@ class GradeJsKeepsToTheContract(unittest.TestCase):
         self.assertIn("useGoogleFonts: false", viewer)
         self.assertNotIn("useGoogleFonts: true", viewer)
         self.assertIn("DocxScrollViewer", viewer)
+
+    def test_a_canvas_text_entry_is_shown_as_html(self):
+        self.assertIn("p.label === 'Canvas text entry'", self.src)
+        self.assertIn('class="canvasHtml workEntry"', self.src)
+        css = (WEB / "style.css").read_text(encoding="utf-8")
+        self.assertIn(".canvasHtml table{border-collapse:collapse;margin:10px 0;width:100%;\n  display:table}", css)
 
     def test_the_work_pane_close_is_not_an_inline_handler(self):
         """Inline onclick is blocked by the page policy, so Close did nothing

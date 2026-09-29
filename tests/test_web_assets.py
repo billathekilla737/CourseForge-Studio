@@ -90,7 +90,8 @@ class TheShellNamesWhereYouAre(unittest.TestCase):
         self.assertIn('href="#/c/${esc(courseId)}/a/${esc(a.id)}"', grade)
         self.assertIn('href="#/schedule"', grade)
         hub = (WEB / "js" / "hub.js").read_text(encoding="utf-8")
-        self.assertIn('href="#/roster"', hub)
+        self.assertIn('href="${href}"', hub)
+        self.assertIn("'#/roster'", hub)
         core = (WEB / "js" / "core.js").read_text(encoding="utf-8")
         self.assertIn("parts[0] === 'roster'", core)
 

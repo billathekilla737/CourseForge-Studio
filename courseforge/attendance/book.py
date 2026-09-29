@@ -22,7 +22,17 @@ MAX_SPAN = 240
 MAX_NOTE = 200
 MAX_MINUTES = 180
 
-_lock = threading.Lock()
+# The lock that guards the file. It must not be held across a Canvas call:
+# listing the instructor's files is what made a roll call take minutes.
+_disk_lock = threading.Lock()
+_sync_lock = threading.Lock()
+_pending_guard = threading.Lock()
+_pending: set[str] = set()
+_wake = threading.Event()
+_worker_started = False
+_app_ref = None
+# Wait until the clicks stop, then copy once, instead of once per student.
+_QUIET_S = 1.2
 
 
 def _now() -> str:
@@ -237,19 +247,85 @@ def _push(app, course_id, book: dict) -> dict:
         return {"did": "error", "error": str(exc)[:200]}
 
 
+def nudge(app, course_id) -> None:
+    """Ask the background copy to run after the clicks go quiet.
+
+    The click itself only writes the file. Canvas is this thread's job, so
+    the next student is not waiting on the previous upload.
+    """
+    global _app_ref, _worker_started
+    try:
+        cid = _course_key(course_id)
+    except ValueError:
+        return
+    with _pending_guard:
+        _pending.add(cid)
+        _app_ref = app
+        if not _worker_started:
+            _worker_started = True
+            threading.Thread(
+                target=_sync_loop, name="attendance-sync", daemon=True,
+            ).start()
+    _wake.set()
+
+
+def _sync_loop() -> None:
+    while True:
+        _wake.wait()
+        _wake.clear()
+        while _wake.wait(_QUIET_S):
+            _wake.clear()
+        app = _app_ref
+        if app is None:
+            continue
+        with _pending_guard:
+            batch = sorted(_pending)
+            _pending.clear()
+        for cid in batch:
+            try:
+                reconcile(app, cid)
+            except Exception:  # noqa: BLE001
+                pass
+        with _pending_guard:
+            more = bool(_pending)
+        if more:
+            _wake.set()
+
+
 def reconcile(app, course_id) -> dict:
-    """Local file and the Canvas copy, merged. Pushes when this side is ahead."""
-    with _lock:
+    """Local file and the Canvas copy, merged. Pushes when this side is ahead.
+
+    The Canvas read and the upload happen outside the file lock, so a mark
+    saved while a copy is in flight is still on disk when this merges.
+    """
+    with _sync_lock:
+        return _reconcile(app, course_id)
+
+
+def _reconcile(app, course_id) -> dict:
+    remote = _remote(app, course_id)
+    with _disk_lock:
         local = load(app, course_id)
-        remote = _remote(app, course_id)
         merged = merge_books(local, remote)
         if merged != local:
             save(app, course_id, merged)
-        if remote and merged != clean_book(remote):
-            _push(app, course_id, merged)
-        elif not remote and _has_anything(merged):
-            _push(app, course_id, merged)
-        return merged
+        snapshot = merged
+    remote_clean = clean_book(remote) if remote else {}
+    should_push = (bool(remote) and snapshot != remote_clean) or (
+        not remote and _has_anything(snapshot))
+    if not should_push:
+        return snapshot
+    with _disk_lock:
+        current = load(app, course_id)
+    if current != snapshot:
+        nudge(app, course_id)
+        return current
+    _push(app, course_id, snapshot)
+    with _disk_lock:
+        current = load(app, course_id)
+    if current != snapshot:
+        nudge(app, course_id)
+    return current
 
 
 def _has_anything(book: dict) -> bool:
@@ -344,7 +420,11 @@ def set_meet(book: dict, day: str, on: bool) -> dict:
 
 
 def apply_marks(book: dict, day: str, marks, roster_ids=None, fill: str = "") -> dict:
-    """Write marks for one date. `fill` of "present" sets everyone still blank."""
+    """Write marks for one date. `fill` of "present" sets everyone still blank.
+
+    A mark may carry `updated`. An older stamp does not cover a newer one,
+    so a slow request cannot undo a click that already landed.
+    """
     found = parse_day(day)
     if not found:
         raise ValueError("That is not a yyyy-mm-dd date.")
@@ -353,8 +433,23 @@ def apply_marks(book: dict, day: str, marks, roster_ids=None, fill: str = "") ->
     book = clean_book(book)
     iso = _iso(found)
     cell = dict(book["marks"].get(iso) or {})
-    stamp = _now()
+    changed = False
+    last = str(book.get("updated") or "")
+
+    def take(uid: str, status: str, minutes, note, stamp: str) -> None:
+        nonlocal changed, last
+        cleaned = _clean_mark({
+            "status": status, "minutes": minutes, "note": note, "updated": stamp,
+        })
+        if cleaned is None:
+            raise ValueError("A mark is present, tardy, absent, or excused.")
+        cell[uid] = cleaned
+        changed = True
+        if stamp > last:
+            last = stamp
+
     if fill == "present":
+        stamp = _now()
         for uid in roster_ids or []:
             uid = str(uid).strip()
             if not _UID.match(uid):
@@ -362,7 +457,7 @@ def apply_marks(book: dict, day: str, marks, roster_ids=None, fill: str = "") ->
             current = cell.get(uid) or {}
             if current.get("status"):
                 continue
-            cell[uid] = {"status": "present", "minutes": 0, "note": "", "updated": stamp}
+            take(uid, "present", 0, "", stamp)
     for raw in marks or []:
         if not isinstance(raw, dict):
             continue
@@ -375,27 +470,58 @@ def apply_marks(book: dict, day: str, marks, roster_ids=None, fill: str = "") ->
         if status not in STATUSES and status != "":
             raise ValueError("A mark is present, tardy, absent, or excused.")
         previous = cell.get(uid) or {}
+        incoming = str(raw.get("updated") or "")
+        prev_stamp = str(previous.get("updated") or "")
+        if incoming and prev_stamp and incoming < prev_stamp:
+            continue
         note = raw.get("note")
         if note is None:
             note = previous.get("note") or ""
         minutes = raw.get("minutes")
         if minutes is None:
             minutes = previous.get("minutes") or 0
-        cleaned = _clean_mark({
-            "status": status, "minutes": minutes, "note": note, "updated": stamp,
-        })
-        if cleaned is None:
-            raise ValueError("A mark is present, tardy, absent, or excused.")
-        cell[uid] = cleaned
+        take(uid, status, minutes, note, incoming or _now())
+    if not changed:
+        return book
     if cell:
         book["marks"][iso] = cell
-    book["updated"] = stamp
+    book["updated"] = last or _now()
     # A real mark on a day that is not already a class day makes it one, so
     # the mark is not stored where the calendar will not show it. A clear
     # does not put the day back.
     if any((row.get("status") for row in cell.values())):
-        book["meet"][iso] = {"on": True, "updated": stamp}
+        book["meet"][iso] = {"on": True, "updated": book["updated"]}
     return book
+
+
+def apply_edit(app, course_id, body: dict) -> dict:
+    """Save one edit on this computer. Does not call Canvas."""
+    if not isinstance(body, dict):
+        body = {}
+    with _disk_lock:
+        stored = load(app, course_id)
+        changed = False
+        if body.get("weekdays"):
+            stored = set_pattern(
+                stored, body.get("weekdays") or [],
+                str(body.get("start") or ""), str(body.get("end") or ""),
+                body.get("skip_breaks", True),
+            )
+            changed = True
+        if body.get("marks") or body.get("fill"):
+            people = [p["user_id"] for p in roster(app, course_id)]
+            stored = apply_marks(
+                stored, str(body.get("date") or ""), body.get("marks") or [],
+                roster_ids=people, fill=str(body.get("fill") or ""),
+            )
+            changed = True
+        if (body.get("date") and "on" in body
+                and not (body.get("marks") or body.get("fill") or body.get("weekdays"))):
+            stored = set_meet(stored, str(body.get("date") or ""), bool(body.get("on")))
+            changed = True
+        if changed:
+            stored = save(app, course_id, stored)
+        return stored
 
 
 def meeting_dates(book: dict, breaks: set[date]) -> list[date]:

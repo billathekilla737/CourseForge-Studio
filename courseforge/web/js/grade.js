@@ -2003,12 +2003,47 @@ async function renderStorage() {
    course come from the assignment list already cached for it, so a course you
    have never opened says so rather than the page making five Canvas calls to
    tell you something you are about to click into anyway. */
+function homeListTools(on) {
+  ['btnExpand', 'btnCollapse'].forEach(id => {
+    const el = document.getElementById(id);
+    if (el) el.hidden = !on;
+  });
+  if (!on) return;
+  const expand = document.getElementById('btnExpand');
+  const collapse = document.getElementById('btnCollapse');
+  if (expand) expand.onclick = () => setAllGlance(true);
+  if (collapse) collapse.onclick = () => setAllGlance(false);
+}
+
+/* The chevrons on the rows currently showing, including the resume band.
+   Other terms keep whatever they had. A course that has never been opened
+   has no figures to open. */
+function setAllGlance(open) {
+  const buttons = document.querySelectorAll('#pickerBody .pickFold, #pickerResume .pickFold');
+  const all = glanceMap();
+  buttons.forEach(btn => {
+    const id = String(btn.dataset.cid || '');
+    if (!id) return;
+    if (open) all[id] = 1;
+    else all[id] = 0;
+    btn.setAttribute('aria-expanded', open ? 'true' : 'false');
+    btn.setAttribute('aria-label', open ? 'Collapse' : 'Expand');
+    const box = btn.closest('.pickRow, .resumeBand');
+    if (box) box.classList.toggle('open', open);
+  });
+  try { localStorage.setItem('cg.glance', JSON.stringify(all)); } catch (_) { /* private mode */ }
+}
+
 async function openCourses(refresh) {
   const tb = $('#teachBar'); if (tb) tb.classList.add('hidden');
+  // The strip repaints before the new list arrives. Drop the previous
+  // term's five so they do not sit under a different term's courses.
+  S.behind = null;
   showView('picker');
   crumbs([{ label: 'Courses' }]);
   $('#pickerTitle').textContent = 'Your courses';
   $('#pickerResume').innerHTML = '';
+  homeListTools(true);
   $('#btnRefresh').onclick = () => openCourses(true);
   $('#headerActions').innerHTML =
     '<a class="btn" href="#/schedule">Term schedule</a>'
@@ -2092,9 +2127,22 @@ function paintHome(picked) {
     ? '<div class="pickList">' + list.map(courseRow).join('') + '</div>'
     : '<p class="hint">No courses in this term.</p>';
   wireCourseTools($('#pickerBody'));
+  S.behind = behindShown(picked.behind);
+  if (typeof renderBehind === 'function') renderBehind($('#pickerStrip'), S.behind);
 
   renderStorage();
   $('#selTerm').onchange = ev => { S.term = ev.target.value; openCourses(false); };
+}
+
+/* The server ranks past-due work by days, not by how many are waiting.
+   This screen shows five, and only for the term on screen. */
+function behindShown(rows) {
+  const all = Array.isArray(rows) ? rows : [];
+  if (S.term === '__all') return all.slice(0, 5);
+  const ids = new Set((S.courses || [])
+    .filter(c => (c.term_label || '') === S.term)
+    .map(c => String(c.id)));
+  return all.filter(row => ids.has(String(row.course_id))).slice(0, 5);
 }
 
 function courseCount(list) {
@@ -2107,9 +2155,10 @@ function courseCount(list) {
 /* One row per course: the catalogue code, what the course is actually called,
    and the state this machine knows about. A course nobody has opened here says
    so plainly rather than showing a zero that would read as "nothing to do". */
-/* The same four figures the course page shows in its band. Folded until asked:
-   a course list that always showed them was taller than the tools beside it.
-   Remembering an open row matters because changing the term redraws the list. */
+/* The same four figures the course page shows in its band. Open unless this
+   course was collapsed on purpose. A missing entry is the default, open, so
+   a new course does not start folded. Collapse stores 0; deleting the entry
+   would look like the default and spring open again. */
 function glanceMap() {
   try {
     const raw = JSON.parse(localStorage.getItem('cg.glance') || '{}');
@@ -2117,7 +2166,10 @@ function glanceMap() {
   } catch (_) { return {}; }
 }
 function glanceIsOpen(id) {
-  return !!glanceMap()[String(id || '')];
+  const key = String(id || '');
+  const all = glanceMap();
+  if (!Object.prototype.hasOwnProperty.call(all, key)) return true;
+  return !!all[key];
 }
 function glanceCards(c, onBand) {
   const waiting = +c.waiting || 0;
@@ -2151,7 +2203,7 @@ function wireGlance(root) {
       const all = glanceMap();
       const id = String(btn.dataset.cid || '');
       if (open) all[id] = 1;
-      else delete all[id];
+      else all[id] = 0;
       try { localStorage.setItem('cg.glance', JSON.stringify(all)); } catch (_) { /* private mode */ }
     };
   });
@@ -2247,27 +2299,14 @@ function renderResume(r) {
   const host = $('#pickerResume');
   if (!host) return;
   if (!r) { host.innerHTML = ''; return; }
-  const where = [r.code, r.term_label].filter(Boolean).join(' · ');
-  const what = r.assignment_name
-    ? `${r.waiting ? r.waiting + ' waiting on ' : 'last on '}"${r.assignment_name}"`
-    : (r.waiting ? r.waiting + ' submissions waiting' : 'no submissions waiting');
-  const open = r.known === false ? false : glanceIsOpen(r.course_id);
-  host.innerHTML = `<section class="resumeBand${open ? ' open' : ''}" aria-labelledby="resumeH">
-    <div>
-      <div class="kicker">Where you left off</div>
-      <h2 id="resumeH">${esc(r.title)}</h2>
-      <p>${esc(where)}${where ? ' · ' : ''}${esc(what)}, ${esc(r.ago || 'earlier')}.</p>
-      ${r.known === false ? '' : glanceCards(r, true)}
-    </div>
-    <div class="go">
-      <div class="pickActs">${r.known === false ? '' : glanceFold(r, true)}${refreshButton(r, true)}</div>
-      <a class="btn primary" href="${r.assignment_id
-        ? `#/c/${esc(r.course_id)}/a/${esc(r.assignment_id)}`
-        : `#/c/${esc(r.course_id)}/grade`}">Carry on grading</a>
-      <a class="btn" href="#/c/${esc(r.course_id)}">Open the course</a>
-    </div>
+  const href = r.assignment_id
+    ? `#/c/${esc(r.course_id)}/a/${esc(r.assignment_id)}`
+    : `#/c/${esc(r.course_id)}/grade`;
+  host.innerHTML = `<section class="resumeBand" aria-labelledby="resumeH">
+    <p class="resumeLine"><span class="kicker">Where you left off</span>
+      <span class="resumeName" id="resumeH">${esc(r.title || '')}</span></p>
+    <a class="btn primary sm" href="${href}">Carry on grading</a>
   </section>`;
-  wireCourseTools(host);
 }
 
 /* "5 hours ago". The hub says the same thing about the same timestamps; this
@@ -2291,6 +2330,7 @@ function ago(iso) {
 async function openCourse(courseId, refresh) {
   const tb = $('#teachBar'); if (tb) tb.classList.add('hidden');
   showView('picker');
+  homeListTools(false);
   // Arriving straight on this screen, the course list has not been read yet,
   // and the crumb and the tab would say "Course 734975" until it was.
   if (!S.courses.some(c => String(c.id) === String(courseId)) && typeof ensureCourse === 'function') {
@@ -4075,7 +4115,7 @@ function selectionItems(st) {
   items.push({ id: 'regrade',
                label: one ? 'Re-grade this student' : 'Re-grade ' + st.n + ' students',
                bar: 'Re-grade', cls: 'ai', disabled: !st.canAI,
-               title: 'Re-grade just these students' });
+               title: 'Re-grade just these students, using the custom instructions' });
   items.push({ id: 'review',
                label: st.allOk ? 'Un-mark reviewed' : 'Mark as reviewed',
                bar: st.allOk ? 'Un-mark reviewed' : 'Mark reviewed',
@@ -5083,6 +5123,14 @@ function fileUrl(name) {
 
 /* Pictures pulled out of a Word file, and pages of a scanned PDF, sit one
    folder under files/. The name has to keep that folder or the picture 404s. */
+/* A picture pasted into the text box is drawn inside the entry once the HTML
+   is shown. The separate image part would put the same picture again below. */
+function inlinedInEntry(s, path) {
+  const name = String(path || '').split(/[\\/]/).pop();
+  if (!name || !/_rce\d+_/.test(name)) return false;
+  return (s.parts || []).some(p => p && p.html && p.html.indexOf(name) >= 0);
+}
+
 function fileRel(path) {
   const norm = String(path || '').replace(/\\/g, '/');
   const mark = '/files/';
@@ -5625,9 +5673,15 @@ function renderWork(s, e) {
             src="${esc(fileUrl(fileRel(p.path)))}"></div>`;
         return;
       }
-      if (p.kind === 'text' && p.text && p.text.trim()) {
+      if (p.kind === 'text' && p.label === 'Canvas text entry' && p.html
+          && /<(?:p|div|h[1-6]|table|ul|ol|li|blockquote|pre)\b/i.test(p.html)) {
+        body += `<div class="workSec"><h4>${esc(p.label)} <span class="wc">${p.words} words</span></h4>
+          <div class="canvasHtml workEntry">${p.html}</div></div>`;
+      } else if (p.kind === 'text' && p.text && p.text.trim()) {
         body += `<div class="workSec"><h4>${esc(p.label)} <span class="wc">${p.words} words</span></h4>
           ${renderProse(p.text)}</div>`;
+      } else if (p.kind === 'image' && inlinedInEntry(s, p.path)) {
+        return;
       } else if (p.kind === 'image') {
         body += `<div class="workSec"><h4>${esc(p.label)}</h4>
           <img class="workImg" loading="lazy" alt="${esc(p.label)}"

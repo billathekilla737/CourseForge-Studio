@@ -6,7 +6,8 @@ import unittest
 import zipfile
 from pathlib import Path
 
-from courseforge.extract import extract_submission, unpack_file, xlsx_to_text, pptx_to_text
+from courseforge.extract import (extract_submission, present_text_entries,
+                                 unpack_file, xlsx_to_text, pptx_to_text)
 
 
 def _xlsx(path: Path) -> None:
@@ -88,6 +89,41 @@ class OfficeAndImages(unittest.TestCase):
             parts = unpack_file(blank)
             self.assertTrue(any(p.kind == "image" for p in parts),
                             [ (p.kind, p.note) for p in parts ])
+
+    def test_a_canvas_text_entry_keeps_its_table(self):
+        """The work pane used to show the editor as pipes. Grading still gets
+        the flat text; the page gets the table."""
+        body = (
+            "<h2>Part 4</h2><p>The <strong>goal</strong> is the hard part.</p>"
+            "<script>alert(1)</script>"
+            "<table><tr><th>Case</th><th>Verdict</th></tr>"
+            "<tr><td>Walker</td><td>Gray area</td></tr></table>"
+            '<img src="https://school.example/files/55/preview" alt="chart">'
+        )
+        flat = extract_submission(body, []).text
+        self.assertIn("|", flat)
+        self.assertNotIn("<table>", flat)
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = Path(tmp)
+            shot = folder / "9_rce55_chart.png"
+            shot.write_bytes(b"\x89PNG\r\n\x1a\n")
+            shown = present_text_entries(
+                {"9": {"parts": [{"label": "Canvas text entry", "text": flat}]}},
+                [{"user_id": 9, "body": body}],
+                folder, "1", "2")
+        html = shown["9"]["parts"][0]["html"]
+        self.assertIn("<h2>", html)
+        self.assertIn("<strong>", html)
+        self.assertIn("<table>", html)
+        self.assertIn("<th>", html)
+        self.assertIn("<td>Walker</td>", html)
+        self.assertNotIn("<script>", html)
+        self.assertNotIn("alert", html)
+        self.assertIn("/api/a/1/2/file?name=9_rce55_chart.png", html)
+        self.assertNotIn("school.example", html)
+        # The copy handed to the page is not written back onto the extract
+        # the grader reads.
+        self.assertNotIn("html", extract_submission(body, []).parts[0].__dict__)
 
     def test_a_png_submission_is_graded_as_an_image(self):
         with tempfile.TemporaryDirectory() as tmp:

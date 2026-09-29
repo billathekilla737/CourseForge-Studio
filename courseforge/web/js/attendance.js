@@ -16,6 +16,11 @@
   ];
   const DOW = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
   let token = 0;
+  // Status clicks paint before the request returns. One request is in flight;
+  // the rest wait in markQueue so an older reply cannot land last and win.
+  let markQueue = [];
+  let markFlight = null;
+  let markGen = 0;
 
   function mem() {
     S.attendance = S.attendance || { filter: 'trouble' };
@@ -130,11 +135,11 @@
   }
 
   async function quietSync(cid, mine, shown) {
-    if (patternDirty() || mem().needsPush) return;
+    if (patternDirty() || mem().needsPush || marksBusy()) return;
     try {
       const data = await api('/attendance/' + encodeURIComponent(cid) + '/sync', { body: {} });
       if (mine !== token || String(mem().courseId) !== String(cid)) return;
-      if (patternDirty()) return;
+      if (patternDirty() || marksBusy()) return;
       if (snap(data) === snap(shown)) return;
       mem().data = data;
       paint();
@@ -228,13 +233,26 @@
     if (!cid || (S.view && S.view !== 'area' && !leaving)) return;
     const payload = pendingBody();
     const retry = mem().retry;
-    if (!payload && !retry && !mem().needsPush) return;
+    const queued = unackedGroups();
+    if (!payload && !retry && !mem().needsPush && !queued.length) return;
     if (leaving) {
-      if (retry) keepalivePost(cid, retry.path, retry.body);
+      // The click is already on disk once its request landed. This sends
+      // anything still queued, including a newer status than the request
+      // already in flight. The server keeps the later timestamp.
+      if (queued.length) queued.forEach(body => keepalivePost(cid, '/marks', body));
+      else if (retry) keepalivePost(cid, retry.path, retry.body);
       if (payload) keepalivePost(cid, '/flush', payload);
-      else if (!retry && mem().needsPush) keepalivePost(cid, '/flush', {});
+      else if (!retry && !queued.length && mem().needsPush) keepalivePost(cid, '/flush', {});
       mem().needsPush = false;
       mem().retry = null;
+      mem().markDirty = false;
+      markQueue = [];
+      markFlight = null;
+      markGen++;
+      return;
+    }
+    if (queued.length || marksBusy()) {
+      if (payload) scheduleSave();
       return;
     }
     if (retry) send(retry.path, retry.body);
@@ -242,7 +260,228 @@
     else send('/flush', {});
   }
 
+  function nowIso() {
+    const d = new Date();
+    const p = (n, w) => String(n).padStart(w || 2, '0');
+    return p(d.getUTCFullYear(), 4) + '-' + p(d.getUTCMonth() + 1) + '-' + p(d.getUTCDate())
+      + 'T' + p(d.getUTCHours()) + ':' + p(d.getUTCMinutes()) + ':' + p(d.getUTCSeconds())
+      + '.' + p(d.getUTCMilliseconds(), 3) + '+00:00';
+  }
+
+  function marksBusy() {
+    return markFlight !== null || markQueue.length > 0 || !!mem().markDirty;
+  }
+
+  function coalesceMarks(ops) {
+    const list = (ops || []).filter(op => op && op.date);
+    if (!list.length) return null;
+    const date = String(list[0].date);
+    if (list.some(op => String(op.date) !== date)) return null;
+    const marks = new Map();
+    let fill = '';
+    list.forEach(op => {
+      if (op.fill === 'present') fill = 'present';
+      (op.marks || []).forEach(m => {
+        if (m && m.user_id != null) marks.set(String(m.user_id), m);
+      });
+    });
+    const body = { date: date, marks: [...marks.values()] };
+    if (fill) body.fill = fill;
+    return body;
+  }
+
+  function unackedGroups() {
+    const ops = [];
+    if (markFlight) ops.push(markFlight);
+    markQueue.forEach(op => ops.push(op));
+    const order = [];
+    const byDate = new Map();
+    ops.forEach(op => {
+      const date = String(op.date || '');
+      if (!byDate.has(date)) {
+        byDate.set(date, []);
+        order.push(date);
+      }
+      byDate.get(date).push(op);
+    });
+    return order.map(date => coalesceMarks(byDate.get(date))).filter(Boolean);
+  }
+
+  function takeBatch() {
+    if (!markQueue.length) return null;
+    const date = String(markQueue[0].date);
+    const group = [];
+    while (markQueue.length && String(markQueue[0].date) === date) group.push(markQueue.shift());
+    return coalesceMarks(group);
+  }
+
+  function localTotals(data) {
+    const meetings = data.meetings || [];
+    const marks = data.marks || {};
+    const ids = [];
+    const seen = new Set();
+    (data.roster || []).forEach(p => {
+      const uid = String(p.user_id);
+      if (uid && !seen.has(uid)) { seen.add(uid); ids.push(uid); }
+    });
+    Object.keys(marks).forEach(day => {
+      Object.keys(marks[day] || {}).forEach(uid => {
+        if (uid && !seen.has(uid)) { seen.add(uid); ids.push(uid); }
+      });
+    });
+    return ids.map(uid => {
+      const count = { user_id: uid, present: 0, tardy: 0, absent: 0, excused: 0, minutes: 0 };
+      meetings.forEach(day => {
+        const mark = (marks[day] || {})[uid] || {};
+        if (Object.prototype.hasOwnProperty.call(count, mark.status)) count[mark.status] += 1;
+        if (mark.status === 'tardy') count.minutes += Number(mark.minutes) || 0;
+      });
+      return count;
+    });
+  }
+
+  function visibleSnap(data) {
+    data = data || {};
+    const marks = {};
+    Object.keys(data.marks || {}).sort().forEach(day => {
+      const cell = {};
+      Object.keys(data.marks[day] || {}).sort().forEach(uid => {
+        const m = data.marks[day][uid] || {};
+        cell[uid] = [m.status || '', Number(m.minutes) || 0, m.note || ''];
+      });
+      marks[day] = cell;
+    });
+    const totals = (data.totals || []).map(r => [
+      String(r.user_id), r.present || 0, r.tardy || 0, r.absent || 0,
+      r.excused || 0, Number(r.minutes) || 0,
+    ]).sort();
+    const range = data.range || {};
+    return JSON.stringify({
+      meetings: (data.meetings || []).slice().sort(),
+      marks: marks,
+      totals: totals,
+      range: [range.start || '', range.end || ''],
+    });
+  }
+
+  function applyLocal(body) {
+    const data = mem().data;
+    if (!data || !body || !body.date) return false;
+    const date = String(body.date);
+    if (!data.marks) data.marks = {};
+    if (!data.marks[date]) data.marks[date] = {};
+    const cell = data.marks[date];
+    if (body.fill === 'present') {
+      (data.roster || []).forEach(p => {
+        const uid = String(p.user_id);
+        const current = cell[uid];
+        if (current && current.status) return;
+        cell[uid] = { status: 'present', minutes: 0, note: '', updated: nowIso() };
+      });
+    }
+    (body.marks || []).forEach(raw => {
+      const uid = String(raw.user_id || '');
+      if (!uid) return;
+      const prev = cell[uid] || {};
+      let status = String(raw.status || '').toLowerCase();
+      if (status === 'clear' || status === 'unmarked') status = '';
+      const stamp = raw.updated || nowIso();
+      if (stamp && prev.updated && stamp < prev.updated) return;
+      if (!status) {
+        delete cell[uid];
+        return;
+      }
+      cell[uid] = {
+        status: status,
+        minutes: status === 'tardy'
+          ? (Number(raw.minutes != null ? raw.minutes : (prev.minutes || 0)) || 0) : 0,
+        note: raw.note != null ? String(raw.note) : (prev.note || ''),
+        updated: stamp,
+      };
+    });
+    if (!Object.keys(cell).length) delete data.marks[date];
+    const any = Object.keys(data.marks[date] || {}).some(uid => data.marks[date][uid] && data.marks[date][uid].status);
+    if (any) {
+      data.meetings = data.meetings || [];
+      if (data.meetings.indexOf(date) < 0) data.meetings.push(date);
+      data.meetings.sort();
+    }
+    data.totals = localTotals(data);
+    return true;
+  }
+
+  function queueMarks(body) {
+    body = Object.assign({}, body || {});
+    body.marks = (body.marks || []).map(raw => Object.assign({}, raw, {
+      updated: raw.updated || nowIso(),
+    }));
+    const wasMeeting = !!(mem().data && (mem().data.meetings || []).indexOf(String(body.date)) >= 0);
+    if (!applyLocal(body)) return;
+    const one = !body.fill && body.marks.length === 1;
+    if (one && wasMeeting) paintTouched(String(body.marks[0].user_id), String(body.date));
+    else paintStill();
+    markQueue.push(body);
+    mem().markDirty = true;
+    pumpMarks();
+  }
+
+  function takeBatchAndSend() {
+    return takeBatch();
+  }
+
+  async function pumpMarks() {
+    if (markFlight || !markQueue.length) return;
+    const cid = mem().courseId;
+    const gen = markGen;
+    const body = takeBatchAndSend();
+    if (!body) return;
+    markFlight = body;
+    try {
+      const data = await api('/attendance/' + encodeURIComponent(cid) + '/marks', { body: body });
+      if (String(mem().courseId) !== String(cid) || markGen !== gen) {
+        markFlight = null;
+        return;
+      }
+      markFlight = null;
+      if (markQueue.length) {
+        pumpMarks();
+        return;
+      }
+      mem().markDirty = false;
+      mem().needsPush = data.sync === 'error';
+      const same = visibleSnap(mem().data) === visibleSnap(data);
+      mem().data = data;
+      if (!same) paintStill();
+      if (mem().needsPush) {
+        scheduleSave();
+        setStatus('saved here; the Canvas copy will be sent again', 'err');
+      } else {
+        setStatus('saved', 'ok');
+      }
+    } catch (err) {
+      const failed = markFlight;
+      markFlight = null;
+      if (String(mem().courseId) !== String(cid) || markGen !== gen) return;
+      const rejected = err && err.status === 400;
+      if (rejected) {
+        markQueue = [];
+        mem().markDirty = false;
+        setStatus(firstLine(err.message), 'err');
+        reload();
+        return;
+      }
+      if (failed) markQueue.unshift(failed);
+      mem().needsPush = true;
+      setStatus(firstLine(err.message), 'err');
+      setTimeout(() => { if (!markFlight && markQueue.length) pumpMarks(); }, 800);
+    }
+  }
+
   async function send(path, body) {
+    if (path === '/marks') {
+      queueMarks(body || {});
+      return;
+    }
     const mine = ++token;
     const cid = mem().courseId;
     const keep = document.activeElement && document.activeElement.getAttribute
@@ -252,6 +491,11 @@
     try {
       const data = await api('/attendance/' + encodeURIComponent(cid) + path, { body: body || {} });
       if (mine !== token || String(mem().courseId) !== String(cid)) return;
+      if ((marksBusy() || mem().markDirty) && mem().data) {
+        data.marks = mem().data.marks;
+        data.totals = mem().data.totals;
+        data.meetings = mem().data.meetings;
+      }
       mem().data = data;
       mem().retry = null;
       mem().needsPush = data.sync === 'error';
@@ -290,7 +534,69 @@
     wire(host);
     if (keep) {
       const back = host.querySelector('[data-keep="' + CSS.escape(keep) + '"]');
-      if (back) back.focus();
+      if (back) back.focus({ preventScroll: true });
+    }
+  }
+
+  function paintStill(keep) {
+    const scroller = $('#viewArea');
+    const top = scroller ? scroller.scrollTop : 0;
+    const left = scroller ? scroller.scrollLeft : 0;
+    if (!keep && document.activeElement && document.activeElement.getAttribute) {
+      keep = document.activeElement.getAttribute('data-keep') || '';
+    }
+    paint(keep);
+    if (scroller) {
+      scroller.scrollTop = top;
+      scroller.scrollLeft = left;
+    }
+  }
+
+  /* One row, the day cell, and the totals. Rebuilding the whole calendar on
+     every click threw away the scroll position and waited on the network. */
+  function paintTouched(uid, iso) {
+    const data = mem().data;
+    const host = $('#areaBody');
+    if (!host || !data || !iso || iso !== mem().selected) return paintStill();
+    const scroller = $('#viewArea');
+    const top = scroller ? scroller.scrollTop : 0;
+    const left = scroller ? scroller.scrollLeft : 0;
+    const keep = document.activeElement && document.activeElement.getAttribute
+      ? document.activeElement.getAttribute('data-keep') : '';
+    const probe = host.querySelector('[data-uid="' + CSS.escape(String(uid)) + '"]');
+    const person = probe && probe.closest('.atPerson');
+    if (!person) return paintStill(keep);
+    const mark = ((data.marks || {})[iso] || {})[String(uid)] || {};
+    const wrap = document.createElement('div');
+    wrap.innerHTML = personRow(data, String(uid), mark);
+    const next = wrap.firstElementChild;
+    if (!next) return paintStill(keep);
+    person.replaceWith(next);
+    wirePerson(next);
+    const oldDay = host.querySelector('[data-date="' + CSS.escape(iso) + '"]');
+    if (oldDay) {
+      const dayWrap = document.createElement('div');
+      dayWrap.innerHTML = dayCell(data, iso);
+      const fresh = dayWrap.firstElementChild;
+      if (fresh) {
+        oldDay.replaceWith(fresh);
+        wireDay(fresh);
+      }
+    }
+    const tot = host.querySelector('#atTotH');
+    const section = tot && tot.closest('section');
+    if (section) {
+      const totWrap = document.createElement('div');
+      totWrap.innerHTML = totalsHtml(data);
+      if (totWrap.firstElementChild) section.replaceWith(totWrap.firstElementChild);
+    }
+    if (keep) {
+      const back = host.querySelector('[data-keep="' + CSS.escape(keep) + '"]');
+      if (back) back.focus({ preventScroll: true });
+    }
+    if (scroller) {
+      scroller.scrollTop = top;
+      scroller.scrollLeft = left;
     }
   }
 
@@ -332,46 +638,48 @@
       Nothing is sent to the gradebook.</p>`}`;
   }
 
-  function calendarHtml(data, month) {
-    const [y, m] = month.split('-').map(Number);
-    const firstDow = new Date(y, m - 1, 1).getDay();
-    const count = new Date(y, m, 0).getDate();
+  function dayCell(data, iso) {
     const meetings = new Set(data.meetings || []);
     const breaks = new Set(data.breaks || []);
     const today = isoToday();
     const filter = mem().filter || 'trouble';
+    const d = Number(iso.slice(8));
+    const meet = meetings.has(iso);
+    const brk = breaks.has(iso);
+    const counts = dayCounts(data, iso);
+    const cls = ['atDay'];
+    if (iso === today) cls.push('today');
+    if (!meet) cls.push('off');
+    if (brk && !meet) cls.push('break');
+    if (meet && counts.absent) cls.push('absent');
+    else if (meet && counts.tardy) cls.push('tardy');
+    else if (meet && allHere(data, counts)) cls.push('here');
+    const dim = (filter === 'absent' && meet && !counts.absent)
+      || (filter === 'tardy' && meet && !counts.tardy);
+    if (dim) cls.push('dim');
+    const people = meet ? glancePeople(data, iso) : [];
+    const line = people.length
+      ? people.map(p => p.short + (p.word ? ', ' + p.word : '')).join('; ')
+      : cellLine(data, meet, brk, counts);
+    const pressed = iso === mem().selected;
+    const glance = people.map(p =>
+      `<span class="atWhoLine ${p.status}" title="${esc(p.full + (p.word ? ', ' + p.word : ''))}">${
+        esc(p.short)}${p.word ? `<i>${esc(p.word)}</i>` : ''}</span>`).join('');
+    return `<button type="button" class="${cls.join(' ')}" data-date="${iso}"
+      data-keep="day-${iso}" aria-pressed="${pressed ? 'true' : 'false'}"
+      aria-label="${esc(longDay(iso) + (line ? ', ' + line : ''))}">
+      <span class="atNum">${d}</span>
+      ${glance ? `<span class="atGlance">${glance}</span>` : (line ? `<span class="atCount">${esc(line)}</span>` : '')}
+    </button>`;
+  }
+
+  function calendarHtml(data, month) {
+    const [y, m] = month.split('-').map(Number);
+    const firstDow = new Date(y, m - 1, 1).getDay();
+    const count = new Date(y, m, 0).getDate();
     let cells = '';
     for (let i = 0; i < firstDow; i++) cells += '<div></div>';
-    for (let d = 1; d <= count; d++) {
-      const iso = month + '-' + pad(d);
-      const meet = meetings.has(iso);
-      const brk = breaks.has(iso);
-      const counts = dayCounts(data, iso);
-      const cls = ['atDay'];
-      if (iso === today) cls.push('today');
-      if (!meet) cls.push('off');
-      if (brk && !meet) cls.push('break');
-      if (meet && counts.absent) cls.push('absent');
-      else if (meet && counts.tardy) cls.push('tardy');
-      else if (meet && allHere(data, counts)) cls.push('here');
-      const dim = (filter === 'absent' && meet && !counts.absent)
-        || (filter === 'tardy' && meet && !counts.tardy);
-      if (dim) cls.push('dim');
-      const people = meet ? glancePeople(data, iso) : [];
-      const line = people.length
-        ? people.map(p => p.short + (p.word ? ', ' + p.word : '')).join('; ')
-        : cellLine(data, meet, brk, counts);
-      const pressed = iso === mem().selected;
-      const glance = people.map(p =>
-        `<span class="atWhoLine ${p.status}" title="${esc(p.full + (p.word ? ', ' + p.word : ''))}">${
-          esc(p.short)}${p.word ? `<i>${esc(p.word)}</i>` : ''}</span>`).join('');
-      cells += `<button type="button" class="${cls.join(' ')}" data-date="${iso}"
-        data-keep="day-${iso}" aria-pressed="${pressed ? 'true' : 'false'}"
-        aria-label="${esc(longDay(iso) + (line ? ', ' + line : ''))}">
-        <span class="atNum">${d}</span>
-        ${glance ? `<span class="atGlance">${glance}</span>` : (line ? `<span class="atCount">${esc(line)}</span>` : '')}
-      </button>`;
-    }
+    for (let d = 1; d <= count; d++) cells += dayCell(data, month + '-' + pad(d));
     const prev = shiftMonth(month, -1);
     const next = shiftMonth(month, 1);
     return `<div class="atCalHead">
@@ -571,12 +879,7 @@
         paint();
       };
     });
-    host.querySelectorAll('[data-date]').forEach(btn => {
-      btn.onclick = () => {
-        mem().selected = btn.getAttribute('data-date');
-        paint('day-' + mem().selected);
-      };
-    });
+    host.querySelectorAll('[data-date]').forEach(wireDay);
     host.querySelectorAll('[data-filter]').forEach(btn => {
       btn.onclick = () => {
         mem().filter = btn.getAttribute('data-filter');
@@ -589,13 +892,25 @@
     if (hold) hold.onclick = () => send('/meet', { date: mem().selected, on: true });
     const rest = host.querySelector('#atRest');
     if (rest) rest.onclick = () => send('/marks', { date: mem().selected, fill: 'present', marks: [] });
-    host.querySelectorAll('[data-mark]').forEach(btn => {
+    host.querySelectorAll('.atPerson').forEach(wirePerson);
+  }
+
+  function wireDay(btn) {
+    btn.onclick = () => {
+      mem().selected = btn.getAttribute('data-date');
+      paint('day-' + mem().selected);
+    };
+  }
+
+  function wirePerson(row) {
+    if (!row) return;
+    row.querySelectorAll('[data-mark]').forEach(btn => {
       btn.onclick = () => send('/marks', {
         date: mem().selected,
         marks: [{ user_id: btn.getAttribute('data-uid'), status: btn.getAttribute('data-mark') }],
       });
     });
-    host.querySelectorAll('[data-minutes]').forEach(input => {
+    row.querySelectorAll('[data-minutes]').forEach(input => {
       input.onchange = () => send('/marks', {
         date: mem().selected,
         marks: [{

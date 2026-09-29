@@ -602,7 +602,8 @@ def _work_for_model(entry: dict, pseud: Pseudonymizer) -> str:
 # ------------------------------------------------------------------ prompts
 def build_prompt(assignment: dict, rubric: list[dict], entry: dict,
                  instructions: str, label: str,
-                 pseud: Pseudonymizer | None = None) -> str:
+                 pseud: Pseudonymizer | None = None,
+                 addressed: bool = False) -> str:
     lines: list[str] = []
     lines.append(f"# Assignment: {assignment.get('name','(untitled)')}")
     lines.append(f"Points possible: {assignment.get('points_possible')}")
@@ -646,17 +647,27 @@ def build_prompt(assignment: dict, rubric: list[dict], entry: dict,
         if pseud is not None:
             noted = nicknames.redact(pseud.scrub_roster(noted), pseud)
         lines.append(noted)
+        lines.append(
+            "Apply these instructions to the student below. They are in force "
+            "for a re-grade of one student, not only when the whole class is graded.")
         lines.append("")
 
+    waived = latepolicy.waiver(instructions, entry, addressed=addressed) if instructions.strip() else ""
     lines.append(f"## Student {label}")
     meta = [f"status: {entry.get('status')}"]
     if entry.get("submitted_at"):
         meta.append(f"submitted: {entry['submitted_at']}")
     if entry.get("late"):
-        meta.append("LATE")
-        meta.append(
-            "Grade the work as if it were on time. Do not dock points for "
-            "lateness; the Studio applies the syllabus late policy after you score.")
+        if waived:
+            meta.append("submitted late — penalty waived by the instructor")
+            meta.append(
+                "Do not mention that the work is late, and do not lower any "
+                "score because it is late. The instructor already waived that.")
+        else:
+            meta.append("LATE")
+            meta.append(
+                "Grade the work as if it were on time. Do not dock points for "
+                "lateness; the Studio applies the syllabus late policy after you score.")
     meta.append(f"word count: {entry.get('words', 0)}")
     if entry.get("filenames"):
         files = list(entry["filenames"])
@@ -756,7 +767,7 @@ def _num(value) -> str:
 # ------------------------------------------------------------------ grading
 def grade_one(cfg: Config, assignment: dict, rubric: list[dict], entry: dict,
               instructions: str, progress: Progress = _noop,
-              students: list | None = None) -> dict:
+              students: list | None = None, addressed: bool = False) -> dict:
     """Grade a single student. Returns a draft entry; never raises."""
     uid = entry["user_id"]
     label = (entry.get("pseudonym") if cfg.pseudonymize
@@ -835,7 +846,8 @@ def grade_one(cfg: Config, assignment: dict, rubric: list[dict], entry: dict,
     _item(progress, label, "reading the submission",
           _brief(len(entry.get("text") or "")))
     prompt = build_prompt(assignment, rubric, entry, instructions, label,
-                          pseud=Pseudonymizer(students or [], enabled=cfg.pseudonymize))
+                          pseud=Pseudonymizer(students or [], enabled=cfg.pseudonymize),
+                          addressed=addressed)
 
     # Student screenshots always go. The Blender contact sheet is optional:
     # blend_vision is about that render, not about whether a PNG submission
@@ -1307,7 +1319,10 @@ def grade_assignment(cfg: Config, store: Store, course_id, assignment_id,
     if not extracted:
         raise RuntimeError("Nothing synced for this assignment yet -- run Sync first.")
 
-    targets = [uid for uid in extracted if not only or uid in set(only)]
+    # Ids from the page are strings. A numeric id would otherwise match nobody,
+    # and the re-grade would finish without touching the student.
+    wanted = None if not only else {str(u) for u in only}
+    targets = [uid for uid in extracted if wanted is None or str(uid) in wanted]
     done = 0
     total = len(targets)
     # Emit the total up front so the bar appears immediately; the first student
@@ -1327,7 +1342,7 @@ def grade_assignment(cfg: Config, store: Store, course_id, assignment_id,
     with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
         futures = {
             pool.submit(grade_one, cfg, assignment, rubric, extracted[uid],
-                        instructions, progress, roster): uid
+                        instructions, progress, roster, bool(wanted)): uid
             for uid in targets
         }
         for future in concurrent.futures.as_completed(futures):
@@ -1346,7 +1361,7 @@ def grade_assignment(cfg: Config, store: Store, course_id, assignment_id,
                          else nicknames.shown(info.get("name"), uid)) or uid
                 _item(progress, label, "failed", str(exc)[:80], finished=True)
             info = extracted.get(uid) or {}
-            reason = latepolicy.waiver(instructions, info)
+            reason = latepolicy.waiver(instructions, info, addressed=bool(wanted))
             if reason:
                 result = dict(result)
                 result["late_penalty"] = {
@@ -1357,7 +1372,11 @@ def grade_assignment(cfg: Config, store: Store, course_id, assignment_id,
                 result = latepolicy.attach(result, info, late_policy, possible)
             # Write through the store, which re-reads under a lock. Holding a
             # local snapshot here let two overlapping jobs erase each other.
-            store.put_student(course_id, assignment_id, uid, result)
+            # A picked re-grade is the instructor asking for a new score.
+            # A Canvas grade or a hand edit must not hide that result. Auto-grade
+            # of the whole class still leaves those alone.
+            store.put_student(course_id, assignment_id, uid, result,
+                              keep_human=wanted is None)
             done += 1
             progress(f"graded {done}/{total}", done, total)
 

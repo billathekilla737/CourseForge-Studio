@@ -92,6 +92,87 @@ class LocalState(unittest.TestCase):
         self.assertIsNotNone(state["touched_at"])
         self.assertIsNone(state["worked_at"])
 
+    def test_open_work_is_what_is_still_ungraded(self):
+        self.course(101, assignments=[
+            {"id": "1", "name": "Essay", "needs_grading": 12, "due_at": "2026-09-01T05:00:00Z"},
+            {"id": "2", "name": "Quiz", "needs_grading": 3, "due_at": "2026-09-02T05:00:00Z"},
+        ])
+        state = hub.local_state(self.app, 101)
+        self.assertEqual([row["name"] for row in state["open_work"]], ["Essay", "Quiz"])
+
+    def test_a_posted_grade_is_not_still_behind(self):
+        cdir = self.course(101, assignments=[
+            {"id": "1", "name": "Essay", "needs_grading": 12, "due_at": "2026-09-01T05:00:00Z"},
+            {"id": "2", "name": "Quiz", "needs_grading": 3, "due_at": "2026-09-02T05:00:00Z"},
+        ])
+        (cdir / "1").mkdir()
+        (cdir / "1" / "extracted.json").write_text(json.dumps({
+            "7": {"user_id": "7", "status": "submitted",
+                  "canvas_score": 10, "canvas_posted_at": "2026-09-03T00:00:00+00:00"},
+        }), encoding="utf-8")
+        state = hub.local_state(self.app, 101)
+        self.assertEqual([row["id"] for row in state["open_work"]], ["2"])
+        self.assertEqual(state["to_grade"], 1)
+        self.assertEqual(state["waiting"], 3)
+
+
+class Behind(unittest.TestCase):
+    def row(self, cid, n, due, name="Work"):
+        return {
+            "id": cid, "title": "Course %s" % cid, "code": "C%s" % cid,
+            "name": "Course %s" % cid, "open_work": [{
+                "id": 100 + cid, "name": name, "needs_grading": n, "due_at": due,
+            }],
+        }
+
+    def on(self, day):
+        """Noon on this computer, so the calendar day does not depend on UTC."""
+        from datetime import datetime
+        local = datetime.now().astimezone().tzinfo
+        return datetime(day.year, day.month, day.day, 12, 0, tzinfo=local).isoformat()
+
+    def test_days_past_due_come_first_and_only_five_are_kept(self):
+        from datetime import date
+        today = date(2026, 9, 29)
+        courses = [
+            self.row(1, 1, self.on(date(2026, 9, 10)), "One"),
+            self.row(2, 9, self.on(date(2026, 9, 11)), "Nine"),
+            self.row(3, 4, self.on(date(2026, 9, 12)), "Four early"),
+            self.row(4, 4, self.on(date(2026, 9, 13)), "Four later"),
+            self.row(5, 2, self.on(date(2026, 9, 14)), "Two"),
+            self.row(6, 8, "", "Eight undated"),
+            self.row(7, 3, self.on(date(2026, 9, 1)), "Three"),
+        ]
+        courses.append({
+            "id": 8, "excluded": True, "title": "Hidden", "code": "HID",
+            "open_work": [{"id": 99, "name": "Skip", "needs_grading": 40,
+                           "due_at": self.on(date(2026, 8, 1))}],
+        })
+        out = hub.take_behind(courses, today=today)
+        self.assertEqual([row["name"] for row in out],
+                         ["Three", "One", "Nine", "Four early", "Four later"])
+        self.assertEqual([row["days_behind"] for row in out], [28, 19, 18, 17, 16])
+        self.assertEqual(out[0]["course_code"], "C7")
+        self.assertEqual(len(out), 5)
+        self.assertNotIn("open_work", courses[0])
+        self.assertFalse(any(row["assignment_id"] == 99 for row in out))
+        self.assertEqual(set(out[0]), {
+            "course_id", "course_title", "course_code", "assignment_id",
+            "name", "needs_grading", "due_at", "days_behind",
+        })
+
+    def test_undated_and_not_yet_due_are_not_behind(self):
+        from datetime import date
+        today = date(2026, 9, 29)
+        out = hub.take_behind([
+            self.row(1, 4, "", "Undated"),
+            self.row(2, 40, self.on(date(2026, 10, 1)), "Later"),
+            self.row(3, 1, self.on(today), "Today"),
+            self.row(4, 1, self.on(date(2026, 9, 28)), "Yesterday"),
+        ], today=today)
+        self.assertEqual([row["name"] for row in out], ["Yesterday"])
+        self.assertEqual(out[0]["days_behind"], 1)
+
 
 class Resume(unittest.TestCase):
     def row(self, cid, worked=None, **extra):

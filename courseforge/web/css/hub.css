@@ -26,10 +26,10 @@
 .pickFold.onBand:hover{background:rgba(255,255,255,.18);color:#fff}
 .pickStats{display:none;grid-column:1 / -1;
   grid-template-columns:repeat(4,minmax(7.5rem,1fr));
-  justify-content:space-between;column-gap:1.15rem;row-gap:12px;margin-top:12px}
+  justify-content:space-between;column-gap:.8rem;row-gap:8px;margin-top:8px}
 .pickRow.open .pickStats,.resumeBand.open .pickStats{display:grid}
 .pickStat{display:block;background:var(--bg);border:1px solid var(--line);
-  border-radius:18px;padding:8px 10px;min-width:0;text-align:center}
+  border-radius:18px;padding:6px 8px;min-width:0;text-align:center}
 .pickStat b{display:block;font:700 15px/1.15 var(--mono);color:var(--ink);text-align:center}
 .pickStat span{display:block;margin-top:2px;font-size:10px;line-height:1.25;
   color:var(--muted);text-transform:uppercase;letter-spacing:.03em;text-align:center}

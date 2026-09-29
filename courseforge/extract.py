@@ -15,9 +15,10 @@ import time
 import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path
-from urllib.parse import unquote_plus, urlparse
+from urllib.parse import quote, unquote_plus, urlparse
 
 from .canvas_policy import file_url_allowed
+from .htmlclean import clean as clean_html
 
 IMAGE_EXT = {".jpg", ".jpeg", ".jpe", ".jfif", ".png", ".gif", ".webp",
              ".heic", ".bmp", ".tif", ".tiff"}
@@ -640,3 +641,78 @@ def extract_submission(body_html: str | None, files: list[Path],
                   "could not be downloaded; read them in SpeedGrader"),
         ))
     return sub
+
+
+_IMG = re.compile(r"<img\b[^>]*?\bsrc=\"([^\"]*)\"[^>]*>", re.I)
+_FILE_ID = re.compile(r"/files/(\d+)")
+
+
+def present_text_entries(extracted: dict | None, submissions: list | None,
+                         files_dir: Path, course_id, assignment_id,
+                         base_url: str = "") -> dict:
+    """Give each Canvas text entry the HTML the student actually wrote.
+
+    Grading still reads the flat text. The work pane should not: a table in
+    the editor is a table, not a line of pipes. The HTML is cleaned first.
+    Pictures already downloaded out of that entry are pointed at the local
+    file so they sit where the student put them. The stored extract is not
+    modified.
+    """
+    bodies: dict[str, str] = {}
+    for sub in submissions or []:
+        if isinstance(sub, dict) and sub.get("user_id") is not None:
+            bodies[str(sub["user_id"])] = sub.get("body") or ""
+    if not bodies or not extracted:
+        return extracted or {}
+    out: dict = {}
+    for uid, info in extracted.items():
+        raw = bodies.get(str(uid)) or ""
+        if not raw.strip() or not isinstance(info, dict):
+            out[uid] = info
+            continue
+        html = _entry_html(raw, str(uid), files_dir, course_id, assignment_id, base_url)
+        if not html:
+            out[uid] = info
+            continue
+        info = dict(info)
+        parts = []
+        placed = False
+        for part in info.get("parts") or []:
+            if (not placed and isinstance(part, dict)
+                    and part.get("label") == "Canvas text entry"):
+                part = dict(part)
+                part["html"] = html
+                placed = True
+            parts.append(part)
+        if placed:
+            info["parts"] = parts
+        out[uid] = info
+    return out
+
+
+def _local_rce(files_dir: Path, uid: str, file_id: str) -> Path | None:
+    if not files_dir.is_dir():
+        return None
+    matches = sorted(files_dir.glob(f"{uid}_rce{file_id}_*"))
+    return matches[0] if matches else None
+
+
+def _entry_html(raw: str, uid: str, files_dir: Path, course_id, assignment_id,
+                base_url: str) -> str:
+    html = clean_html(raw, base_url)
+    if not html:
+        return ""
+
+    def replace(match: re.Match) -> str:
+        src = match.group(1)
+        found = _FILE_ID.search(src)
+        if not found:
+            return ""
+        local = _local_rce(files_dir, uid, found.group(1))
+        if local is None:
+            return ""
+        url = (f"/api/a/{course_id}/{assignment_id}/file?name="
+               + quote(local.name))
+        return re.sub(r"\bsrc=\"[^\"]*\"", f'src="{url}"', match.group(0), count=1)
+
+    return _IMG.sub(replace, html).strip()

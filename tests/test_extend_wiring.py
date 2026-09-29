@@ -98,7 +98,9 @@ class TheShellKnowsAboutIt(unittest.TestCase):
         self.assertIn("extensions: 'Deadline extensions", read(WEB / "js" / "core.js"))
 
     def test_the_page_is_reachable_from_the_picker(self):
-        self.assertIn('href="#/extensions"', read(WEB / "js" / "hub.js"))
+        hub = read(WEB / "js" / "hub.js")
+        self.assertIn('href="${href}"', hub)
+        self.assertIn("'#/extensions'", hub)
 
     def test_the_record_names_the_area_in_words(self):
         self.assertIn("extend: 'Extensions'", read(WEB / "js" / "record.js"))

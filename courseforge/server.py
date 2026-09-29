@@ -614,10 +614,17 @@ class App:
     def workspace(self, course_id, assignment_id) -> dict:
         draft = self.store.draft(course_id, assignment_id)
         policy = draft.get("late_policy") or self.course_late_policy(course_id)
+        draft = self._reprice_late(course_id, assignment_id, draft, policy)
+        adir = self.store.assignment_dir(course_id, assignment_id)
+        extracted = extract.present_text_entries(
+            self.store.extracted(course_id, assignment_id),
+            self.store.read(adir / "submissions.json", []),
+            adir / "files", course_id, assignment_id,
+            getattr(self.cfg, "base_url", "") or "")
         return {
             "assignment": self.store.assignment(course_id, assignment_id),
             "draft": draft,
-            "extracted": self.store.extracted(course_id, assignment_id),
+            "extracted": extracted,
             "instructions": self.store.instructions(course_id, assignment_id),
             "late_policy": policy,
             "late_waiver": latepolicy.waives_everyone(
@@ -813,7 +820,7 @@ class App:
         extra = {}
         if entry.get("late_penalty") and curve.is_scored(entry):
             extra["late_penalty"] = latepolicy.refresh(
-                entry, curve.earned_total(entry, rubric))
+                entry, curve.earned_total(entry, rubric), possible)
             entry = {**entry, **extra}
         if curve.is_scored(entry) and (
                 entry.get("curve") or (entry.get("late_penalty") or {}).get("applied")):
@@ -843,6 +850,68 @@ class App:
                         "was_source": was_source,
                         "comment_changed": was_comment != (entry.get("comment") or "")})
         return entry
+
+    def _reprice_late(self, course_id, assignment_id, draft: dict, policy: dict) -> dict:
+        """Replace a late cut Studio already applied, using the fractional day.
+
+        Opening the assignment is enough for those rows. It does not re-grade
+        the work, add a cut to a score that never had one, or touch a waived
+        penalty or a course where Canvas already deducts.
+        """
+        if not policy or policy.get("canvas_applies"):
+            return draft
+        if policy.get("kind") != "percent_per_day":
+            return draft
+        extracted = self.store.extracted(course_id, assignment_id)
+        instructions = self.store.instructions(course_id, assignment_id)
+        rubric = draft.get("rubric") or []
+        possible = draft.get("points_possible") or 0
+        changed = False
+        with self.store.lock:
+            draft = self.store.draft(course_id, assignment_id)
+            for uid, entry in (draft.get("students") or {}).items():
+                if not entry or not curve.is_scored(entry):
+                    continue
+                info = extracted.get(str(uid)) or {}
+                if not info.get("late"):
+                    continue
+                current = dict(entry.get("late_penalty") or {})
+                # A score with no late cut, or one Canvas already took, stays
+                # as it is. This only replaces a cut Studio itself applied.
+                if not current or current.get("waived") or current.get("kind") == "canvas":
+                    continue
+                if latepolicy.waiver(instructions, info):
+                    continue
+                earned = curve.earned_total(entry, rubric)
+                fresh = latepolicy.attach(
+                    {"total": earned, "scores": entry.get("scores"), "flags": []},
+                    info, policy, possible)
+                new_lp = fresh.get("late_penalty")
+                if not new_lp:
+                    continue
+                old_flags = list(entry.get("flags") or [])
+                flags = [f for f in old_flags
+                         if not str(f).startswith("late penalty")]
+                flags.extend(f for f in (fresh.get("flags") or [])
+                             if str(f).startswith("late penalty"))
+                want = curve.final_total(
+                    {**entry, "late_penalty": new_lp}, rubric, possible)
+                same = (
+                    current.get("applied") == new_lp.get("applied")
+                    and current.get("points") == new_lp.get("points")
+                    and current.get("days") == new_lp.get("days")
+                    and current.get("summary") == new_lp.get("summary")
+                    and entry.get("final_total") == want
+                    and old_flags == flags
+                    and current.get("past_window") == new_lp.get("past_window"))
+                entry["late_penalty"] = new_lp
+                entry["flags"] = flags
+                entry["final_total"] = want
+                if not same:
+                    changed = True
+            if changed:
+                self.store.save_draft(course_id, assignment_id, draft)
+        return draft
 
     def _refresh_totals(self, course_id, assignment_id) -> None:
         """Recompute the posted total on every entry that has a curve or late dock."""

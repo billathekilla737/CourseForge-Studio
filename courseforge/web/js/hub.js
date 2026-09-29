@@ -202,52 +202,79 @@
   function renderAcross(host) {
     if (!host) return;
     const batchOn = typeof openBatch === 'function' || (window.Studio && window.Studio.areas && window.Studio.areas.has('a11y'));
-    const off = (t, m) => `<span class="acrossItem off" aria-disabled="true"
-        title="Not installed in this build"><span class="ic"></span>
-        <span><span class="t">${esc(t)}</span><span class="m">${esc(m)}</span></span></span>`;
+    /* The sentence stays on the link (hover and screen readers). Drawing it
+       under the name made this column taller than a 1080p window. */
+    const item = (href, ic, title, blurb, on) => {
+      const note = on ? blurb : 'Not installed in this build.';
+      const body = `<span class="ic${on ? ' ' + ic : ''}"></span>
+        <span><span class="t">${esc(title)}</span>
+        <span class="m">${esc(note)}</span></span>`;
+      if (!on) {
+        return `<span class="acrossItem off" aria-disabled="true" title="${esc(note)}">${body}</span>`;
+      }
+      return `<a class="acrossItem" href="${href}" title="${esc(note)}">${body}</a>`;
+    };
     host.innerHTML = `<div class="sectionHead"><h2 id="acrossH">Across your courses</h2>
       <span class="hint">several at once</span></div>
+    <div class="acrossCol">
     <section class="acrossStack" aria-labelledby="acrossH">
-      <a class="acrossItem" href="#/schedule"><span class="ic grade"></span>
-        <span><span class="t">Term schedule</span>
-        <span class="m">Every dated assignment in the term, week by week, with
-          reminders and announcements.</span></span></a>
-      <a class="acrossItem" href="#/students">
-        <span class="ic grade"></span>
-        <span><span class="t">Students</span>
-        <span class="m">Search one person across every course: accommodations,
-          extensions, grades, mail and notes.</span></span></a>
-      <a class="acrossItem" href="#/roster">
-        <span class="ic grade"></span>
-        <span><span class="t">Accommodations roster</span>
-        <span class="m">Standing extra time and attempts, applied to any quiz in
-          any course.</span></span></a>
-      ${batchOn
-        ? `<a class="acrossItem" href="#/batch"><span class="ic a11y"></span>
-             <span><span class="t">Batch Course Restyle</span>
-             <span class="m">Restyle and verify pages across several courses at
-               once. Dry run first.</span></span></a>`
-        : off('Batch Course Restyle', 'Not installed in this build.')}
-      ${batchOn
-        ? `<a class="acrossItem" href="#/files"><span class="ic a11y"></span>
-             <span><span class="t">ADA file compliance</span>
-             <span class="m">PDFs, slide decks and Word documents across several
-               courses. Survey first; nothing is uploaded until you say so.</span></span></a>`
-        : off('ADA file compliance', 'Not installed in this build.')}
-      <a class="acrossItem" href="#/extensions"><span class="ic record"></span>
-        <span><span class="t">Deadline extensions</span>
-        <span class="m">A student was ill or bereaved: give them longer on the work
-          that fell during the absence, in every course they are in. Nobody else's
-          dates move.</span></span></a>
-      <a class="acrossItem" href="#/reports"><span class="ic record"></span>
-        <span><span class="t">Reports</span>
-        <span class="m">An accessibility score with a before and an after, and every
-          syllabus checked against the statements your college requires.</span></span></a>
-    </section>`;
+      ${item('#/schedule', 'grade', 'Term schedule',
+        'Every dated assignment in the term, week by week, with reminders and announcements.', true)}
+      ${item('#/students', 'grade', 'Students',
+        'Search one person across every course: accommodations, extensions, grades, mail and notes.', true)}
+      ${item('#/roster', 'grade', 'Accommodations roster',
+        'Standing extra time and attempts, applied to any quiz in any course.', true)}
+      ${item('#/batch', 'a11y', 'Batch Course Restyle',
+        'Restyle and verify pages across several courses at once. Dry run first.', batchOn)}
+      ${item('#/files', 'a11y', 'ADA file compliance',
+        'PDFs, slide decks and Word documents across several courses. Survey first; nothing is uploaded until you say so.', batchOn)}
+      ${item('#/extensions', 'record', 'Deadline extensions',
+        "A student was ill or bereaved: give them longer on the work that fell during the absence, in every course they are in. Nobody else's dates move.", true)}
+      ${item('#/reports', 'record', 'Reports',
+        'An accessibility score with a before and an after, and every syllabus checked against the statements your college requires.', true)}
+    </section>
+    <div id="behindMount"></div>
+    </div>`;
+    if (typeof S !== 'undefined' && Array.isArray(S.behind)) renderBehind(host, S.behind);
+  }
+
+  /* To Do, same name as the Canvas list. Five assignments past their due
+     date, furthest first. The number is calendar days, not submissions. */
+  function renderBehind(host, rows) {
+    if (!host) return;
+    let mount = host.querySelector('#behindMount');
+    if (!mount) {
+      mount = document.createElement('div');
+      mount.id = 'behindMount';
+      const col = host.querySelector('.acrossCol');
+      (col || host).appendChild(mount);
+    }
+    const list = (Array.isArray(rows) ? rows : []).filter(row => (+row.days_behind || 0) >= 1).slice(0, 5);
+    const body = list.length
+      ? `<div class="behindList">${list.map(row => {
+          const course = row.course_title || row.course_code || '';
+          const code = row.course_code && row.course_code !== course ? row.course_code : '';
+          const klass = [code, course].filter(Boolean).join(' ') || 'Course';
+          const due = row.due_at && typeof fmtDate === 'function' ? fmtDate(row.due_at) : '';
+          const assignment = row.name || 'Assignment';
+          const meta = [klass, due].filter(Boolean).join(' · ');
+          const days = +row.days_behind || 0;
+          const label = days === 1 ? '1 day behind' : days + ' days behind';
+          return `<a class="behindItem" href="#/c/${esc(row.course_id)}/a/${esc(row.assignment_id)}">
+            <span class="behindText">
+              <span class="nm">${esc(assignment)}</span>
+              <span class="m">${esc(meta)}</span></span>
+            <span class="n">${esc(label)}</span></a>`;
+        }).join('')}</div>`
+      : '<p class="behindEmpty">Nothing is past its due date.</p>';
+    mount.innerHTML = `<section class="behindGrade" aria-labelledby="behindH">
+      <h2 id="behindH">To Do</h2>
+      ${body}</section>`;
   }
 
   document.addEventListener('studio:picker', ev => renderAcross(ev.detail && ev.detail.host));
 
   window.openHub = openHub;
+  window.renderBehind = renderBehind;
   Object.assign(window.Studio || (window.Studio = {}), { openHub, refreshHub });
 })();

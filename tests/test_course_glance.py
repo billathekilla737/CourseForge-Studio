@@ -45,6 +45,39 @@ class TheHomeListDrawsTheCards(unittest.TestCase):
         self.assertIn("border-radius:18px", css)
         self.assertNotIn(">Figures", src)
         self.assertIn(".pickStats{display:none", css.replace(" ", "").replace("\n", ""))
+        self.assertIn("function setAllGlance(", src)
+        opened = src[src.index("function glanceIsOpen"):src.index("function glanceCards")]
+        self.assertIn("return true", opened)
+        self.assertIn("all[id] = 0", src)
+        resume = src[src.index("function renderResume"):src.index("function ago(iso)")]
+        self.assertIn("Where you left off", resume)
+        self.assertIn("Carry on grading", resume)
+        self.assertNotIn("Open the course", resume)
+        self.assertNotIn("glanceCards", resume)
+        self.assertIn("btnExpand", src)
+        self.assertIn("btnCollapse", src)
+        page = (Path(__file__).resolve().parents[1] / "courseforge" / "web"
+                / "index.html").read_text(encoding="utf-8")
+        self.assertIn('id="btnExpand"', page)
+        self.assertIn('id="btnCollapse"', page)
+        hub = (Path(__file__).resolve().parents[1] / "courseforge" / "web" / "js"
+               / "hub.js").read_text(encoding="utf-8")
+        self.assertIn('id="behindH">To Do', hub)
+        self.assertNotIn("Five assignments, by how many days", hub)
+        self.assertIn("days behind", hub)
+        self.assertIn('class="nm">${esc(assignment)}', hub)
+        self.assertIn('class="m">${esc(meta)}', hub)
+        self.assertNotIn('class="pickCode"', hub)
+        self.assertNotIn("Most behind on grading", hub)
+        self.assertIn("id=\"behindMount\"", hub)
+        css_home = (Path(__file__).resolve().parents[1] / "courseforge" / "web"
+                    / "style.css").read_text(encoding="utf-8")
+        self.assertIn(".behindGrade", css_home)
+        self.assertIn(".acrossCol", css_home)
+        self.assertIn("Every dated assignment in the term", hub)
+        self.assertIn('title="${esc(note)}"', hub)
+        flat_home = css_home.replace(" ", "").replace("\n", "")
+        self.assertIn(".acrossItem.m{position:absolute", flat_home)
 
 
 class GlanceMatchesTheCoursePage(unittest.TestCase):

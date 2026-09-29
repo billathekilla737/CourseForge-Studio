@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>CourseForge Studio</title>
 <link rel="icon" href="favicon.svg" type="image/svg+xml">
-<link rel="stylesheet" href="style.css?v=pdf-1">
+<link rel="stylesheet" href="style.css?v=todo-8">
 <!-- Area-only styles. An area that is not installed yet has no file here; the
      404 is harmless and the page renders without it. -->
 <link rel="stylesheet" href="css/a11y.css">
@@ -15,7 +15,7 @@
 <link rel="stylesheet" href="css/courseops.css">
 <link rel="stylesheet" href="css/assistant.css">
 <link rel="stylesheet" href="css/student.css?v=students-12">
-<link rel="stylesheet" href="css/hub.css?v=glance-5">
+<link rel="stylesheet" href="css/hub.css?v=glance-7">
 <link rel="stylesheet" href="css/inbox.css?v=inbox-3">
 <link rel="stylesheet" href="css/attendance.css?v=attend-5">
 <link rel="stylesheet" href="css/schedule.css?v=schedcal-1">
@@ -57,6 +57,10 @@
     <h2 id="pickerTitle">Your courses</h2>
     <span class="hint" id="pickerHint">Reading your courses from Canvas…</span>
     <div class="spacer"></div>
+    <button class="btn sm" id="btnExpand" type="button" hidden
+      title="Show the figures for every course in this list">Expand all</button>
+    <button class="btn sm" id="btnCollapse" type="button" hidden
+      title="Hide the figures for every course in this list">Collapse all</button>
     <button class="btn sm" id="btnRefresh">Refresh from Canvas</button>
   </div>
   <div id="pickerBody"></div>
@@ -164,8 +168,8 @@
      shrugs off; its hub card says "Not installed". -->
 <script src="js/core.js?v=load-5"></script>
 <script src="js/components.js"></script>
-<script src="js/grade.js?v=pdf-1"></script>
-<script src="js/hub.js?v=graded-1"></script>
+<script src="js/grade.js?v=home-2"></script>
+<script src="js/hub.js?v=todo-6"></script>
 <script src="js/a11y.js"></script>
 <script src="js/files.js"></script>
 <script src="js/docs.js"></script>
@@ -178,7 +182,7 @@
 <script src="js/reports.js"></script>
 <script src="js/extend.js?v=nick-1"></script>
 <script src="js/student.js?v=students-11"></script>
-<script src="js/attendance.js?v=attend-4"></script>
+<script src="js/attendance.js?v=attend-6"></script>
 <script src="js/boot.js"></script>
 <script type="module" src="js/docview.js?v=docx-1"></script>
 <script type="module" src="js/pdfview.js?v=pdf-1"></script>

@@ -84,6 +84,16 @@ class Book(unittest.TestCase):
         self.assertEqual(merged["weekdays"], ["wed"])
         self.assertNotIn("name", json.dumps(merged))
 
+    def test_an_older_click_does_not_cover_a_newer_one(self):
+        stored = book.apply_marks(book.empty_book(), "2026-09-02", [
+            {"user_id": "101", "status": "absent", "updated": "2026-09-02T12:00:02.000+00:00"},
+        ])
+        stored = book.apply_marks(stored, "2026-09-02", [
+            {"user_id": "101", "status": "present", "updated": "2026-09-02T12:00:01.000+00:00"},
+        ])
+        shown = book.public_marks(stored)["2026-09-02"]
+        self.assertEqual(shown["101"]["status"], "absent")
+
     def test_a_bad_mark_is_refused(self):
         with self.assertRaises(ValueError):
             book.apply_marks(book.empty_book(), "2026-09-02", [
@@ -164,6 +174,80 @@ class OnDisk(unittest.TestCase):
         save_sidecar(self.tmp, book.sync_key("734975"),
                      {"sha256": _digest(book.clean_book(stored))})
         self.assertEqual(book.outstanding(self.app), [])
+
+    def test_a_status_click_saves_without_calling_canvas(self):
+        from unittest import mock
+        from courseforge.attendance import routes
+        req = type("R", (), {
+            "app": self.app,
+            "params": {"cid": "734975"},
+            "body": {"date": "2026-09-02", "marks": [
+                {"user_id": "101", "status": "absent",
+                 "updated": "2026-09-02T15:00:00.000+00:00"},
+            ]},
+        })()
+        with mock.patch.object(book, "nudge") as nudged:
+            with mock.patch.object(book, "_remote", side_effect=AssertionError("canvas read")):
+                with mock.patch.object(book, "_push", side_effect=AssertionError("canvas write")):
+                    out = routes.marks(req)
+        nudged.assert_called_once()
+        self.assertEqual(out["sync"], "local")
+        self.assertEqual(out["marks"]["2026-09-02"]["101"]["status"], "absent")
+        raw = (self.tmp / "734975" / "attendance.json").read_text(encoding="utf-8")
+        self.assertIn("absent", raw)
+        self.assertNotIn("Casey", raw)
+
+    def test_two_overlapping_saves_both_stick(self):
+        import threading
+        barrier = threading.Barrier(2)
+        errors = []
+
+        def go(uid, status, stamp):
+            try:
+                barrier.wait(timeout=2)
+                book.apply_edit(self.app, "734975", {
+                    "date": "2026-09-02",
+                    "marks": [{"user_id": uid, "status": status, "updated": stamp}],
+                })
+            except Exception as exc:  # noqa: BLE001
+                errors.append(exc)
+
+        threads = [
+            threading.Thread(target=go, args=("101", "present", "2026-09-02T15:00:01.000+00:00")),
+            threading.Thread(target=go, args=("205", "absent", "2026-09-02T15:00:02.000+00:00")),
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(3)
+            self.assertFalse(thread.is_alive())
+        self.assertEqual(errors, [])
+        shown = book.public_marks(book.load(self.app, "734975"))["2026-09-02"]
+        self.assertEqual(shown["101"]["status"], "present")
+        self.assertEqual(shown["205"]["status"], "absent")
+
+    def test_a_mark_saved_while_canvas_is_reading_is_kept(self):
+        from unittest import mock
+
+        def remote(app, cid):
+            self.assertTrue(book._disk_lock.acquire(blocking=False))
+            book._disk_lock.release()
+            book.apply_edit(app, cid, {
+                "date": "2026-09-02",
+                "marks": [{"user_id": "205", "status": "tardy", "minutes": 4,
+                           "updated": "2026-09-02T15:00:00.000+00:00"}],
+            })
+            return {"marks": {"2026-09-02": {
+                "101": {"status": "present", "minutes": 0, "note": "",
+                        "updated": "2026-09-02T14:00:00+00:00"}}}}
+
+        with mock.patch.object(book, "nudge"):
+            with mock.patch.object(book, "_remote", side_effect=remote):
+                with mock.patch.object(book, "_push", return_value={"did": "sent"}):
+                    out = book.reconcile(self.app, "734975")
+        cell = out["marks"]["2026-09-02"]
+        self.assertEqual(cell["205"]["status"], "tardy")
+        self.assertEqual(cell["101"]["status"], "present")
 
     def test_opening_does_not_need_canvas_when_nothing_is_synced(self):
         shown = book.view(self.app, "734975", book.reconcile(self.app, "734975"))

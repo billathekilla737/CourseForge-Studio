@@ -77,32 +77,10 @@ def flush(req):
     not lose the marks. A later pass sends anything Canvas did not confirm.
     """
     cid = _cid(req)
-    body = _body(req)
-    stored = book.load(req.app, cid)
-    changed = False
     try:
-        if body.get("weekdays"):
-            stored = book.set_pattern(
-                stored, body.get("weekdays") or [],
-                str(body.get("start") or ""), str(body.get("end") or ""),
-                body.get("skip_breaks", True),
-            )
-            changed = True
-        if body.get("marks") or body.get("fill"):
-            people = [p["user_id"] for p in book.roster(req.app, cid)]
-            stored = book.apply_marks(
-                stored, str(body.get("date") or ""), body.get("marks") or [],
-                roster_ids=people, fill=str(body.get("fill") or ""),
-            )
-            changed = True
-        if (body.get("date") and "on" in body
-                and not (body.get("marks") or body.get("fill") or body.get("weekdays"))):
-            stored = book.set_meet(stored, str(body.get("date") or ""), bool(body.get("on")))
-            changed = True
+        book.apply_edit(req.app, cid, _body(req))
     except ValueError as exc:
         raise HTTPError(400, str(exc)) from None
-    if changed:
-        book.save(req.app, cid, stored)
     stored = book.reconcile(req.app, cid)
     out = _view(req.app, cid, stored)
     enabled = bool(getattr(getattr(req.app, "state_sync", None), "enabled", False))
@@ -127,60 +105,32 @@ def reload_roster(req):
     return _view(req.app, cid, stored)
 
 
-@route("POST", "/api/attendance/{cid}/pattern", area=AREA)
-def pattern(req):
+def _saved(req) -> dict:
+    """Write the edit and answer at once. The Canvas copy follows behind it."""
     cid = _cid(req)
-    body = _body(req)
-    stored = book.reconcile(req.app, cid)
     try:
-        stored = book.set_pattern(
-            stored, body.get("weekdays") or [],
-            str(body.get("start") or ""), str(body.get("end") or ""),
-            body.get("skip_breaks", True),
-        )
+        stored = book.apply_edit(req.app, cid, _body(req))
     except ValueError as exc:
         raise HTTPError(400, str(exc)) from None
-    book.save(req.app, cid, stored)
-    pushed = book._push(req.app, cid, stored)
+    book.nudge(req.app, cid)
     out = _view(req.app, cid, stored)
-    out["sync"] = pushed.get("did") or ""
+    out["sync"] = "local"
     return out
+
+
+@route("POST", "/api/attendance/{cid}/pattern", area=AREA)
+def pattern(req):
+    return _saved(req)
 
 
 @route("POST", "/api/attendance/{cid}/meet", area=AREA)
 def meet(req):
-    cid = _cid(req)
-    body = _body(req)
-    stored = book.reconcile(req.app, cid)
-    try:
-        stored = book.set_meet(stored, str(body.get("date") or ""), bool(body.get("on")))
-    except ValueError as exc:
-        raise HTTPError(400, str(exc)) from None
-    book.save(req.app, cid, stored)
-    pushed = book._push(req.app, cid, stored)
-    out = _view(req.app, cid, stored)
-    out["sync"] = pushed.get("did") or ""
-    return out
+    return _saved(req)
 
 
 @route("POST", "/api/attendance/{cid}/marks", area=AREA)
 def marks(req):
-    cid = _cid(req)
-    body = _body(req)
-    stored = book.reconcile(req.app, cid)
-    people = [p["user_id"] for p in book.roster(req.app, cid)]
-    try:
-        stored = book.apply_marks(
-            stored, str(body.get("date") or ""), body.get("marks") or [],
-            roster_ids=people, fill=str(body.get("fill") or ""),
-        )
-    except ValueError as exc:
-        raise HTTPError(400, str(exc)) from None
-    book.save(req.app, cid, stored)
-    pushed = book._push(req.app, cid, stored)
-    out = _view(req.app, cid, stored)
-    out["sync"] = pushed.get("did") or ""
-    return out
+    return _saved(req)
 
 
 def hub_status(app, course_id) -> dict:

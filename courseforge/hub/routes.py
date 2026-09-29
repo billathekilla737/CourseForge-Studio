@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import importlib
 import time
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 
 from .. import audit, gradesync, ledger
@@ -54,6 +54,9 @@ def picker(req):
         "courses": courses,
         "terms": app.term_summary(False),
         "resume": _resume(courses),
+        # Past-due work still to grade, most days first. The page keeps
+        # five for the term on screen. Disk only, from the same pass as the counts.
+        "behind": take_behind(courses, limit=None),
     }
 
 
@@ -153,6 +156,7 @@ def figures(app, cid, cdir: Path) -> dict:
         rows = []
     waiting = 0
     to_grade = 0
+    open_work = []
     for r in rows:
         if not isinstance(r, dict):
             continue
@@ -174,6 +178,12 @@ def figures(app, cid, cdir: Path) -> dict:
             continue
         to_grade += 1
         waiting += n
+        open_work.append({
+            "id": r.get("id"),
+            "name": r.get("name") or "",
+            "needs_grading": n,
+            "due_at": r.get("due_at") or "",
+        })
     graded = 0
     last: str | None = None
     try:
@@ -202,6 +212,7 @@ def figures(app, cid, cdir: Path) -> dict:
         "graded": graded,
         "writes_today": writes,
         "last_graded_at": last,
+        "open_work": open_work,
     }
 
 
@@ -246,7 +257,79 @@ def local_state(app, course_id) -> dict:
         "worked_at": _iso(newest_draft),
         "last_assignment": ({"id": newest_aid, "name": names.get(newest_aid or "", "")}
                             if newest_aid else None),
+        "open_work": fig["open_work"],
     }
+
+
+def days_behind(due_at, today: date | None = None) -> int | None:
+    """Calendar days from the due date to today, in this computer's time.
+
+    None when the assignment has no due date. Zero means it is due today.
+    A negative number is not due yet. An undated assignment is not behind.
+    """
+    text = str(due_at or "").strip()
+    if not text:
+        return None
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        when = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=timezone.utc)
+    due_day = when.astimezone().date()
+    today = today or datetime.now().astimezone().date()
+    return (today - due_day).days
+
+
+def take_behind(courses: list[dict], limit: int | None = 5,
+                today: date | None = None) -> list[dict]:
+    """Assignments still to grade, the ones furthest past their due date first.
+
+    A day is a calendar day on this computer, not a count of submissions.
+    Work that is not yet due, or has no due date, is left off: it is not
+    behind. The course rows lose `open_work` here. Pass limit=None for the
+    full ranking; the home page keeps five for the term on screen.
+    No student is named.
+    """
+    rows = []
+    for course in courses:
+        if course.get("excluded"):
+            course.pop("open_work", None)
+            continue
+        for item in course.pop("open_work", None) or []:
+            if not isinstance(item, dict):
+                continue
+            try:
+                n = int(item.get("needs_grading") or 0)
+            except (TypeError, ValueError):
+                continue
+            if n <= 0:
+                continue
+            due = str(item.get("due_at") or "")
+            days = days_behind(due, today)
+            if days is None or days < 1:
+                continue
+            rows.append({
+                "course_id": course.get("id"),
+                "course_title": course.get("title") or course.get("name") or "",
+                "course_code": course.get("code") or "",
+                "assignment_id": item.get("id"),
+                "name": item.get("name") or "",
+                "needs_grading": n,
+                "due_at": due,
+                "days_behind": days,
+            })
+
+    def key(row: dict):
+        return (-row["days_behind"], row.get("due_at") or "",
+                str(row.get("name") or "").lower())
+
+    rows.sort(key=key)
+    if limit is None:
+        return rows
+    return rows[:limit]
 
 
 def _iso(stamp: float) -> str | None:

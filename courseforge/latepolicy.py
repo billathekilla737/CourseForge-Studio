@@ -3,6 +3,8 @@
 Claude grades the work as if it were on time. This module reads the syllabus
 (and, when Canvas already has a late policy, that too), turns the prose into a
 percent, and docks the draft total. The earned rubric scores stay as they are.
+A per-day percent is taken off the assignment's points for the fraction of a
+day the roster shows. Half a day is half the daily cut, not a whole day.
 
 If Canvas itself is already deducting, Studio does not dock a second time.
 """
@@ -36,9 +38,9 @@ APPLY_KINDS = frozenset({
 # name ("ignore late grades for this assignment") covers the whole class.
 _WAIVE_ALL = re.compile(
     r"(?:"
-    r"(?:ignore|waive|skip|disregard|forgive)\s+(?:the\s+|any\s+|all\s+)?late\s+"
+    r"(?:ignore|waive|wave|skip|disregard|forgive)\s+(?:the\s+|any\s+|all\s+)?late\s+"
     r"(?:grades?|penalt(?:y|ies)|work|submissions?|docks?|deductions?)|"
-    r"(?:ignore|waive|skip|disregard|forgive)\s+(?:being\s+)?late\b|"
+    r"(?:ignore|waive|wave|skip|disregard|forgive)\s+(?:being\s+)?late\b|"
     r"(?:do not|don't|never)\s+dock\b[^.!\n]{0,40}\blate\b|"
     r"(?:do not|don't|never)\s+(?:penalize|penalise)\b[^.!\n]{0,40}\blate\b|"
     r"no\s+(?:late\s+)?(?:penalty|deduction|dock)\b[^.!\n]{0,40}\blate\b|"
@@ -51,7 +53,12 @@ _WAIVE_ALL = re.compile(
 _DONT_WAIVE = re.compile(
     r"(?:do not|don't|never)\s+(?:ignore|waive|forgive)\s+(?:the\s+)?late",
     re.I)
-_LATE_WORD = re.compile(r"late|tardy|tardin|waiv|exception|dock|penal", re.I)
+_LATE_WORD = re.compile(r"late|tardy|tardin|waiv|wave|exception|dock|penal|extension", re.I)
+_THIS_STUDENT = re.compile(r"this\s+student(?:'s|’s)?", re.I)
+_WAIVE_VERB = re.compile(
+    r"ignore|waive|wave|forgive|skip|disregard|no\s+penalty|don'?t\s+dock|"
+    r"do\s+not\s+dock|extension",
+    re.I)
 
 _PER_INTERVAL = re.compile(
     r"(\d+(?:\.\d+)?)\s*(?:percent|%)"
@@ -269,9 +276,32 @@ def _fmt(value: float) -> str:
     return str(value)
 
 
+def _after_grace(seconds_late: int | float, policy: dict) -> int:
+    grace = int(float(policy.get("grace_hours") or 0) * 3600)
+    return max(0, int(seconds_late or 0) - grace)
+
+
+def shown_days(seconds_late: int | float, policy: dict) -> float:
+    """Days late the way the roster prints them: nearest tenth, after grace.
+
+    A fraction of a day stays a fraction. Half a day is 0.5, not a whole day.
+    The tenth matches the roster label (0.5 days late, 0.7 days late).
+    """
+    seconds = _after_grace(seconds_late, policy)
+    if seconds <= 0:
+        return 0.0
+    # Half-up in integer seconds, so 0.7 days is not lost to binary fractions.
+    tenths = (seconds * 10 + 43200) // 86400
+    return tenths / 10.0
+
+
 def intervals(seconds_late: int | float, policy: dict) -> int:
-    """How many late steps Canvas-style: round up, after any grace."""
-    seconds = max(0, int(seconds_late or 0) - int(float(policy.get("grace_hours") or 0) * 3600))
+    """How many late hours, Canvas-style: round up, after any grace.
+
+    Day penalties do not use this. A fraction of a day is that fraction,
+    not the next whole day. See shown_days.
+    """
+    seconds = _after_grace(seconds_late, policy)
     if seconds <= 0:
         return 0
     step = 3600 if (policy.get("interval") or "day") == "hour" else 86400
@@ -319,17 +349,55 @@ def _name_variants(student: dict) -> list[str]:
             flipped = " ".join((rest.strip() + " " + last.strip()).split())
             if flipped and flipped.lower() not in {n.lower() for n in found}:
                 found.append(flipped)
-    return [n for n in sorted(found, key=len, reverse=True) if len(n.split()) >= 2]
+    given = ""
+    sort = str(student.get("sortable_name") or "")
+    if "," in sort:
+        rest = sort.split(",", 1)[1].strip()
+        given = rest.split()[0] if rest else ""
+    else:
+        parts = str(student.get("name") or "").split()
+        given = parts[0] if parts else ""
+    if len(given) >= 4:
+        try:
+            from .identity import ALSO_WORDS
+        except Exception:  # noqa: BLE001
+            ALSO_WORDS = set()
+        if given.lower() not in ALSO_WORDS:
+            found.append(given)
+    return [n for n in sorted(found, key=len, reverse=True) if n]
 
 
 def waives_everyone(instructions: str) -> bool:
     text = instructions or ""
     if _DONT_WAIVE.search(text):
         return False
-    return bool(_WAIVE_ALL.search(text))
+    for match in _WAIVE_ALL.finditer(text):
+        window = text[max(0, match.start() - 40):match.end() + 40]
+        # "wave the late penalty" in "wave this student's late penalty" is
+        # about one person, not the class.
+        if _THIS_STUDENT.search(window):
+            continue
+        return True
+    return False
 
 
-def waiver(instructions: str, student: dict | None) -> str:
+def waives_addressed_student(instructions: str) -> bool:
+    """True when the note says "this student" and waives lateness.
+
+    The box is for the whole assignment, so this does not lift the class.
+    It only means something when the instructor is grading students they picked.
+    """
+    text = instructions or ""
+    if not text.strip() or _DONT_WAIVE.search(text):
+        return False
+    for match in _THIS_STUDENT.finditer(text):
+        window = text[max(0, match.start() - 60):match.end() + 60]
+        if _WAIVE_VERB.search(window) and _LATE_WORD.search(window):
+            return True
+    return False
+
+
+def waiver(instructions: str, student: dict | None, *, addressed: bool = False) -> str:
     """Why this student's late dock is lifted, or empty if it still applies.
 
     A name in the instructions ("ignore Jane Doe's tardy submission") lifts
@@ -361,11 +429,19 @@ def waiver(instructions: str, student: dict | None) -> str:
                 return "Late penalty waived for this student by your instructions."
     if waives_everyone(text):
         return "Late penalty waived for this assignment by your instructions."
+    if addressed and waives_addressed_student(text):
+        return "Late penalty waived for this student by your instructions."
     return ""
 
 
-def deduction(entry: dict, earned: float) -> float:
-    """Points to take off the earned score. 0 if nothing applies."""
+def deduction(entry: dict, earned: float, possible: float | None = None) -> float:
+    """Points to take off the earned score. 0 if nothing applies.
+
+    A per-day rule is that fraction of the assignment's points. 10% a day on
+    a 100-point assignment is 10 points a day, so 0.5 days is 5 points off
+    and 0.7 days is 7. It is not 10% of whatever score they earned, and a
+    fraction of a day is not rounded up to a whole day.
+    """
     lp = (entry or {}).get("late_penalty") or {}
     if not lp.get("applied"):
         return 0.0
@@ -373,11 +449,27 @@ def deduction(entry: dict, earned: float) -> float:
     if lp.get("kind") == "none_accepted" or lp.get("past_window"):
         return round(earned, 2)
     percent = float(lp.get("percent") or 0)
-    units = int(lp.get("units") or 0)
     kind = lp.get("kind") or ""
+    if kind == "percent_per_day":
+        days = lp.get("days")
+        if days is None:
+            days = float(lp.get("units") or 0)
+        base = lp.get("base")
+        if base is None:
+            base = possible
+        if not base:
+            base = earned
+        base = max(0.0, float(base))
+        points = float(days) * percent / 100.0 * base
+        floor = float(lp.get("floor_percent") or 0)
+        if floor and base:
+            lowest = base * floor / 100.0
+            points = min(points, max(0.0, earned - lowest))
+        return round(min(max(points, 0.0), earned), 2)
+    units = int(lp.get("units") or 0)
     if kind == "flat_percent":
         pct = percent
-    elif kind in ("percent_per_day", "percent_per_hour", "canvas"):
+    elif kind in ("percent_per_hour", "canvas"):
         pct = percent * max(units, 0)
     else:
         return 0.0
@@ -397,8 +489,13 @@ def attach(graded: dict, submission: dict, policy: dict | None,
     if graded.get("total") is None:
         return graded
     seconds = int(submission.get("seconds_late") or 0)
-    units = intervals(seconds, policy)
     kind = policy.get("kind") or "none"
+    # Day cuts follow the fraction printed on the roster. Hour cuts still
+    # round up; a per-day rule does not.
+    if kind == "percent_per_day" and not policy.get("canvas_applies"):
+        units = shown_days(seconds, policy)
+    else:
+        units = intervals(seconds, policy)
     lp = {
         "kind": kind,
         "seconds": seconds,
@@ -413,6 +510,10 @@ def attach(graded: dict, submission: dict, policy: dict | None,
         "applied": False,
         "past_window": False,
     }
+    if kind == "percent_per_day":
+        lp["days"] = units
+        if possible:
+            lp["base"] = float(possible)
     if policy.get("canvas_applies"):
         lp["kind"] = "canvas"
         lp["summary"] = policy.get("summary") or (
@@ -423,14 +524,23 @@ def attach(graded: dict, submission: dict, policy: dict | None,
         graded["late_penalty"] = lp
         return graded
     max_days = policy.get("max_days")
-    if kind in ("percent_per_day", "percent_per_hour") and max_days is not None:
-        step = 24 if kind == "percent_per_hour" else 1
-        if units > int(max_days) * step:
+    if kind == "percent_per_day" and max_days is not None:
+        if _after_grace(seconds, policy) / 86400.0 > float(max_days):
+            lp["past_window"] = True
+            lp["kind"] = "none_accepted"
+            lp["summary"] = f"Past the {max_days}-day window in the syllabus; score is zero."
+    elif kind == "percent_per_hour" and max_days is not None:
+        if units > int(max_days) * 24:
             lp["past_window"] = True
             lp["kind"] = "none_accepted"
             lp["summary"] = f"Past the {max_days}-day window in the syllabus; score is zero."
     if units <= 0 and not lp["past_window"] and kind != "none_accepted":
-        lp["summary"] = "Late, but inside the grace period. No deduction."
+        if float(policy.get("grace_hours") or 0) and _after_grace(seconds, policy) <= 0:
+            lp["summary"] = "Late, but inside the grace period. No deduction."
+        elif kind == "percent_per_day":
+            lp["summary"] = "Less than a tenth of a day late. No deduction."
+        else:
+            lp["summary"] = "Late, but inside the grace period. No deduction."
         graded["late_penalty"] = lp
         return graded
     if kind == "none_accepted" or lp["past_window"]:
@@ -444,10 +554,17 @@ def attach(graded: dict, submission: dict, policy: dict | None,
         graded["flags"] = flags
         return graded
     lp["applied"] = True
+    earned_now = float(graded.get("total") or 0)
     lp["points"] = deduction({"late_penalty": {**lp, "applied": True}},
-                             float(graded.get("total") or 0))
+                             earned_now, possible)
     if kind == "flat_percent":
         lp["summary"] = f"{_fmt(lp['percent'])}% off for being late, from the syllabus."
+    elif kind == "percent_per_day":
+        days = float(lp.get("days") or 0)
+        word = "day" if days == 1 else "days"
+        lp["summary"] = (
+            f"{_fmt(days)} {word} late (−{_fmt(lp['points'])} pts), "
+            f"{_fmt(lp['percent'])}% of the assignment per day, from the syllabus.")
     else:
         unit = "hour" if lp["interval"] == "hour" else "day"
         lp["summary"] = (
@@ -460,12 +577,19 @@ def attach(graded: dict, submission: dict, policy: dict | None,
     return graded
 
 
-def refresh(entry: dict, earned: float) -> dict:
-    """Recompute points after a hand edit of the earned score."""
+def refresh(entry: dict, earned: float, possible: float | None = None) -> dict:
+    """Recompute points after a hand edit of the earned score.
+
+    A per-day cut is a fraction of the assignment, so editing the earned
+    score does not change how many points the lateness costs. It still
+    cannot take off more than they earned.
+    """
     lp = dict((entry or {}).get("late_penalty") or {})
     if not lp:
         return lp
-    lp["points"] = deduction({"late_penalty": lp}, earned)
+    if possible and not lp.get("base"):
+        lp["base"] = float(possible)
+    lp["points"] = deduction({"late_penalty": lp}, earned, possible)
     return lp
 
 

@@ -391,7 +391,7 @@ class GradeJsKeepsToTheContract(unittest.TestCase):
         page = (WEB / "index.html").read_text(encoding="utf-8")
         self.assertIn("js/docview.js?v=docx-1", page)
         self.assertIn("js/pdfview.js?v=pdf-1", page)
-        self.assertIn("style.css?v=todo-8", page)
+        self.assertIn("style.css?v=home-3", page)
         self.assertIn("function pdfCard(", self.src)
         self.assertIn("pdfCard(p, url, reused)", body)
         self.assertIn("PdfView.take", body)

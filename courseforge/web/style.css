@@ -1519,10 +1519,15 @@ a.card,a.card:visited{color:var(--ink);text-decoration:none}
    Only the course list wears this. The assignment list shares the section and
    must stay a single column. */
 #viewPicker > .sectionHead{flex-wrap:wrap;align-items:center}
+/* The home page is a dashboard, not a document, so it may use more of a wide
+   screen than the reading views: 1720px instead of the 1500px the other views
+   cap at. The course list takes what is left after a rail of fixed width, so a
+   long name has room and the rail keeps its shape whether there is one course
+   or twelve. */
 #viewPicker.pickerHome{display:grid;align-content:start;align-items:start;
-  padding-top:10px;
-  grid-template-columns:minmax(0,1.4fr) minmax(0,1fr);
-  column-gap:22px;row-gap:0}
+  max-width:1720px;padding-top:12px;
+  grid-template-columns:minmax(0,1fr) clamp(370px,31%,470px);
+  column-gap:30px;row-gap:0}
 /* Rows are named rather than left to auto-placement so the two columns start
    level: each one opens with its own .sectionHead, on the same row, so the two
    headings are plainly siblings. With the list's heading spanning the full
@@ -1530,7 +1535,7 @@ a.card,a.card:visited{color:var(--ink);text-decoration:none}
    looked like it began somewhere else. */
 #viewPicker.pickerHome > #pickerResume{grid-column:1/-1;grid-row:1}
 #viewPicker.pickerHome > .sectionHead,
-#viewPicker.pickerHome > #pickerStrip > .sectionHead{margin-bottom:8px}
+#viewPicker.pickerHome > #pickerStrip > .sectionHead{margin-bottom:10px}
 #viewPicker.pickerHome > .sectionHead{grid-column:1;grid-row:2}
 #viewPicker.pickerHome > #pickerBody{grid-column:1;grid-row:3}
 /* display:contents, so the right-hand heading and its list are grid items in
@@ -1539,28 +1544,39 @@ a.card,a.card:visited{color:var(--ink);text-decoration:none}
    column's -- the two headings level and everything under them not. */
 #viewPicker.pickerHome > #pickerStrip{display:contents}
 #viewPicker.pickerHome > #pickerStrip > .sectionHead{grid-column:2;grid-row:2}
-#viewPicker.pickerHome > #pickerStrip > .acrossCol{grid-column:2;grid-row:3}
+/* The rail sticks while a long course list scrolls under it, and scrolls on
+   its own only when the window is too short for it. So the two columns never
+   have to be the same height: five courses, two, or fourteen, the rail sits
+   where it is. The 150px is the header, the banner slot and the padding above. */
+#viewPicker.pickerHome > #pickerStrip > .acrossCol{grid-column:2;grid-row:3;
+  position:sticky;top:0;align-self:start;
+  max-height:calc(100vh - 150px);overflow:auto;overscroll-behavior:contain;
+  scrollbar-width:thin;padding-right:2px}
+@media (max-width:1100px){
+  #viewPicker.pickerHome{grid-template-columns:minmax(0,1fr) minmax(300px,36%);column-gap:22px}
+}
 @media (max-width:900px){
   #viewPicker.pickerHome{grid-template-columns:minmax(0,1fr)}
   #viewPicker.pickerHome > #pickerResume,
   #viewPicker.pickerHome > .sectionHead,
   #viewPicker.pickerHome > #pickerBody{grid-column:1;grid-row:auto}
   #viewPicker.pickerHome > #pickerStrip > .sectionHead,
-  #viewPicker.pickerHome > #pickerStrip > .acrossCol{grid-column:1;grid-row:auto}
+  #viewPicker.pickerHome > #pickerStrip > .acrossCol{grid-column:1;grid-row:auto;
+    position:static;max-height:none;overflow:visible}
   #viewPicker.pickerHome > #pickerStrip > .sectionHead{margin-top:24px}
 }
 
 /* Where you left off. Navy with the gold rule, the same band the hub wears, so
    the two screens read as one tool. */
 .resumeBand{display:flex;align-items:center;justify-content:space-between;gap:12px;
-  padding:5px 12px;margin:0 0 8px;
+  padding:8px 16px;margin:0 0 14px;
   border-radius:var(--radius);border-top:3px solid var(--gold);
   background:var(--navy);color:#fff}
-.resumeBand .resumeLine{display:flex;align-items:baseline;gap:10px;min-width:0;margin:0}
-.resumeBand .kicker{margin:0;font-size:10px;font-weight:600;letter-spacing:.08em;
+.resumeBand .resumeLine{display:flex;align-items:baseline;gap:12px;min-width:0;margin:0}
+.resumeBand .kicker{margin:0;font-size:10.5px;font-weight:600;letter-spacing:.08em;
   text-transform:uppercase;color:var(--gold);white-space:nowrap}
 .resumeBand .resumeName{min-width:0;overflow:hidden;text-overflow:ellipsis;
-  white-space:nowrap;font-size:14px;font-weight:650}
+  white-space:nowrap;font-size:15.5px;font-weight:650}
 .resumeBand .btn.primary{background:var(--gold);border-color:var(--gold);
   color:#231a04;font-weight:650}
 .resumeBand .btn.primary:hover{background:#f2b53d}
@@ -1568,14 +1584,14 @@ a.card,a.card:visited{color:var(--ink);text-decoration:none}
 /* The other courses: one row each, not a card each. */
 .pickList{display:flex;flex-direction:column;border:1px solid var(--line);
   border-radius:var(--radius);overflow:hidden;background:var(--panel)}
-.pickRow{display:grid;grid-template-columns:auto minmax(0,1fr) auto;gap:11px;
-  align-items:center;width:100%;padding:10px 14px;text-align:left;font:inherit;
+.pickRow{display:grid;grid-template-columns:auto minmax(0,1fr) auto;gap:12px;
+  align-items:center;width:100%;padding:12px 16px;text-align:left;font:inherit;
   color:var(--ink);background:var(--panel);cursor:pointer;
   border:0;border-top:1px solid var(--line)}
 .pickRow:first-child{border-top:0}
 .pickRow:hover{background:var(--zone-soft)}
-.pickRow .nm{font-size:13.5px;font-weight:600;min-width:0}
-.pickRow .sub{font-size:11px;color:var(--muted);margin-top:2px}
+.pickRow .nm{font-size:14.5px;font-weight:600;min-width:0;line-height:1.3}
+.pickRow .sub{font-size:11.5px;color:var(--muted);margin-top:3px}
 .pickRow .rt{display:flex;gap:6px;align-items:center;justify-content:flex-end;
   flex-wrap:wrap}
 .pickRow.off{opacity:.55;cursor:not-allowed}
@@ -1590,39 +1606,47 @@ a.pickRow,a.pickRow:visited{color:var(--ink);text-decoration:none}
 /* The four things that are not about one course. A stack, so they are plainly
    a different kind of thing from the rows beside them. */
 .acrossStack{display:flex;flex-direction:column;gap:4px}
-.acrossItem{display:grid;grid-template-columns:auto minmax(0,1fr);gap:9px;
-  align-items:center;width:100%;text-align:left;font:inherit;color:var(--ink);
-  padding:5px 10px;background:var(--panel);border:1px solid var(--line);
-  border-radius:7px;cursor:pointer;text-decoration:none}
-.acrossItem:hover{border-color:var(--accent)}
-.acrossItem .ic{width:8px;height:8px;border-radius:2px;margin-top:0;
+.acrossItem{display:grid;grid-template-columns:auto minmax(0,1fr);gap:10px;
+  align-items:start;width:100%;text-align:left;font:inherit;color:var(--ink);
+  padding:8px 11px;background:var(--panel);border:1px solid var(--line);
+  border-radius:8px;cursor:pointer;text-decoration:none;
+  transition:border-color .12s ease,transform .12s ease}
+.acrossItem:hover{border-color:var(--accent);transform:translateX(2px)}
+.acrossItem .ic{width:8px;height:8px;border-radius:2px;margin-top:6px;
   background:var(--zone)}
 .acrossItem .ic.a11y{background:var(--a11y)}
 .acrossItem .ic.grade{background:var(--accent)}
-.acrossItem .t{display:block;font-size:12.5px;font-weight:600}
-/* Kept for the hover title and screen readers. A visible second line is what
-   made Across your courses taller than the course list. */
-.acrossItem .m{position:absolute;width:1px;height:1px;padding:0;margin:-1px;
-  overflow:hidden;clip:rect(0 0 0 0);clip-path:inset(50%);white-space:nowrap;border:0}
+.acrossItem .t{display:block;font-size:13px;font-weight:600;line-height:1.3}
+/* The sentence under each name says what the tool does, and it is the reason
+   this column exists: a name alone ("Reports", "Students") sends people to
+   click and find out. It stays on the link's title too, for screen readers
+   and for anyone hovering with the rail scrolled. */
+.acrossItem .m{display:block;font-size:11px;color:var(--muted);margin-top:1px;
+  line-height:1.35}
 .acrossItem.off{opacity:.55;cursor:not-allowed}
 .acrossItem.off:hover{border-color:var(--line)}
 a.acrossItem,a.acrossItem:visited{color:var(--ink)}
 
 /* Directly under Across your courses, in that column, so a long course list
    does not push it to the bottom of the page. */
-.behindGrade{margin-top:10px}
-.behindGrade h2{margin:0 0 6px;font-size:18px}
-.behindList{display:flex;flex-direction:column;gap:6px}
-.behindItem{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:10px;
+.behindGrade{margin-top:12px}
+.behindGrade h2{margin:0 0 7px;font-size:18px}
+.behindList{display:flex;flex-direction:column;gap:4px}
+.behindItem{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:12px;
   align-items:center;width:100%;text-align:left;font:inherit;color:var(--ink);
-  padding:6px 10px;background:var(--panel);border:1px solid var(--line);
-  border-radius:7px;text-decoration:none}
-.behindItem:hover{border-color:var(--accent)}
+  padding:6px 11px;background:var(--panel);border:1px solid var(--line);
+  border-radius:8px;text-decoration:none;
+  transition:border-color .12s ease,transform .12s ease}
+.behindItem:hover{border-color:var(--accent);transform:translateX(2px)}
 .behindItem .behindText{min-width:0}
-.behindItem .nm{display:block;font-size:13.5px;font-weight:600}
-.behindItem .m{display:block;font-size:11px;color:var(--muted);margin-top:2px;
-  line-height:1.4}
-.behindItem .n{font-size:12px;font-weight:600;color:var(--muted);white-space:nowrap}
+.behindItem .nm{display:block;font-size:13.5px;font-weight:600;line-height:1.3}
+.behindItem .m{display:block;font-size:11px;color:var(--muted);margin-top:1px;
+  line-height:1.32}
+/* How far behind, as a chip in the warning colours: it is the one number on
+   the rail that asks for something. */
+.behindItem .n{font-size:11.5px;font-weight:650;color:var(--warn);white-space:nowrap;
+  background:var(--warn-soft);border:1px solid var(--warn);padding:2px 9px;
+  border-radius:999px}
 .behindEmpty{margin:0;font-size:12.5px;color:var(--muted)}
 a.behindItem,a.behindItem:visited{color:var(--ink)}
 

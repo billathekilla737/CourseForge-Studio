@@ -77,7 +77,17 @@ class TheHomeListDrawsTheCards(unittest.TestCase):
         self.assertIn("Every dated assignment in the term", hub)
         self.assertIn('title="${esc(note)}"', hub)
         flat_home = css_home.replace(" ", "").replace("\n", "")
-        self.assertIn(".acrossItem.m{position:absolute", flat_home)
+        # The sentence under each tool is drawn, not tucked away for screen
+        # readers: a name alone sends people to click and find out.
+        self.assertIn(".acrossItem.m{display:block", flat_home)
+        self.assertNotIn(".acrossItem.m{position:absolute", flat_home)
+        # The rail sticks while a long course list scrolls, so the two columns
+        # never have to be the same height.
+        self.assertIn("position:sticky", flat_home[flat_home.index(".acrossCol{"):][:200])
+        # Cards up to six courses, one-line rows from seven: the row follows
+        # the length of the list, not the other way round.
+        flat_hub = css.replace(" ", "").replace("\n", "")
+        self.assertIn(".pickList:has(.pickRow:nth-child(7)).pickRow.open{", flat_hub)
 
 
 class GlanceMatchesTheCoursePage(unittest.TestCase):

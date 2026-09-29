@@ -26,13 +26,16 @@
 .pickFold.onBand:hover{background:rgba(255,255,255,.18);color:#fff}
 .pickStats{display:none;grid-column:1 / -1;
   grid-template-columns:repeat(4,minmax(7.5rem,1fr));
-  justify-content:space-between;column-gap:.8rem;row-gap:8px;margin-top:8px}
+  justify-content:space-between;column-gap:.8rem;row-gap:8px;margin-top:10px}
 .pickRow.open .pickStats,.resumeBand.open .pickStats{display:grid}
+/* A figure is read at a glance from across the desk: the number leads, the
+   label under it is a caption. 15px numbers under 10px captions was the size
+   of a footnote, and the rows read as crushed. */
 .pickStat{display:block;background:var(--bg);border:1px solid var(--line);
-  border-radius:18px;padding:6px 8px;min-width:0;text-align:center}
-.pickStat b{display:block;font:700 15px/1.15 var(--mono);color:var(--ink);text-align:center}
-.pickStat span{display:block;margin-top:2px;font-size:10px;line-height:1.25;
-  color:var(--muted);text-transform:uppercase;letter-spacing:.03em;text-align:center}
+  border-radius:18px;padding:8px 10px;min-width:0;text-align:center}
+.pickStat b{display:block;font:700 19px/1.1 var(--mono);color:var(--ink);text-align:center}
+.pickStat span{display:block;margin-top:3px;font-size:10.5px;line-height:1.25;
+  color:var(--muted);text-transform:uppercase;letter-spacing:.04em;text-align:center}
 .pickStat.warn b{color:var(--warn)}
 .resumeBand .go{align-items:flex-end}
 .resumeBand .pickActs{flex-basis:100%;margin:0}
@@ -41,6 +44,24 @@
 .pickStats.onBand .pickStat b{color:var(--gold)}
 .pickStats.onBand .pickStat span{color:#cfdcec}
 .pickStats.onBand .pickStat.warn b{color:#ffb020}
+/* The row follows the length of the list. Up to six courses, each is a card
+   with its four figures underneath, and five of them stand about as tall as
+   the rail beside them. From seven courses on a wide screen, the figures move
+   onto the course's own line, between the name and the buttons, so a course is
+   one row of about 75px instead of a card of 115px: twelve fit a 1080p window
+   and the eye runs down one column of numbers. The "N to grade" pill says what
+   the second figure says, so it steps aside while the figures are on the line.
+   A browser without :has() keeps the cards, which is the safe side. */
+@media (min-width:1500px){
+  .pickList:has(.pickRow:nth-child(7)) .pickRow.open{
+    grid-template-columns:minmax(0,1fr) auto auto;align-items:center}
+  .pickList:has(.pickRow:nth-child(7)) .pickRow.open .pickStats{grid-column:2;grid-row:1;
+    margin-top:0;grid-template-columns:repeat(4,minmax(6.9rem,auto));column-gap:.5rem}
+  .pickList:has(.pickRow:nth-child(7)) .pickRow.open .pickActs{grid-column:3;grid-row:1}
+  .pickList:has(.pickRow:nth-child(7)) .pickRow.open .rt{display:none}
+  .pickList:has(.pickRow:nth-child(7)) .pickRow.open .pickStat{padding:6px 10px}
+  .pickList:has(.pickRow:nth-child(7)) .pickRow.open .pickStat b{font-size:18px}
+}
 @media (max-width:640px){
   .pickRow.open .pickStats,.resumeBand.open .pickStats{
     grid-template-columns:repeat(2,minmax(7.5rem,1fr));column-gap:1rem}

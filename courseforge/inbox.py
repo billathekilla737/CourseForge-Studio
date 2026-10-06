@@ -24,10 +24,15 @@ a defence anybody wants to make to a dean.
 """
 from __future__ import annotations
 
+import base64
+import binascii
 import hashlib
 import html
 import json
+import mimetypes
 import re
+import secrets
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urljoin
@@ -607,18 +612,284 @@ def out_people(t: "Thread") -> list[dict]:
              "user_id": str(p.get("id"))} for p in t.people]
 
 
+# ---------------------------------------------------------------- attaching
+# A file for a reply waits on this computer until that reply is sent. Canvas's
+# own inbox uploads a file the moment it is picked, but that would put a
+# picture in Canvas before anybody had agreed to send anything, and every other
+# write here waits for the second click. So the bytes are kept here, the
+# confirmation is bound to what they hash to, and they go to Canvas inside the
+# send, after the gate.
+OUTBOX = ".inbox-outbox"
+# One file. The page's whole request is capped at 16 MB (server.MAX_BODY_BYTES)
+# and base64 adds a third, so this is the most that arrives in one piece.
+MAX_ATTACH_BYTES = 10 * 1024 * 1024
+MAX_ATTACH = 10
+# A file staged for a reply that was never sent.
+OUTBOX_KEEP_S = 2 * 24 * 3600
+# Canvas only attaches files from this folder of the sender's own files, and
+# drops any other id without saying so.
+ATTACH_FOLDER = "conversation attachments"
+_STAGED = re.compile(r"^[0-9a-f]{32}$")
+_MIME = re.compile(r"^[a-z0-9][a-z0-9.+-]*/[a-z0-9][a-z0-9.+-]*$")
+
+
+class Refused(Exception):
+    """A reply that stopped before anything reached the student. The message
+    is a sentence for the person, and a job shows it as written."""
+
+
+def _outbox(app) -> Path:
+    return Path(app.store.root) / OUTBOX
+
+
+def _attach_name(name: str, mime: str) -> str:
+    """A file name Canvas, and the student's computer, will both take.
+
+    No folders, nothing Windows refuses in a name, and no quote mark, which
+    would end the multipart header the upload carries the name in.
+    """
+    text = str(name or "").replace("\\", "/").rsplit("/", 1)[-1]
+    text = re.sub(r'[\x00-\x1f\x7f"<>:|?*]+', " ", text)
+    text = re.sub(r"\s+", " ", text).strip().strip(".").strip()
+    stem, dot, ext = text.rpartition(".")
+    if not dot or not stem or len(ext) > 16:
+        stem, ext = text, ""
+    if not ext:
+        ext = (mimetypes.guess_extension(mime or "") or "").lstrip(".")
+    stem = (stem.strip() or "attachment")[:100]
+    return f"{stem}.{ext}" if ext else stem
+
+
+def _attach_mime(mime: str, name: str) -> str:
+    """What the browser said the file is, when it said something sane."""
+    got = str(mime or "").split(";")[0].strip().lower()
+    if _MIME.match(got) and got != "application/octet-stream":
+        return got
+    return mimetypes.guess_type(name)[0] or "application/octet-stream"
+
+
+def _size(n) -> str:
+    n = int(n or 0)
+    if n < 1024:
+        return "%d bytes" % n
+    if n < 1024 * 1024:
+        return "%d KB" % max(1, round(n / 1024))
+    return "%s MB" % ("%.1f" % (n / 1024 / 1024)).rstrip("0").rstrip(".")
+
+
+def _sweep_outbox(root: Path, now: float | None = None) -> None:
+    """Forget files staged for a reply that never went. Quietly: one that
+    cannot be removed today is tried again on the next attach."""
+    cutoff = (time.time() if now is None else now) - OUTBOX_KEEP_S
+    try:
+        entries = list(root.iterdir())
+    except OSError:
+        return
+    for path in entries:
+        try:
+            if path.is_file() and path.stat().st_mtime < cutoff:
+                path.unlink()
+        except OSError:
+            pass
+
+
+def public_staged(meta: dict) -> dict:
+    """The chip on the page: what the file is, never where it is kept."""
+    return {"id": meta["id"], "name": meta["name"], "mime": meta["mime"],
+            "size": meta["size"], "kind": _kind(meta["mime"], meta["name"])}
+
+
+def stage_file(app, conversation_id, name: str, mime: str, data: str) -> dict:
+    """Keep one file for a reply to this thread. Nothing is sent to Canvas.
+
+    `data` is the file as base64, the way the page reads it. The bytes and the
+    thread they were attached on stay here; the reply names them by id.
+    """
+    cid = str(conversation_id or "").strip()
+    if not cid.isdigit():
+        raise Refused("That is not a Canvas conversation.")
+    try:
+        raw = base64.b64decode(str(data or ""), validate=True)
+    except (binascii.Error, ValueError):
+        raise Refused("That file did not arrive whole. Attach it again.") from None
+    clean = _attach_name(name, mime)
+    if not raw:
+        raise Refused("%s is empty, so there is nothing to attach." % clean)
+    if len(raw) > MAX_ATTACH_BYTES:
+        raise Refused("%s is %s. One attachment can be up to %s here."
+                      % (clean, _size(len(raw)), _size(MAX_ATTACH_BYTES)))
+    root = _outbox(app)
+    root.mkdir(parents=True, exist_ok=True)
+    _sweep_outbox(root)
+    file_id = secrets.token_hex(16)
+    meta = {"id": file_id, "conversation_id": cid, "name": clean,
+            "mime": _attach_mime(mime, clean), "size": len(raw),
+            "sha256": hashlib.sha256(raw).hexdigest(),
+            "at": datetime.now(timezone.utc).isoformat(timespec="seconds")}
+    # The bytes first and the note that names them second, so a note never
+    # points at a file that is not all there.
+    part = root / (file_id + ".part")
+    part.write_bytes(raw)
+    part.replace(root / file_id)
+    (root / (file_id + ".json")).write_text(json.dumps(meta), encoding="utf-8")
+    return public_staged(meta)
+
+
+def staged(app, conversation_id, ids) -> list[dict]:
+    """The files a reply carries, in the order they were attached.
+
+    Each has to be one this computer kept for this same thread. An id from
+    another thread, or one that has been swept, is refused rather than
+    quietly left off a message somebody is about to agree to.
+    """
+    if not ids:
+        return []
+    if not isinstance(ids, (list, tuple)):
+        raise Refused("The attachments on this reply did not arrive as a list.")
+    if len(ids) > MAX_ATTACH:
+        raise Refused("That is %d attachments. One reply can carry %d here."
+                      % (len(ids), MAX_ATTACH))
+    root = _outbox(app)
+    out, seen = [], set()
+    for raw in ids:
+        file_id = str(raw or "").strip().lower()
+        if file_id in seen:
+            continue
+        seen.add(file_id)
+        meta = None
+        if _STAGED.match(file_id):
+            try:
+                meta = json.loads((root / (file_id + ".json")).read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                meta = None
+        if (not isinstance(meta, dict)
+                or str(meta.get("conversation_id")) != str(conversation_id)
+                or not (root / file_id).is_file()):
+            raise Refused("An attachment on this reply is no longer on this computer. "
+                          "Remove it and attach it again. Nothing was sent.")
+        out.append({**meta, "id": file_id})
+    return out
+
+
+def _drop_staged(app, files: list[dict]) -> None:
+    root = _outbox(app)
+    for meta in files:
+        for path in (root / meta["id"], root / (meta["id"] + ".json")):
+            try:
+                path.unlink()
+            except OSError:
+                pass
+
+
+def _files_phrase(files: list[dict]) -> str:
+    """', with 2 files attached: shot.png (240 KB) and notes.pdf (1.2 MB)'"""
+    if not files:
+        return ""
+    named = ["%s (%s)" % (f["name"], _size(f["size"])) for f in files]
+    listed = named[0] if len(named) == 1 else ", ".join(named[:-1]) + " and " + named[-1]
+    return ", with %d file%s attached: %s" % (len(files), "" if len(files) == 1 else "s",
+                                               listed)
+
+
+def _why(exc: Exception) -> str:
+    """Canvas's own reason, short, without the address it was refused at."""
+    body = str(getattr(exc, "body", "") or "")
+    said = ""
+    try:
+        data = json.loads(body) if body.strip().startswith("{") else {}
+    except ValueError:
+        data = {}
+    if isinstance(data, dict):
+        said = data.get("message") or ""
+        errors = data.get("errors")
+        if not said and isinstance(errors, list) and errors and isinstance(errors[0], dict):
+            said = errors[0].get("message") or ""
+    if said:
+        return ("Canvas said: %s" % str(said).strip())[:200]
+    if getattr(exc, "status", None):
+        return "Canvas answered HTTP %s" % exc.status
+    return type(exc).__name__
+
+
+def _upload(app, files: list[dict], log) -> tuple[list[str], list[dict]]:
+    """Every attachment into your own Canvas files, before the message goes.
+
+    One failure stops the send. Files already up stay in your conversation
+    attachments folder, where only you can see them, and the student gets
+    nothing rather than half of what was agreed to.
+    """
+    root = _outbox(app)
+    ids, sent = [], []
+    for index, meta in enumerate(files, start=1):
+        log("uploading %d/%d %s" % (index, len(files), meta["name"]), index - 1,
+            len(files) + 1)
+        try:
+            raw = (root / meta["id"]).read_bytes()
+        except OSError:
+            raise Refused("%s is no longer on this computer. Nothing was sent."
+                          % meta["name"]) from None
+        # The confirmation named this hash. Bytes that no longer match it are
+        # not what was agreed to.
+        if hashlib.sha256(raw).hexdigest() != meta.get("sha256"):
+            raise Refused("%s changed after it was attached. Nothing was sent; "
+                          "attach it again." % meta["name"])
+        try:
+            up = app.client.upload_user_file(meta["name"], raw, folder=ATTACH_FOLDER,
+                                             content_type=meta["mime"],
+                                             on_duplicate="rename")
+        except Exception as exc:  # noqa: BLE001
+            raise Refused("Canvas would not take %s (%s). Nothing was sent to the "
+                          "student." % (meta["name"], _why(exc))) from None
+        file_id = str((up or {}).get("id") or "")
+        if not file_id:
+            raise Refused("Canvas took %s but did not say where it put it. Nothing "
+                          "was sent to the student." % meta["name"])
+        ids.append(file_id)
+        sent.append({"name": meta["name"], "size": meta["size"],
+                     "sha256": meta["sha256"], "canvas_file_id": file_id})
+    return ids, sent
+
+
+def _attached_count(app, conversation_id, out) -> int | None:
+    """How many files the message that just went out carries, by Canvas's count.
+
+    Canvas answers add_message with the thread and the new message in it. If
+    that answer does not say, the thread is read back once. None when neither
+    says, which the page reports as unknown rather than as a success.
+    """
+    msgs = out.get("messages") if isinstance(out, dict) else None
+    if (isinstance(msgs, list) and msgs and isinstance(msgs[0], dict)
+            and "attachments" in msgs[0]):
+        return len(msgs[0].get("attachments") or [])
+    try:
+        row = app.client.conversation(conversation_id, mark_read=False)
+    except Exception:  # noqa: BLE001
+        return None
+    me = str(app.me_id or "")
+    for msg in (row or {}).get("messages") or []:       # newest first
+        if isinstance(msg, dict) and str(msg.get("author_id") or "") == me:
+            return len(msg.get("attachments") or [])
+    return None
+
+
 # ------------------------------------------------------------------ sending
 def send_reply(app, conversation_id, body: str, confirm_token: str | None = None,
-               log=lambda *_a, **_k: None) -> dict:
+               log=lambda *_a, **_k: None, attachments=None) -> dict:
     """Send one reply, to one thread, after the gate has been through twice.
 
     No batch form and no rule that sends on its own. Whatever a queue of
     unattended replies would save, it is not worth the morning somebody finds
     out their tool told a student something it had no business saying.
+
+    `attachments` are ids from `stage_file`. They are named in the sentence,
+    bound into the confirmation by what they hash to, and uploaded only after
+    it -- all of them, before the message, so a reply never goes out missing
+    a file that was agreed to.
     """
     body = (body or "").strip()
     if not body:
         raise ValueError("There is nothing in the reply box to send.")
+    files = staged(app, conversation_id, attachments)
     row = app.client.conversation(conversation_id, mark_read=False)
     t = Thread(app, row, app.me_id)
     who = ", ".join(p["name"] or p["tag"] for p in out_people(t)) or "this thread"
@@ -628,30 +899,65 @@ def send_reply(app, conversation_id, body: str, confirm_token: str | None = None
     # from the box, so an edit the instructor made is what goes out.
     final = t.unmask(body)
 
-    app._gate("inbox-reply",
-              {"conversation_id": str(conversation_id), "body": final},
-              'Send this reply to %s in Canvas about "%s"' % (who, subject),
+    gated = {"conversation_id": str(conversation_id), "body": final}
+    if files:
+        # The hash, not the name: swapping a picture for another of the same
+        # name after the review screen must not ride on the same Yes.
+        gated["files"] = [{"name": f["name"], "size": f["size"], "sha256": f["sha256"]}
+                          for f in files]
+    app._gate("inbox-reply", gated,
+              'Send this reply to %s in Canvas about "%s"%s'
+              % (who, subject, _files_phrase(files)),
               confirm_token,
               detail=final[:1200],
               what="replying to a student")
 
-    log("sending the reply")
-    out = app.client.reply_to_conversation(conversation_id, final)
+    ids, sent = _upload(app, files, log)
+    if ids:
+        log("sending the reply", len(ids), len(ids) + 1)
+        out = app.client.reply_to_conversation(conversation_id, final, attachment_ids=ids)
+    else:
+        log("sending the reply")
+        out = app.client.reply_to_conversation(conversation_id, final)
+    attached = _attached_count(app, conversation_id, out) if ids else 0
+    _drop_staged(app, files)
+
+    said = 'Replied in Canvas to %s about "%s".' % (who, subject)
+    warning = ""
+    if ids and attached is None:
+        said = 'Replied in Canvas to %s about "%s", sending %d file%s that Canvas did ' \
+               'not confirm.' % (who, subject, len(ids), "" if len(ids) == 1 else "s")
+        warning = ("Sent. Canvas did not say whether the attachments are on it, so "
+                   "check the thread.")
+    elif ids and attached < len(ids):
+        said = 'Replied in Canvas to %s about "%s". Canvas attached %d of the %d ' \
+               'files sent.' % (who, subject, attached, len(ids))
+        warning = ("Sent, but Canvas attached only %d of the %d files. The rest are in "
+                   "your Canvas files, in the %s folder." % (attached, len(ids), ATTACH_FOLDER))
+    elif ids:
+        said = 'Replied in Canvas to %s about "%s", with %d file%s attached.' \
+               % (who, subject, len(ids), "" if len(ids) == 1 else "s")
+    detail = {"conversation_id": str(conversation_id), "body": final[:2000]}
+    if ids:
+        detail.update(files=sent, attached=attached)
     audit.record(
         app.course_dir(t.course_id) if t.course_id else app.store.root,
-        "inbox", "replied",
-        'Replied in Canvas to %s about "%s".' % (who, subject),
+        "inbox", "replied", said,
         students=[audit.person(p["user_id"], p["name"]) for p in out_people(t)],
-        count=1, course_id=t.course_id or "",
-        detail={"conversation_id": str(conversation_id), "body": final[:2000]})
+        count=1, course_id=t.course_id or "", detail=detail)
     log("sent")
     try:
         app.client.set_conversation_state(conversation_id, "read")
     except Exception as exc:  # noqa: BLE001
         log("sent, but the unread mark could not be cleared (%s)" % exc)
-    return {"ok": True, "conversation_id": str(conversation_id),
-            "sent_to": [p["name"] or p["tag"] for p in out_people(t)],
-            "body": final, "canvas": out}
+    result = {"ok": True, "conversation_id": str(conversation_id),
+              "sent_to": [p["name"] or p["tag"] for p in out_people(t)],
+              "body": final, "canvas": out}
+    if files:
+        result.update(files=[f["name"] for f in files], attached=attached)
+    if warning:
+        result["warning"] = warning
+    return result
 
 
 # ------------------------------------------------------------- several at once

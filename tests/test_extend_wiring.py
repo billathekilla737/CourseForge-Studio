@@ -17,6 +17,17 @@ def read(rel: Path) -> str:
     return rel.read_text(encoding="utf-8")
 
 
+def braced(text: str) -> str:
+    """The first `{...}` in `text`, nested braces included."""
+    start = text.index("{")
+    depth = 0
+    for at in range(start, len(text)):
+        depth += {"{": 1, "}": -1}.get(text[at], 0)
+        if depth == 0:
+            return text[start:at + 1]
+    raise AssertionError("unbalanced braces")
+
+
 class TheAreaIsLoaded(unittest.TestCase):
     def test_it_is_in_the_core_list(self):
         from courseforge import areas
@@ -87,7 +98,8 @@ class TheClientCanDoWhatTheAreaAsksOfIt(unittest.TestCase):
 
 class TheShellKnowsAboutIt(unittest.TestCase):
     def test_the_script_is_loaded(self):
-        self.assertIn('src="js/extend.js"', read(WEB / "index.html"))
+        # With or without the ?v= tag that makes a browser fetch it afresh.
+        self.assertRegex(read(WEB / "index.html"), r'src="js/extend\.js(\?[^"]*)?"')
 
     def test_the_hash_route_opens_it(self):
         s = read(WEB / "js" / "core.js")
@@ -114,6 +126,16 @@ class TheShellKnowsAboutIt(unittest.TestCase):
         s = read(WEB / "js" / "extend.js")
         self.assertIn("runJobConfirmed('Moving due dates in Canvas'", s)
         self.assertNotIn("askConfirm(", s)
+
+    def test_the_confirmation_travels_inside_the_body(self):
+        """`api()` sends `opts.body` and nothing else, and the gate reads the
+        token from the body. A token handed to `api()` beside the body never
+        leaves the page: every Yes arrives without one, is refused, and the
+        same question comes back, so nothing is ever written."""
+        s = read(WEB / "js" / "extend.js")
+        call = s[s.index("api('/extend/apply'"):]
+        body = braced(call[call.index("body:"):])
+        self.assertRegex(body, r"\bconfirm:\s*token\b")
 
     def test_the_styles_it_uses_are_defined(self):
         css = read(WEB / "style.css")

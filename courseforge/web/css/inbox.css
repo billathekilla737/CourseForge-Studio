@@ -12,3 +12,28 @@
 .ibWhoLink:hover{color:var(--accent)}
 .ibCourse{font-size:11px;font-weight:600;color:var(--muted);white-space:nowrap;
   overflow:hidden;text-overflow:ellipsis;max-width:16rem}
+
+/* Files on a reply. They wait on this computer until the reply is sent. */
+.ibAttach{display:flex;flex-wrap:wrap;gap:8px}
+.ibAttach[hidden]{display:none}
+.ibChip{display:flex;align-items:center;gap:8px;max-width:min(100%, 300px);
+  padding:5px 5px 5px 6px;border:1px solid var(--line);border-radius:8px;
+  background:var(--bg)}
+.ibChip.busy{opacity:.65}
+.ibThumb{flex:none;width:40px;height:40px;border-radius:5px;object-fit:cover;
+  border:1px solid var(--line);background:var(--panel)}
+.ibThumbFile{display:grid;place-items:center;font-size:10px;font-weight:700;
+  color:var(--muted);text-transform:uppercase}
+.ibChipText{display:flex;flex-direction:column;min-width:0}
+.ibChipName{font-size:12.5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.ibChipSize{font-size:11px;color:var(--muted)}
+.ibChipX{flex:none;margin-left:auto;width:26px;height:26px;border:0;border-radius:6px;
+  background:transparent;color:var(--muted);font-size:17px;line-height:1;cursor:pointer}
+.ibChipX:hover:not(:disabled){background:var(--danger-soft);color:var(--danger)}
+.ibChipX:disabled{cursor:default}
+.ibAttachHint{margin:0;font-size:11.5px}
+.ibOffer{display:flex;align-items:center;gap:8px;flex-wrap:wrap;font-size:12.5px;
+  padding:7px 10px;border-radius:7px;background:var(--edit-soft);border:1px solid var(--edit)}
+.ibOffer[hidden]{display:none}
+.ibDraftBox.dropping{outline:2px dashed var(--edit);outline-offset:3px;
+  background:var(--edit-soft)}

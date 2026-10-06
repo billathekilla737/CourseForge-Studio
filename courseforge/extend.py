@@ -14,10 +14,13 @@ Three things it is careful about.
 
 **It extends from the date that actually applies to the student.** Canvas can
 hold several dates for one assignment: the class date, a section's date, and a
-per-student override from an earlier extension. The student sees whichever is
-most lenient, so that is the one +3 days is measured from. Starting from the
-class date instead would quietly pull a student's deadline *backwards* when
-they already had longer, which is the one outcome nobody would ever intend.
+per-student override from an earlier extension. The student is held to their
+own override's date if they have one, and otherwise to the most lenient of the
+rest, so that is the one +3 days is measured from. Starting from the class
+date instead would quietly pull a student's deadline *backwards* when they
+already had longer, which is the one outcome nobody would ever intend. And it
+is that date, not the class's or a classmate's, that has to fall in the
+absence for anything to move.
 
 **It moves the lock date with the due date.** An assignment that locks on the
 due date will still refuse the submission at the new one, so the extension
@@ -134,7 +137,14 @@ def shift(value, days: int, tz_name: str | None = None) -> str | None:
 
 def touches_window(assignment: dict, overrides: list[dict], user_ids,
                    sections: dict, start, end, tz_name: str | None = None) -> bool:
-    """True if the class date or any selected student's effective date is in the window."""
+    """True if the class date or any selected student's effective date is in the window.
+
+    Only the cut that decides what is worth planning. Whose dates move is
+    `plan`'s call, made per student from that student's own date: one
+    student's date being in the window says nothing about another's. The class
+    date still counts here so that a student whose own date has moved out of
+    the absence is told so, instead of the assignment silently not appearing.
+    """
     if day_in_window(assignment.get("due_at"), start, end, tz_name):
         return True
     for uid in user_ids:
@@ -198,59 +208,77 @@ def applicable(overrides: list[dict], user_id, section_ids) -> list[dict]:
     return out
 
 
+def _decides(mine: list[dict], field: str) -> dict | None:
+    """The override whose `field` this student is held to; None means the
+    assignment's own.
+
+    Canvas settles each date on its own, from only the overrides that set it,
+    and leaves the key off an override that does not change that date. That is
+    not the same as sending it as null: null takes the date away. Of the ones
+    that set it, the student's own override wins outright -- Canvas has
+    preferred it to a section's since 2022, even when the section's is later --
+    and among the rest no date at all beats every date, then the latest wins.
+    """
+    setting = [o for o in mine if field in o]
+    for o in setting:
+        if o.get("how") == "adhoc":
+            return o
+    if not setting:
+        return None
+    undated = [o for o in setting if parse_iso(o.get(field)) is None]
+    return undated[0] if undated else max(setting, key=lambda o: parse_iso(o.get(field)))
+
+
 def effective(assignment: dict, overrides: list[dict], user_id, section_ids) -> dict:
     """The due and lock dates this student is actually held to, and from where.
 
-    Canvas's own rule when more than one override reaches a student is that the
-    most lenient wins, so that is the rule here: the latest due date, and an
-    override with no due date at all beats every dated one.
+    Each date is settled separately, the way Canvas does it (`_decides`): an
+    override that only moves the lock leaves the student on the class due
+    date, and a null lock means no lock, not the class's.
     """
     mine = applicable(overrides, user_id, section_ids)
-    base = {
-        "due_at": assignment.get("due_at"),
-        "lock_at": assignment.get("lock_at"),
-        "source": "the class due date",
-        "override_id": None,
-        "override_title": "",
-        "shared_with": 0,
-        "how": "everyone",
-    }
-    if not mine:
-        return base
-
-    def rank(o):
-        # No due date is the most lenient thing an override can say.
-        when = parse_iso(o.get("due_at"))
-        return (1, datetime.max.replace(tzinfo=timezone.utc)) if when is None else (0, when)
-
-    best = max(mine, key=rank)
-    ids = [str(u) for u in (best.get("student_ids") or [])]
-    adhoc = best.get("how") == "adhoc"
+    # Canvas lets a student into one ad-hoc override per assignment, so if they
+    # are in one, that is where a new date for them has to go, whether or not
+    # it is what sets their due date. A second one would be refused.
+    own = next((o for o in mine if o.get("how") == "adhoc"), None)
+    if own is not None and own.get("unassign_item"):
+        # Taken off this assignment in Canvas: nothing of theirs is due here,
+        # and the override that says so is no place to write a date.
+        return {"due_at": None, "lock_at": None, "source": "unassigned from them",
+                "override_id": None, "override_title": own.get("title") or "",
+                "shared_with": 0, "how": "adhoc"}
+    due_by = _decides(mine, "due_at")
+    lock_by = _decides(mine, "lock_at")
+    ids = [str(u) for u in ((own or {}).get("student_ids") or [])]
     return {
-        "due_at": best.get("due_at"),
-        "lock_at": best.get("lock_at") if best.get("lock_at") is not None
-                   else assignment.get("lock_at"),
-        "source": ("an extension already on this assignment" if adhoc and is_ours(best.get("title"))
-                   else "a date already set just for them" if adhoc
-                   else "their section's date"),
-        "override_id": best.get("id") if adhoc else None,
-        "override_title": best.get("title") or "",
+        "due_at": due_by.get("due_at") if due_by else assignment.get("due_at"),
+        "lock_at": lock_by.get("lock_at") if lock_by else assignment.get("lock_at"),
+        "source": ("the class due date" if due_by is None
+                   else "their section's date" if due_by.get("how") == "section"
+                   else "an extension already on this assignment" if is_ours(due_by.get("title"))
+                   else "a date already set just for them"),
+        "override_id": own.get("id") if own else None,
+        "override_title": (own or {}).get("title") or "",
         # How many OTHER students ride on that same override. Anything above
         # zero is why a row gets left alone rather than rewritten.
-        "shared_with": max(0, len(ids) - 1) if adhoc else 0,
-        "how": best.get("how"),
+        "shared_with": max(0, len(ids) - 1),
+        "how": due_by.get("how") if due_by else "everyone",
     }
 
 
 # ------------------------------------------------------------------ the plan
 def plan(students: list[dict], targets: list[dict], days: int,
-         submitted: set | None = None, include_submitted: bool = False) -> dict:
+         submitted: set | None = None, include_submitted: bool = False,
+         start=None, end=None) -> dict:
     """Every date change this would make, without making any of them.
 
-    `students` are {user_id, name}; `targets` are assignments already narrowed
-    to the window, each carrying its course, its overrides, the timezone to do
-    the arithmetic in, and `enrolled` / `sections` for the course it is in.
-    `submitted` holds (assignment_id, user_id) pairs already turned in.
+    `students` are {user_id, name}; `targets` are the assignments worth
+    planning (see `touches_window`), each carrying its course, its overrides,
+    the timezone to do the arithmetic in, and `enrolled` / `sections` for the
+    course it is in. `start` and `end` are the absence: a student is planned on
+    an assignment only where their own date there falls inside it (left out,
+    any date does). `submitted` holds (assignment_id, user_id) pairs already
+    turned in.
     """
     days = int(days)
     if not 1 <= days <= MAX_DAYS:
@@ -265,6 +293,12 @@ def plan(students: list[dict], targets: list[dict], days: int,
         overrides = target.get("overrides") or []
         enrolled = target.get("enrolled")
         sections = target.get("sections") or {}
+        # Did the class's own date fall in the absence? Then a student whose
+        # date is somewhere else is told why nothing of theirs moves. If not,
+        # the assignment is only here for another student's date, and a line
+        # about this one would say no more than one for every assignment
+        # that was never in the window at all.
+        class_in = day_in_window(target.get("due_at"), start, end, tz_name)
         for student in students:
             uid = str(student.get("user_id"))
             base = {
@@ -284,14 +318,28 @@ def plan(students: list[dict], targets: list[dict], days: int,
             now = effective(target, overrides, uid, sections.get(uid))
             if not now["due_at"]:
                 skipped.append({**base, "why": "no due date applies to them here,"
-                                               " so there is nothing to extend"})
+                                               " so there is nothing to extend",
+                                "quiet": not class_in})
+                continue
+            if not day_in_window(now["due_at"], start, end, tz_name):
+                day = _as_local(parse_iso(now["due_at"]), _zone(tz_name)).date()
+                side = "before" if start and day < _day(start) else "after"
+                skipped.append({
+                    **base, "why": f"their date here is {pretty(now['due_at'], tz_name)}, "
+                                   f"{side} the absence, so it does not move",
+                    "from_due": now["due_at"], "outside": True, "quiet": not class_in})
                 continue
             if now["shared_with"]:
+                # Their own override is the only place a new date could go, and
+                # it carries other students -- whether or not it is what sets
+                # their due date.
+                held = ("their date here comes from an override" if now["how"] == "adhoc"
+                        else "Canvas lets them into only one override here, and "
+                             "they are already in one")
                 skipped.append({
-                    **base, "why": f"their date here comes from an override shared "
-                                   f"with {now['shared_with']} other student(s), "
-                                   f"\"{now['override_title']}\". Moving it would "
-                                   f"move theirs too, so it is left alone.",
+                    **base, "why": f"{held} shared with {now['shared_with']} other "
+                                   f"student(s), \"{now['override_title']}\". Moving it "
+                                   f"would move theirs too, so it is left alone.",
                     "from_due": now["due_at"], "blocked": True})
                 continue
 

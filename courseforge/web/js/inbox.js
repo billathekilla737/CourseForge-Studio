@@ -18,14 +18,26 @@
    is the one that cannot be undone, so it says so and keeps its own red
    button. Shift-click takes a range and ctrl-click toggles one, the same as
    the grading roster, because a second way to mean the same thing is one more
-   thing to remember. */
+   thing to remember.
+
+   A reply can carry files: picked, dropped on the box, or pasted as a
+   picture. Each waits on this computer until that reply is sent and reaches
+   Canvas only after the confirmation, which names it. */
 (function () {
   'use strict';
 
   S.inbox = S.inbox || { scope: '', threads: [], open: null, read: {}, drafts: {},
-    told: {}, picked: new Set(), anchor: null };
+    told: {}, picked: new Set(), anchor: null, files: {} };
   const mem = () => S.inbox;
   const CHIP_MS = 120000;
+  // The server's own limits (inbox.MAX_ATTACH_BYTES, MAX_ATTACH), checked here
+  // first so a file that is too big is said at once, before it is read.
+  const MAX_FILE = 10 * 1024 * 1024;
+  const MAX_FILES = 10;
+  // Pictures a chip can show from the file itself. Not SVG: a picture that can
+  // carry script is a file here, not a thumbnail.
+  const RASTER = /^image\/(png|jpe?g|gif|webp|bmp)$/i;
+  let FILE_SEQ = 0;
 
   const SCOPES = [
     { id: '', label: 'Inbox' },
@@ -120,6 +132,8 @@
     drawList();
     drawTools();
     watchKeys();
+    guardDrops();
+    watchPaste();
     inboxChip();
     if (threadId) openThread(threadId);
     else $('#ibPane').appendChild(emptyState('Pick a thread on the left. Opening one '
@@ -259,6 +273,49 @@
     onLeave(() => document.removeEventListener('keydown', onKey));
   }
 
+  /* Inviting a drop on the reply box makes a near miss likely, and a file
+     dropped anywhere else makes the browser open it in place of this tab,
+     taking the unsent draft with it. While the inbox is up, a file dropped
+     outside the box does nothing. */
+  function onStrayDrag(ev) {
+    if (!hasFiles(ev.dataTransfer)) return;
+    if (ev.target && ev.target.closest && ev.target.closest('#ibDraftBox')) return;
+    ev.preventDefault();
+    if (ev.type === 'dragover') ev.dataTransfer.dropEffect = 'none';
+  }
+  function guardDrops() {
+    const kinds = ['dragover', 'drop'];
+    kinds.forEach(k => {
+      document.removeEventListener(k, onStrayDrag);
+      document.addEventListener(k, onStrayDrag);
+    });
+    onLeave(() => kinds.forEach(k => document.removeEventListener(k, onStrayDrag)));
+  }
+
+  /* The obvious thing to do with a screenshot is paste it, and the reply box
+     may not be open yet. A picture pasted while a thread is open, with no
+     typing box in use, opens the reply with the picture already on it. A
+     typing box keeps its own paste: the reply box attaches, and the others
+     are not for pictures. */
+  function onPagePaste(ev) {
+    const t = mem().shown;
+    if (!t || String(t.id) !== String(mem().open) || !$('#ibPane')) return;
+    const el = ev.target;
+    if (el && el.closest && el.closest('input, textarea, select, [contenteditable]')) return;
+    const got = clipFiles(ev.clipboardData);
+    if (!got.length || hasText(ev.clipboardData)) return;
+    ev.preventDefault();
+    openReply(t);
+    addFiles(t, got, true);
+    const box = $('#ibReply');
+    if (box) box.focus();
+  }
+  function watchPaste() {
+    document.removeEventListener('paste', onPagePaste);
+    document.addEventListener('paste', onPagePaste);
+    onLeave(() => document.removeEventListener('paste', onPagePaste));
+  }
+
   function runBulk(act) {
     const ids = [...mem().picked];
     const spec = BULK[act];
@@ -328,6 +385,7 @@
     const pane = $('#ibPane');
     const who = whoHtml(t);
     const read = mem().read[t.id];
+    mem().shown = t;
     pane.innerHTML = `<div class="ibThread">
       <div class="ibHead">
         <h3>${esc(t.subject)}</h3>
@@ -345,6 +403,7 @@
         <button class="btn ai" type="button" id="ibRead">Draft a reply with Claude</button>
         <button class="btn" type="button" id="ibManual">Write it myself</button>
         <a class="btn" href="${esc(canvasLink(t))}" target="_blank" rel="noopener">Open in Canvas</a>
+        <span class="hint">or paste a screenshot to start a reply with it attached</span>
       </div>
       <div id="ibAsk"></div>
       <div id="ibDraft"></div>`;
@@ -477,38 +536,56 @@
   function drawDraft(t, text) {
     const host = $('#ibDraft');
     if (!host) return;
-    host.innerHTML = `<div class="ibDraftBox">
+    host.innerHTML = `<div class="ibDraftBox" id="ibDraftBox">
       <label class="srOnly" for="ibReply">Your reply</label>
       <textarea id="ibReply" rows="6"
         placeholder="Nothing is sent until you press Send.">${esc(text || '')}</textarea>
+      <div class="ibAttach" id="ibAttach" data-thread="${esc(t.id)}" hidden></div>
+      <div class="ibOffer" id="ibOffer" data-thread="${esc(t.id)}" role="status" hidden></div>
       <div class="row">
         <button class="btn primary" type="button" id="ibSend">Send this reply</button>
+        <button class="btn" type="button" id="ibAddFile">Attach files…</button>
+        <input type="file" id="ibPickFile" multiple hidden>
         <button class="btn" type="button" id="ibRedo">Draft it again…</button>
         <button class="btn" type="button" id="ibClear">Discard</button>
         <span class="spacer"></span>
         <span class="hint">Goes to ${esc((t.with || []).map(p => studentLabel(p) || p.tag).join(', '))}
           as you, from your Canvas account.</span>
       </div>
+      <p class="hint ibAttachHint">Paste a picture into the reply, or drop files on this
+        box, to attach them. They stay on this computer until you send.</p>
     </div>`;
     const box = $('#ibReply');
     box.oninput = () => { mem().drafts[t.id] = box.value; };
+    drawFiles(t);
+    wireAttach(t, box);
     $('#ibRedo').onclick = () => askFirst(t);
     $('#ibClear').onclick = () => {
       delete mem().drafts[t.id];
+      dropFiles(t.id);
       host.innerHTML = '';
       setStatus('draft discarded; nothing was sent', 'ok');
     };
     $('#ibSend').onclick = () => {
       const body = (box.value || '').trim();
       if (!body) { setStatus('there is nothing in the box to send', 'err'); box.focus(); return; }
-      runJobConfirmed('Sending the reply',
+      const files = filesOf(t.id);
+      if (files.some(f => !f.id)) {
+        setStatus('an attachment is still being added; send again in a moment', 'err');
+        return;
+      }
+      const attachments = files.map(f => f.id);
+      runJobConfirmed(attachments.length ? 'Sending the reply and its attachments'
+        : 'Sending the reply',
         (token) => api('/inbox/' + encodeURIComponent(t.id) + '/reply',
-          { body: { body, confirm: token } }),
+          { body: { body, attachments, confirm: token } }),
         out => {
           if (!out) return;
           delete mem().drafts[t.id];
           delete mem().read[t.id];
-          setStatus('sent to ' + (out.sent_to || []).join(', '), 'ok');
+          dropFiles(t.id);
+          setStatus(out.warning || ('sent to ' + (out.sent_to || []).join(', ')),
+            out.warning ? 'err' : 'ok');
           openInbox(t.id);
         },
         { title: 'Send this to a student?',
@@ -516,6 +593,206 @@
           note: 'This goes to the student from your Canvas account, under your name. '
               + 'A sent message cannot be taken back.' });
     };
+  }
+
+  /* ---------------------------------------------------------- attachments */
+  /* Attaching is not a Canvas write. The server keeps the file and hands back
+     an id; only the reply, after its confirmation, puts the file in Canvas.
+     So taking a chip off again needs no question. */
+  function filesOf(id, create) {
+    const all = mem().files || (mem().files = {});
+    if (!all[id] && create) all[id] = [];
+    return all[id] || [];
+  }
+
+  function dropFiles(id) {
+    const list = filesOf(id);
+    list.dropped = true;          // an add still on its way must not bring it back
+    list.forEach(f => { if (f.preview) URL.revokeObjectURL(f.preview); });
+    if (mem().files) delete mem().files[id];
+  }
+
+  function wireAttach(t, box) {
+    const pick = $('#ibPickFile');
+    $('#ibAddFile').onclick = () => pick.click();
+    pick.onchange = () => {
+      const got = [...pick.files];
+      pick.value = '';
+      addFiles(t, got, false);
+    };
+    box.onpaste = ev => {
+      const got = clipFiles(ev.clipboardData);
+      if (!got.length) return;                  // plain text
+      if (hasText(ev.clipboardData)) {          // the text pastes; the picture is asked about
+        offerPictures(t, got.filter(f => /^image\//i.test(f.type || '')));
+        return;
+      }
+      ev.preventDefault();
+      addFiles(t, got, true);
+    };
+    const zone = $('#ibDraftBox');
+    zone.ondragover = ev => {
+      if (!hasFiles(ev.dataTransfer)) return;
+      ev.preventDefault();
+      ev.dataTransfer.dropEffect = 'copy';
+      zone.classList.add('dropping');
+    };
+    zone.ondragleave = ev => {
+      if (!zone.contains(ev.relatedTarget)) zone.classList.remove('dropping');
+    };
+    zone.ondrop = ev => {
+      zone.classList.remove('dropping');
+      if (!hasFiles(ev.dataTransfer)) return;
+      ev.preventDefault();
+      addFiles(t, [...ev.dataTransfer.files], false);
+    };
+  }
+
+  const hasFiles = dt => !!dt && [...(dt.types || [])].includes('Files');
+
+  /* Every file on the clipboard, read during the paste itself: the clipboard
+     is gone once the event is over, though the files it handed over are not. */
+  function clipFiles(dt) {
+    if (!dt) return [];
+    const files = [...(dt.files || [])];
+    if (files.length) return files;
+    return [...(dt.items || [])].filter(it => it.kind === 'file')
+      .map(it => it.getAsFile()).filter(Boolean);
+  }
+
+  /* A screenshot arrives as a file with no text beside it, and attaches.
+     Copying cells from Excel, or a slide from PowerPoint, puts a picture of
+     them on the clipboard as well, next to their text. Which one was meant
+     differs -- the cells' text, the slide's picture -- so the text pastes as
+     usual and the picture is offered rather than guessed at. */
+  const hasText = dt => !!dt && !!(dt.getData('text/plain') || '').trim();
+
+  function offerPictures(t, pics) {
+    const host = $('#ibOffer');
+    if (!host || host.dataset.thread !== String(t.id) || !pics.length) return;
+    const one = pics.length === 1;
+    host.hidden = false;
+    host.innerHTML = `<span>That paste also carried ${one ? 'a picture' : pics.length + ' pictures'}
+        of what you copied.</span>
+      <button class="btn sm" type="button" id="ibOfferYes">Attach ${one ? 'it' : 'them'}</button>
+      <button class="btn sm" type="button" id="ibOfferNo">No thanks</button>`;
+    const done = () => {
+      host.hidden = true;
+      host.innerHTML = '';
+      const box = $('#ibReply');
+      if (box) box.focus();
+    };
+    $('#ibOfferYes').onclick = () => { done(); addFiles(t, pics, true); };
+    $('#ibOfferNo').onclick = done;
+  }
+
+  /* The reply box, opened the way "Write it myself" opens it, keeping any
+     draft already written. */
+  function openReply(t) {
+    if ($('#ibReply')) return;
+    const ask = $('#ibAsk');
+    if (ask) { ask.innerHTML = ''; ask.dataset.open = '0'; }
+    if (mem().drafts[t.id] == null) mem().drafts[t.id] = '';
+    drawDraft(t, mem().drafts[t.id]);
+  }
+
+  /* Every pasted screenshot is called image.png. Three on one reply would be
+     three chips with one name, so a pasted picture is named for the time. */
+  function pastedName(file, taken) {
+    const given = String(file.name || '');
+    if (given && !/^image\.[a-z0-9]+$/i.test(given)) return given;
+    const ext = ({ 'image/jpeg': 'jpg', 'image/gif': 'gif', 'image/webp': 'webp',
+      'image/bmp': 'bmp' })[file.type] || 'png';
+    const d = new Date();
+    const two = n => String(n).padStart(2, '0');
+    const stem = `pasted-image-${d.getFullYear()}-${two(d.getMonth() + 1)}-${two(d.getDate())}-`
+      + `${two(d.getHours())}${two(d.getMinutes())}${two(d.getSeconds())}`;
+    let name = `${stem}.${ext}`;
+    for (let n = 2; taken.some(f => f.name === name); n++) name = `${stem}-${n}.${ext}`;
+    return name;
+  }
+
+  async function addFiles(t, list, pasted) {
+    const files = filesOf(t.id, true);
+    for (const file of list) {
+      if (files.dropped) return;
+      if (files.length >= MAX_FILES) {
+        setStatus(`one reply can carry ${MAX_FILES} attachments here`, 'err');
+        break;
+      }
+      const name = pasted ? pastedName(file, files) : (file.name || 'attachment');
+      if (!file.size) { setStatus(`${name} is empty, so it was not attached`, 'err'); continue; }
+      if (file.size > MAX_FILE) {
+        setStatus(`${name} is ${sizeText(file.size)}; one attachment can be up to `
+          + `${sizeText(MAX_FILE)} here`, 'err');
+        continue;
+      }
+      const entry = { key: 'f' + (++FILE_SEQ), id: '', name, size: file.size,
+        preview: RASTER.test(file.type || '') ? URL.createObjectURL(file) : '' };
+      files.push(entry);
+      drawFiles(t);
+      try {
+        const data = await asBase64(file);
+        const out = await api('/inbox/' + encodeURIComponent(t.id) + '/attach',
+          { body: { name, type: file.type || '', data } });
+        Object.assign(entry, { id: out.id, name: out.name || name, size: out.size || file.size });
+        if (!files.dropped) setStatus(`attached ${entry.name}; nothing has been sent`, 'ok');
+      } catch (err) {
+        const at = files.indexOf(entry);
+        if (at >= 0) files.splice(at, 1);
+        if (entry.preview) URL.revokeObjectURL(entry.preview);
+        setStatus(`could not attach ${name}: ${firstLine(err.message)}`, 'err');
+      }
+      drawFiles(t);
+    }
+  }
+
+  /* Only into this thread's own box: by the time a file finishes adding, the
+     pane may be showing a different thread. */
+  function drawFiles(t) {
+    const host = $('#ibAttach');
+    if (!host || host.dataset.thread !== String(t.id)) return;
+    const files = filesOf(t.id);
+    host.hidden = !files.length;
+    host.innerHTML = files.map(f => `<div class="ibChip${f.id ? '' : ' busy'}">
+        ${f.preview ? `<img class="ibThumb" src="${esc(f.preview)}" alt="">`
+          : `<span class="ibThumb ibThumbFile" aria-hidden="true">${esc(extOf(f.name))}</span>`}
+        <span class="ibChipText"><span class="ibChipName" title="${esc(f.name)}">${esc(f.name)}</span>
+          <span class="ibChipSize">${f.id ? esc(sizeText(f.size)) : 'adding…'}</span></span>
+        <button class="ibChipX" type="button" data-key="${esc(f.key)}" ${f.id ? '' : 'disabled'}
+          aria-label="Remove ${esc(f.name)}" title="Remove">×</button>
+      </div>`).join('');
+    host.querySelectorAll('[data-key]').forEach(b => {
+      b.onclick = () => {
+        const list = filesOf(t.id);
+        const at = list.findIndex(f => f.key === b.dataset.key);
+        if (at < 0) return;
+        const [gone] = list.splice(at, 1);
+        if (gone.preview) URL.revokeObjectURL(gone.preview);
+        drawFiles(t);
+        setStatus(`removed ${gone.name}; nothing was sent`, 'ok');
+        const box = $('#ibReply');
+        if (box) box.focus();
+      };
+    });
+  }
+
+  const extOf = name => (String(name).match(/\.([a-z0-9]{1,5})$/i) || [])[1] || 'file';
+
+  function sizeText(n) {
+    n = +n || 0;
+    if (n < 1024) return `${n} bytes`;
+    if (n < 1024 * 1024) return `${Math.max(1, Math.round(n / 1024))} KB`;
+    return `${(n / 1024 / 1024).toFixed(1).replace(/\.0$/, '')} MB`;
+  }
+
+  function asBase64(file) {
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => resolve(String(reader.result || '').replace(/^data:[^,]*,/, ''));
+      reader.onerror = () => reject(reader.error || new Error('the file could not be read'));
+      reader.readAsDataURL(file);
+    });
   }
 
   window.openInbox = openInbox;

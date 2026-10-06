@@ -647,13 +647,21 @@ class CanvasClient(ContentOps, FilesOps, CourseOps):
         return payload or {}
 
     def reply_to_conversation(self, conversation_id: int | str, body: str,
-                              recipients: list | None = None) -> dict:
-        """Add one message to a thread that already exists."""
+                              recipients: list | None = None,
+                              attachment_ids: list | None = None) -> dict:
+        """Add one message to a thread that already exists.
+
+        `attachment_ids` must be files already in your own "conversation
+        attachments" folder. Canvas drops any other id without a word, so the
+        caller counts what is on the message that comes back.
+        """
         if not (body or "").strip():
             raise ValueError("a reply needs a body")
         fields = [("body", body)]
         for who in (recipients or []):
             fields.append(("recipients[]", str(who)))
+        for file_id in (attachment_ids or []):
+            fields.append(("attachment_ids[]", str(file_id)))
         return self._form("POST", f"/conversations/{conversation_id}/add_message", fields)
 
     def create_conversation(self, recipients: list, subject: str, body: str,
@@ -827,20 +835,27 @@ class CanvasClient(ContentOps, FilesOps, CourseOps):
 
     def upload_user_file(self, name: str, payload: bytes,
                          folder: str = "canvas-grader",
-                         content_type: str = "application/octet-stream") -> dict:
+                         content_type: str = "application/octet-stream",
+                         on_duplicate: str = "overwrite") -> dict:
         """Put one file in your Canvas user files, replacing any of that name.
+
+        `on_duplicate="rename"` keeps both instead, and Canvas numbers the new
+        one. That is the right call for a file attached to a message: replacing
+        last week's image.png would change what an old message shows.
 
         Canvas takes three steps: ask for somewhere to put it, POST it there,
         then confirm. The middle step goes to pre-signed storage which rejects
         the request outright if a bearer token rides along, the same trap
         `download` documents for submission attachments.
         """
+        if on_duplicate not in ("overwrite", "rename"):
+            raise ValueError(f"Canvas can overwrite or rename a duplicate, not {on_duplicate!r}")
         offer = self._form("POST", "/users/self/files", [
             ("name", name),
             ("size", str(len(payload))),
             ("content_type", content_type),
             ("parent_folder_path", folder),
-            ("on_duplicate", "overwrite"),
+            ("on_duplicate", on_duplicate),
         ])
         url = (offer or {}).get("upload_url")
         if not url:

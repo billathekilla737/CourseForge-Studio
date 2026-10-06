@@ -342,8 +342,10 @@
     if (!rows.length) return;
     const keys = rows.map(key);
     runJobConfirmed('Moving due dates in Canvas',
+      // The token goes inside the body: api() sends opts.body and nothing
+      // else, and the gate reads it from there.
       token => api('/extend/apply', {
-        body: { ...args(), keys }, confirm: token,
+        body: { ...args(), keys, confirm: token },
       }),
       r => {
         if (!r) return;

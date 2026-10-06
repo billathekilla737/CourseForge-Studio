@@ -5,9 +5,13 @@ every name taken out -- theirs and anyone else's they mention -- and a reply
 must be impossible to send without the instructor pressing the button on that
 specific reply.
 """
+import base64
+import hashlib
 import json
+import os
 import shutil
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -88,7 +92,8 @@ class FakeApp:
         return p
 
     def _gate(self, kind, payload, sentence, token, detail=None, what=""):
-        self.gated.append({"kind": kind, "sentence": sentence, "token": token})
+        self.gated.append({"kind": kind, "sentence": sentence, "token": token,
+                           "payload": payload, "detail": detail})
         if not token:
             raise PermissionError(sentence)
 
@@ -454,6 +459,337 @@ class FilesStayOnTheThread(Base):
         self.assertIn("/file/", src)
         self.assertIn('class="ibImg"', src)
         self.assertIn("not the words that get sent", src)
+
+
+PNG = b"\x89PNG\r\n\x1a\n" + b"\x00" * 64
+
+
+def b64(raw: bytes) -> str:
+    return base64.b64encode(raw).decode("ascii")
+
+
+class AttachClient(FakeClient):
+    """Canvas as an attachment sees it: the file goes into your own files
+    first, and add_message answers with the new message and what is on it."""
+
+    def __init__(self, keep=None):
+        super().__init__()
+        self.uploads = []
+        self.keep = keep            # how many attached ids Canvas keeps; None is all
+
+    def upload_user_file(self, name, payload, folder="canvas-grader",
+                         content_type="application/octet-stream", on_duplicate="overwrite"):
+        self.uploads.append({"name": name, "bytes": payload, "folder": folder,
+                             "type": content_type, "on_duplicate": on_duplicate})
+        return {"id": 900 + len(self.uploads), "display_name": name}
+
+    def reply_to_conversation(self, cid, body, recipients=None, attachment_ids=None):
+        ids = list(attachment_ids or [])
+        self.sent.append((str(cid), body, ids))
+        kept = ids if self.keep is None else ids[:self.keep]
+        return {"id": cid, "messages": [{"id": 3, "author_id": 9, "body": body,
+                                         "attachments": [{"id": int(a)} for a in kept]}]}
+
+
+class AttachingFiles(Base):
+    """A picture or a file on a reply. It waits on this computer until the
+    reply is sent; the confirmation names it and is bound to its bytes; and
+    nothing about it reaches Canvas on the first pass."""
+
+    def setUp(self):
+        super().setUp()
+        self.app.client = AttachClient()
+
+    def stage(self, raw=PNG, name="image.png", mime="image/png", cid=77):
+        return inbox.stage_file(self.app, cid, name, mime, b64(raw))
+
+    def kept(self, chip, suffix=""):
+        return self.tmp / inbox.OUTBOX / (chip["id"] + suffix)
+
+    def test_attaching_keeps_the_file_here_and_sends_nothing(self):
+        chip = self.stage()
+        self.assertEqual((chip["name"], chip["kind"], chip["size"]),
+                         ("image.png", "image", len(PNG)))
+        self.assertEqual(set(chip), {"id", "name", "mime", "size", "kind"})
+        self.assertEqual(self.kept(chip).read_bytes(), PNG)
+        self.assertEqual(self.app.client.uploads, [])
+        self.assertEqual(self.app.client.sent, [])
+
+    def test_nothing_reaches_canvas_on_the_first_pass(self):
+        chip = self.stage()
+        with self.assertRaises(PermissionError):
+            inbox.send_reply(self.app, 77, "See the picture.", attachments=[chip["id"]])
+        self.assertEqual(self.app.client.uploads, [], "it uploaded before the second click")
+        self.assertEqual(self.app.client.sent, [])
+
+    def test_the_confirmation_names_the_file_and_is_bound_to_its_bytes(self):
+        chip = self.stage()
+        with self.assertRaises(PermissionError):
+            inbox.send_reply(self.app, 77, "See the picture.", attachments=[chip["id"]])
+        gated = self.app.gated[0]
+        self.assertIn("with 1 file attached: image.png", gated["sentence"])
+        self.assertEqual(gated["payload"]["files"],
+                         [{"name": "image.png", "size": len(PNG),
+                           "sha256": hashlib.sha256(PNG).hexdigest()}])
+
+    def test_a_plain_reply_is_confirmed_exactly_as_before(self):
+        """No files, no new key: a plain reply keeps the fingerprint it had."""
+        with self.assertRaises(PermissionError):
+            inbox.send_reply(self.app, 77, "ok")
+        self.assertEqual(set(self.app.gated[0]["payload"]), {"conversation_id", "body"})
+
+    def test_with_the_token_the_files_go_up_first_and_then_the_message(self):
+        a = self.stage()
+        b = self.stage(raw=b"%PDF-1.4 notes", name="notes.pdf", mime="application/pdf")
+        out = inbox.send_reply(self.app, 77, "Both attached.", confirm_token="t",
+                               attachments=[a["id"], b["id"]])
+        ups = self.app.client.uploads
+        self.assertEqual([u["name"] for u in ups], ["image.png", "notes.pdf"])
+        self.assertEqual({u["folder"] for u in ups}, {inbox.ATTACH_FOLDER})
+        self.assertEqual({u["on_duplicate"] for u in ups}, {"rename"})
+        self.assertEqual(ups[0]["bytes"], PNG)
+        self.assertEqual(ups[1]["type"], "application/pdf")
+        self.assertEqual(self.app.client.sent, [("77", "Both attached.", ["901", "902"])])
+        self.assertEqual((out["attached"], out["files"]), (2, ["image.png", "notes.pdf"]))
+        self.assertNotIn("warning", out)
+        self.assertFalse(self.kept(a).exists(), "a sent file stayed on this computer")
+        self.assertFalse(self.kept(a, ".json").exists())
+
+    def test_a_failed_upload_sends_nothing_and_says_why(self):
+        from courseforge.canvas import CanvasError
+
+        def refuse(*_a, **_k):
+            raise CanvasError(400, "https://canvas.example.edu/api/v1/users/self/files",
+                              '{"message": "file size exceeds quota"}')
+
+        self.app.client.upload_user_file = refuse
+        chip = self.stage()
+        with self.assertRaises(inbox.Refused) as caught:
+            inbox.send_reply(self.app, 77, "See the picture.", confirm_token="t",
+                             attachments=[chip["id"]])
+        said = str(caught.exception)
+        self.assertIn("file size exceeds quota", said)
+        self.assertIn("Nothing was sent", said)
+        self.assertNotIn("/api/v1", said)
+        self.assertEqual(self.app.client.sent, [])
+        self.assertTrue(self.kept(chip).is_file(), "kept so Send can try again")
+
+    def test_a_file_canvas_dropped_is_reported_not_called_a_success(self):
+        self.app.client.keep = 0
+        chip = self.stage()
+        out = inbox.send_reply(self.app, 77, "See the picture.", confirm_token="t",
+                               attachments=[chip["id"]])
+        self.assertEqual(out["attached"], 0)
+        self.assertIn("attached only 0 of the 1", out["warning"])
+
+    def test_when_canvas_does_not_say_the_thread_is_read_back(self):
+        client = self.app.client
+        plain = AttachClient.reply_to_conversation
+        client.reply_to_conversation = lambda *a, **k: {
+            **plain(client, *a, **k), "messages": []}
+        chip = self.stage()
+        out = inbox.send_reply(self.app, 77, "x", confirm_token="t", attachments=[chip["id"]])
+        # The fake thread's newest message by me carries no files.
+        self.assertEqual(out["attached"], 0)
+        self.assertIn("warning", out)
+
+    def test_a_file_from_another_thread_cannot_ride_on_this_reply(self):
+        chip = self.stage(cid=88)
+        with self.assertRaises(inbox.Refused):
+            inbox.send_reply(self.app, 77, "x", confirm_token="t", attachments=[chip["id"]])
+        self.assertEqual(self.app.client.uploads, [])
+
+    def test_an_id_that_is_not_one_this_computer_kept_is_refused(self):
+        for bad in ("../../config.json", "a" * 31, "z" * 32, "0" * 32):
+            with self.assertRaises(inbox.Refused, msg=bad):
+                inbox.staged(self.app, 77, [bad])
+
+    def test_bytes_changed_after_the_yes_are_not_sent(self):
+        chip = self.stage()
+        self.kept(chip).write_bytes(b"something else entirely")
+        with self.assertRaises(inbox.Refused) as caught:
+            inbox.send_reply(self.app, 77, "x", confirm_token="t", attachments=[chip["id"]])
+        self.assertIn("changed after it was attached", str(caught.exception))
+        self.assertEqual(self.app.client.uploads, [])
+
+    def test_empty_too_big_and_garbled_are_each_a_sentence(self):
+        with self.assertRaises(inbox.Refused):
+            self.stage(raw=b"")
+        with mock.patch.object(inbox, "MAX_ATTACH_BYTES", 16):
+            with self.assertRaises(inbox.Refused) as caught:
+                self.stage(raw=b"x" * 17)
+        self.assertIn("can be up to", str(caught.exception))
+        with self.assertRaises(inbox.Refused):
+            inbox.stage_file(self.app, 77, "a.png", "image/png", "not base64!!")
+        with self.assertRaises(inbox.Refused):
+            inbox.stage_file(self.app, "../77", "a.png", "image/png", b64(PNG))
+
+    def test_too_many_on_one_reply_is_refused(self):
+        ids = [self.stage()["id"] for _ in range(inbox.MAX_ATTACH + 1)]
+        with self.assertRaises(inbox.Refused):
+            inbox.staged(self.app, 77, ids)
+
+    def test_a_name_is_made_safe_for_canvas_and_for_windows(self):
+        name = self.stage(name='..\\..\\evil"name<1>.png')["name"]
+        self.assertEqual(name, "evil name 1.png")
+        self.assertEqual(self.stage(name="", mime="image/png")["name"], "attachment.png")
+
+    def test_a_type_the_browser_left_out_is_worked_out_from_the_name(self):
+        chip = self.stage(raw=b"%PDF-1.4", name="notes.pdf", mime="")
+        self.assertEqual(chip["mime"], "application/pdf")
+        self.assertEqual(chip["kind"], "pdf")
+
+    def test_a_file_staged_and_never_sent_is_swept(self):
+        old = self.stage()
+        stale = time.time() - inbox.OUTBOX_KEEP_S - 60
+        for path in (self.tmp / inbox.OUTBOX).iterdir():
+            os.utime(path, (stale, stale))
+        fresh = self.stage()
+        self.assertFalse(self.kept(old).exists())
+        self.assertFalse(self.kept(old, ".json").exists())
+        self.assertTrue(self.kept(fresh).exists())
+
+    def test_it_is_written_into_the_record_with_the_files(self):
+        from courseforge import audit
+        audit.forget_actor()
+        audit.set_actor_source(lambda: {}, {})
+        chip = self.stage()
+        inbox.send_reply(self.app, 77, "ok", confirm_token="t", attachments=[chip["id"]])
+        row = audit.read(self.app.course_dir("734975"))[0]
+        self.assertIn("with 1 file attached", row["sentence"])
+        self.assertEqual(row["detail"]["files"][0]["name"], "image.png")
+        self.assertEqual(row["detail"]["files"][0]["canvas_file_id"], "901")
+        self.assertEqual(row["detail"]["files"][0]["sha256"], hashlib.sha256(PNG).hexdigest())
+
+
+class TheRoutesCarryAttachments(Base):
+    def setUp(self):
+        super().setUp()
+        self.app.client = AttachClient()
+
+    def req(self, path, body, cid="77"):
+        from courseforge.routing import Request
+        return Request(app=self.app, handler=None, method="POST", path=path,
+                       params={"cid": cid}, body=body)
+
+    def test_the_attach_route_is_registered(self):
+        from courseforge.inboxarea import routes as _r  # noqa: F401
+        from courseforge.routing import ROUTER
+        self.assertIn(("POST", "/api/inbox/{cid}/attach"),
+                      {(rt.method, rt.pattern) for rt in ROUTER.routes})
+
+    def test_attaching_answers_with_the_chip_and_touches_no_canvas(self):
+        from courseforge.inboxarea import routes as r
+        out = r.attach(self.req("/api/inbox/77/attach",
+                                {"name": "shot.png", "type": "image/png", "data": b64(PNG)}))
+        self.assertEqual((out["name"], out["kind"]), ("shot.png", "image"))
+        self.assertEqual(self.app.client.uploads, [])
+
+    def test_a_missing_or_garbled_file_is_a_400_with_a_sentence(self):
+        from courseforge.inboxarea import routes as r
+        from courseforge.routing import HTTPError
+        for body in ({}, {"name": "a.png", "data": "!!!"}):
+            with self.assertRaises(HTTPError) as caught:
+                r.attach(self.req("/api/inbox/77/attach", body))
+            self.assertEqual(caught.exception.status, 400)
+
+    def test_a_file_that_has_gone_is_said_before_the_job_starts(self):
+        from courseforge.inboxarea import routes as r
+        from courseforge.routing import HTTPError
+        with self.assertRaises(HTTPError) as caught:
+            r.reply(self.req("/api/inbox/77/reply", {"body": "x", "attachments": ["0" * 32]}))
+        self.assertEqual(caught.exception.status, 400)
+        self.assertIn("no longer on this computer", caught.exception.message)
+
+    def test_the_reply_job_hands_the_files_to_the_send(self):
+        from courseforge.inboxarea import routes as r
+        chip = inbox.stage_file(self.app, 77, "shot.png", "image/png", b64(PNG))
+        job = r.reply(self.req("/api/inbox/77/reply",
+                               {"body": "See it.", "attachments": [chip["id"]], "confirm": "t"}))
+        out = job.fn(lambda *a, **k: None)
+        self.assertEqual(out["attached"], 1)
+        self.assertEqual(self.app.client.sent[0][2], ["901"])
+
+
+class TheClientCarriesThem(unittest.TestCase):
+    def client(self):
+        from courseforge.canvas import CanvasClient
+        made = CanvasClient("https://canvas.example.edu", "t", scope="grading")
+        made.seen = []
+        made._form = lambda method, path, fields: made.seen.append((path, list(fields))) or {}
+        return made
+
+    def test_add_message_names_each_attachment(self):
+        c = self.client()
+        c.reply_to_conversation(77, "hi", attachment_ids=["901", "902"])
+        path, fields = c.seen[0]
+        self.assertEqual(path, "/conversations/77/add_message")
+        self.assertEqual([v for k, v in fields if k == "attachment_ids[]"], ["901", "902"])
+
+    def test_a_plain_reply_sends_no_attachment_field(self):
+        c = self.client()
+        c.reply_to_conversation(77, "hi")
+        self.assertEqual(c.seen[0][1], [("body", "hi")])
+
+    def test_an_upload_can_keep_both_files_rather_than_replace(self):
+        c = self.client()
+        # No upload slot comes back, so it stops before any network.
+        with self.assertRaises(RuntimeError):
+            c.upload_user_file("a.png", b"x", folder=inbox.ATTACH_FOLDER,
+                               content_type="image/png", on_duplicate="rename")
+        fields = dict(c.seen[0][1])
+        self.assertEqual(fields["on_duplicate"], "rename")
+        self.assertEqual(fields["parent_folder_path"], "conversation attachments")
+        with self.assertRaises(ValueError):
+            c.upload_user_file("a.png", b"x", on_duplicate="delete")
+
+    def test_every_other_upload_still_overwrites(self):
+        c = self.client()
+        with self.assertRaises(RuntimeError):
+            c.upload_user_file("state.json", b"{}")
+        self.assertEqual(dict(c.seen[0][1])["on_duplicate"], "overwrite")
+
+
+class ThePageAttaches(unittest.TestCase):
+    WEB = Path(__file__).resolve().parents[1] / "courseforge" / "web"
+
+    def src(self):
+        return (self.WEB / "js" / "inbox.js").read_text(encoding="utf-8")
+
+    def test_the_files_travel_inside_the_body_with_the_token(self):
+        self.assertIn("{ body: { body, attachments, confirm: token } }", self.src())
+
+    def test_text_on_the_clipboard_pastes_as_text(self):
+        """Excel and Word put a picture of the copy beside its text."""
+        self.assertIn("getData('text/plain')", self.src())
+
+    def test_the_picture_beside_copied_text_is_offered_not_dropped(self):
+        s = self.src()
+        self.assertIn("offerPictures(t, got.filter(", s)
+        self.assertIn('id="ibOffer"', s)
+
+    def test_a_screenshot_pasted_while_reading_opens_the_reply(self):
+        """The reply box may not be open yet when a screenshot is pasted."""
+        s = self.src()
+        self.assertIn("document.addEventListener('paste', onPagePaste)", s)
+        self.assertIn("onLeave(() => document.removeEventListener('paste', onPagePaste))", s)
+
+    def test_its_limits_are_the_servers(self):
+        s = self.src()
+        self.assertIn("const MAX_FILE = %d * 1024 * 1024;"
+                      % (inbox.MAX_ATTACH_BYTES // (1024 * 1024)), s)
+        self.assertIn("const MAX_FILES = %d;" % inbox.MAX_ATTACH, s)
+
+    def test_an_svg_is_never_drawn_as_a_thumbnail(self):
+        line = next(l for l in self.src().splitlines() if "const RASTER" in l)
+        self.assertNotIn("svg", line.lower())
+
+    def test_the_styles_it_uses_are_defined(self):
+        css = (self.WEB / "css" / "inbox.css").read_text(encoding="utf-8")
+        for name in ("ibAttach", "ibChip", "ibThumb", "ibThumbFile", "ibChipText",
+                     "ibChipName", "ibChipSize", "ibChipX", "ibAttachHint",
+                     "ibDraftBox.dropping", "ibOffer"):
+            self.assertIn("." + name, css, name)
 
 
 if __name__ == "__main__":

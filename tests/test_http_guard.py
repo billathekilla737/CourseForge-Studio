@@ -1,6 +1,7 @@
 """Host allow-list, per-launch API key, and student-file MIME rules."""
 from __future__ import annotations
 
+import base64
 import http.client
 import inspect
 import json
@@ -12,8 +13,9 @@ import unittest
 from pathlib import Path
 from types import SimpleNamespace
 
-from courseforge import server
+from courseforge import inbox, server
 from courseforge.assistant import routes as _assistant_routes  # noqa: F401
+from courseforge.inboxarea import routes as _inbox_routes  # noqa: F401
 from courseforge.routing import _error_payload
 from courseforge.store import Store
 
@@ -207,6 +209,31 @@ class LiveApiGuard(unittest.TestCase):
         })
         self.assertEqual(status, 403)
 
+    def _post_as_page(self, path, body):
+        """A POST the way the Studio page sends one: its key, its origin, JSON."""
+        return self._call("POST", path, {
+            "X-Studio-Key": self.key,
+            "Origin": f"http://127.0.0.1:{self.port}",
+        }, body=body)
+
+    def test_a_pasted_picture_reaches_the_inbox_through_the_real_handler(self):
+        png = b"\x89PNG\r\n\x1a\n" + b"\x00" * 64
+        status, _, raw = self._post_as_page("/api/inbox/77/attach", {
+            "name": "image.png", "type": "image/png",
+            "data": base64.b64encode(png).decode("ascii")})
+        self.assertEqual(status, 200, raw)
+        chip = json.loads(raw.decode("utf-8"))
+        self.assertEqual((self.tmp / inbox.OUTBOX / chip["id"]).read_bytes(), png)
+
+    def test_the_largest_attachment_still_fits_in_one_request(self):
+        """The server silently reads no body past MAX_BODY_BYTES. A file at the
+        attach limit, as base64 inside JSON, has to come in under it."""
+        status, _, raw = self._post_as_page("/api/inbox/77/attach", {
+            "name": "big.bin", "type": "application/octet-stream",
+            "data": base64.b64encode(b"\x00" * inbox.MAX_ATTACH_BYTES).decode("ascii")})
+        self.assertEqual(status, 200, raw[:300])
+        self.assertEqual(json.loads(raw.decode("utf-8"))["size"], inbox.MAX_ATTACH_BYTES)
+
     def test_index_carries_the_secret(self):
         status, headers, raw = self._call("GET", "/")
         self.assertEqual(status, 200)
@@ -232,6 +259,27 @@ class LiveApiGuard(unittest.TestCase):
         self.assertNotIn("trace", snap)
         self.assertEqual(snap["error"], "RuntimeError")
         self.assertNotIn("hidden", json.dumps(snap))
+
+    def test_a_stale_confirmation_in_a_job_reads_as_its_sentence(self):
+        """A Yes left open past the ten minutes is refused inside the job. The
+        gate's refusal is written for the person; a bare class name is not."""
+        from courseforge import confirm
+        jobs = server.Jobs()
+        gate = confirm.ConfirmGate()
+
+        def spend(_log):
+            gate.require("push", {"a": 1}, "write it", token="deadbeef")
+
+        job_id = jobs.start("push", spend)
+        snap = None
+        for _ in range(100):
+            snap = jobs.get(job_id)
+            if snap and snap.get("state") != "running":
+                break
+            time.sleep(0.02)
+        self.assertEqual(snap["state"], "error")
+        self.assertIn("no longer valid", snap["error"])
+        self.assertIn("Nothing was sent to Canvas", snap["error"])
 
 
 class RoutingFiveHundred(unittest.TestCase):

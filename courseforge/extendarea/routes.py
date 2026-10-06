@@ -221,8 +221,11 @@ def _plan(app, args, log) -> dict:
         submitted = _submitted(app, targets, args["user_ids"], log)
 
     try:
+        # The window goes in again: a target was kept for anybody's date in
+        # it, and each student is held to their own.
         result = extend.plan(people, targets, args["days"], submitted,
-                             args["include_submitted"])
+                             args["include_submitted"],
+                             start=args["start"], end=args["end"])
     except ValueError as exc:
         raise HTTPError(400, str(exc)) from None
 

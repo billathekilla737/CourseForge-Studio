@@ -439,8 +439,9 @@ def _sync_assignment(cfg: Config, client: CanvasClient, store: Store,
             # can tell what the other machine has already done.
             **gradesync.canvas_grade_fields(sub, me_id),
             "submitted_at": sub.get("submitted_at"),
-            "late": bool(sub.get("late")),
-            "seconds_late": sub.get("seconds_late") or 0,
+            # Late by the clock, even after Studio set Canvas's status to None.
+            "late": latepolicy.true_lateness(sub)[0],
+            "seconds_late": latepolicy.true_lateness(sub)[1],
             "attempt": sub.get("attempt"),
             "student_comments": [
                 {"text": str(c.get("comment") or ""),

@@ -291,6 +291,18 @@ class CanvasClient(ContentOps, FilesOps, CourseOps):
         )
         return payload or {}
 
+    def clear_late_status(self, course_id: int | str, assignment_id: int | str,
+                          user_id: int | str) -> dict:
+        """Set one submission's late status to None, so the course's automatic
+        late deduction does not touch the grade Studio is about to post.
+
+        This is the per-student "Status: None" from SpeedGrader. The course's
+        Late Policies setting is not read or changed. Callers must gate this.
+        """
+        return self._form(
+            "PUT", f"/courses/{course_id}/assignments/{assignment_id}/submissions/{user_id}",
+            [("submission[late_policy_status]", "none")])
+
     def _json_body(self, method: str, path: str, body: dict) -> dict:
         """Send a JSON body. Used where Canvas takes an array of objects and
         form encoding would depend on the order of repeated bracket keys."""

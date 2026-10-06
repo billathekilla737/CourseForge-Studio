@@ -3817,13 +3817,15 @@ function openPush(only) {
               ? `SCORES + ${r.comments_n || 0} SELECTED COMMENT${(r.comments_n || 0) === 1 ? '' : 'S'}`
               : 'SCORES ONLY (no comments)'),
           `WILL WRITE ${write.length} · HELD BACK ${held.length}`,
+          r.late_cleared_n ? `\nLATE: ${r.late_note}` : '',
           held.length ? '\nHELD BACK - nothing is written for these:\n'
             + held.map(s => `  ${studentLabel(s)}: ${s.why}`).join('\n') : '',
           write.length ? '\nWILL WRITE:\n'
             + write.map(s => `  ${studentLabel(s)}: ${s.score}`
               + (s.curved_by ? `   (${s.earned} earned ${s.curved_by > 0 ? '+' : ''}${
                   s.curved_by}${s.curved_by > 0 ? ' curve' : ' late'})` : '')
-              + (s.comment ? '   + comment' : '')).join('\n') : '',
+              + (s.comment ? '   + comment' : '')
+              + (s.clear_late ? '   + Canvas late status set to None' : '')).join('\n') : '',
         ].filter(Boolean).join('\n');
         $('#pushGo').disabled = !write.length;
       };
@@ -3961,7 +3963,7 @@ const LATE_KINDS = ['percent_per_day', 'percent_per_hour', 'flat_percent', 'none
    Canvas's to apply. */
 function lateBox(s, e) {
   if (!s || !(s.late || (e && e.late_penalty && e.late_penalty.applied))) return '';
-  const policy = (S.ws && (S.ws.draft.late_policy || S.ws.late_policy)) || {};
+  const policy = (S.ws && (S.ws.late_policy || S.ws.draft.late_policy)) || {};
   if (policy.canvas_applies || policy.kind === 'canvas') return '';
   if (!LATE_KINDS.includes(policy.kind)) {
     return `<div class="lateBox muted"><b>Late penalty</b> · ${esc(policy.summary
@@ -5044,7 +5046,13 @@ function canvasTag(s, e) {
   const differs = mine != null && Math.abs(mine - s.canvas_score) >= 0.005;
   const when = fmtDate(s.canvas_graded_at);
   const seen = s.canvas_posted_at ? ' · students can see it' : '';
-  return `<span class="tag ${s.canvas_posted_at ? 'ok' : ''}" title="${when ? 'graded in Canvas ' + esc(when) : 'in the Canvas gradebook'}">Canvas: ${num(s.canvas_score)}${seen}${differs ? ' · differs from yours' : ''}</span>`;
+  // canvas_score is what was entered. Canvas's own late policy may have taken
+  // points off what students see; the next push sets Status: None to undo it.
+  const cut = +(s.canvas_points_deducted || 0);
+  const cutTag = cut > 0 && s.canvas_late_status !== 'none'
+    ? `<span class="tag warn" title="Canvas's late policy took this off the score students see. Pushing again sets this submission's Canvas status to None, so only Studio's late penalty counts.">Canvas took −${num(cut)} late · students see ${num(s.canvas_shown_score)}</span>`
+    : '';
+  return `<span class="tag ${s.canvas_posted_at ? 'ok' : ''}" title="${when ? 'graded in Canvas ' + esc(when) : 'in the Canvas gradebook'}">Canvas: ${num(s.canvas_score)}${seen}${differs ? ' · differs from yours' : ''}</span>${cutTag}`;
 }
 
 /* Names the curve steps in the order they were applied, so a stacked curve is
@@ -5142,7 +5150,7 @@ function paintLate(e) {
   const lp = e.late_penalty || {};
   const noteEl = $('#lateNote');
   if (noteEl && lp.applied && isScored(e)) {
-    const policy = (S.ws && (S.ws.draft.late_policy || S.ws.late_policy)) || {};
+    const policy = (S.ws && (S.ws.late_policy || S.ws.draft.late_policy)) || {};
     noteEl.textContent = `Syllabus: ${policy.summary || lp.summary || ''}`;
   }
   const tag = $('#lateTag');

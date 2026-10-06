@@ -11,8 +11,19 @@ import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
 
 let S = null;   // the single live viewer, or null
 
-const CLAY = new THREE.MeshStandardMaterial({ color: 0xc9ccd1, roughness: 0.85, metalness: 0.0 });
+const CLAY = new THREE.MeshStandardMaterial({ color: 0x9aa0a8, roughness: 0.85, metalness: 0.0 });
 const NORMALS = new THREE.MeshNormalMaterial();
+// What a mesh with no material slot gets: matte grey, the way Blender's own
+// viewport shows it. See isLoaderDefault.
+const UNTEXTURED = new THREE.MeshStandardMaterial({ color: 0xb4b8be, roughness: 0.8, metalness: 0.0 });
+
+function isLoaderDefault(m) {
+  // GLTFLoader.createDefaultMaterial: unnamed, white, metalness 1, roughness 1,
+  // no maps. Blender names every material it exports, so an unnamed one can
+  // only be the loader's stand-in for "this primitive has no material".
+  return !!m && m.isMeshStandardMaterial && !m.name && !m.map && !m.metalnessMap
+    && m.metalness === 1 && m.roughness === 1 && m.color.getHex() === 0xffffff;
+}
 
 function teardown() {
   if (!S) return;
@@ -83,12 +94,17 @@ const BlendViewer = {
     const scene = new THREE.Scene();
     scene.background = new THREE.Color(opts.background || 0x1c2026);
 
-    // We export with export_lights=False, so without an environment map any
-    // metallic material renders black.
+    // We export with export_lights=False, so the viewer brings its own light.
+    // The room environment gives metallic materials something to reflect (with
+    // no environment they render black); the hemisphere and key lights give
+    // form. Together they have to land near 1.0 on a lit face. At the old
+    // 1.0 + 1.6 + 1.4 ACES clipped Blender's default 0.8 grey to flat white,
+    // which is what every untextured student model used to look like.
     const pmrem = new THREE.PMREMGenerator(renderer);
     scene.environment = pmrem.fromScene(new RoomEnvironment(), 0.04).texture;
-    scene.add(new THREE.HemisphereLight(0xffffff, 0x334455, 1.6));
-    const key = new THREE.DirectionalLight(0xffffff, 1.4);
+    scene.environmentIntensity = 0.4;
+    scene.add(new THREE.HemisphereLight(0xffffff, 0x334455, 0.25));
+    const key = new THREE.DirectionalLight(0xffffff, 0.7);
     key.position.set(3, 5, 4);
     scene.add(key);
 
@@ -122,6 +138,17 @@ const BlendViewer = {
 
     const root = gltf.scene || gltf.scenes[0];
     S.root = root;
+    // A mesh with no material slot has no glTF material, and the loader's
+    // stand-in for that is white at metalness 1: a dull mirror of the room
+    // environment, which reads as a flat white blob with no shading at all.
+    root.traverse(o => {
+      if (!o.isMesh) return;
+      if (Array.isArray(o.material)) {
+        o.material = o.material.map(m => (isLoaderDefault(m) ? UNTEXTURED.clone() : m));
+      } else if (isLoaderDefault(o.material)) {
+        o.material = UNTEXTURED.clone();
+      }
+    });
     scene.add(root);
     const { radius, center } = frameObject(root, camera, controls);
 

@@ -2900,7 +2900,7 @@ function doGrade(only) {
   const label = only ? `Grading ${n} student${n === 1 ? '' : 's'} with ${pair}`
     : `Auto-grading ${n} students with ${pair}`;
   runJob(label, () => api(`/a/${courseId}/${assignmentId}/grade`, { body: { only } }),
-    () => openAssignment(courseId, assignmentId));
+    () => openAssignment(courseId, assignmentId), { stoppable: true });
 }
 async function setModel(model, key = 'model') {
   const previous = S.health[key];
@@ -3918,6 +3918,13 @@ const UNSCORED_SOURCES = ['auto-skip', 'no-submission'];
 function isScored(e) {
   return !!e && e.total != null && !UNSCORED_SOURCES.includes(e.source);
 }
+/* Students could see a finished grade when this assignment was last scanned.
+   Scans from before scan_live existed fall back to what Canvas shows now. */
+function liveAtScan(s) {
+  if (!s) return false;
+  if (typeof s.scan_live === 'boolean') return s.scan_live;
+  return s.canvas_score != null && !!s.canvas_posted_at;
+}
 function unscoredReason(s, e) {
   if (isScored(e)) return '';
   if (s && s.status === 'unsubmitted') return 'no submission';
@@ -3929,9 +3936,63 @@ function unscoredReason(s, e) {
 /* The score that counts: earned, minus a syllabus late dock, plus any curve.
    The server keeps final_total in step whenever those change. */
 function lateOff(e) {
+  const full = lateFull(e);
+  if (!full) return 0;
+  return Math.round(full * lateShareOf(e)) / 100;
+}
+/* The whole syllabus penalty, before the late slider scales it. */
+function lateFull(e) {
   const lp = e && e.late_penalty;
   if (!lp || !lp.applied) return 0;
   return +(lp.points || 0);
+}
+/* Mirrors latepolicy.share_of: how much of the penalty is applied, 0 to 100.
+   No penalty attached reads as 0, because that is what the score carries. */
+function lateShareOf(e) {
+  const lp = e && e.late_penalty;
+  if (!lp || !lp.applied) return 0;
+  const raw = e.late_share;
+  if (raw == null || !isFinite(+raw)) return 100;
+  return Math.max(0, Math.min(100, Math.round(+raw / 10) * 10));
+}
+const LATE_KINDS = ['percent_per_day', 'percent_per_hour', 'flat_percent', 'none_accepted'];
+/* The late-penalty slider under the score. Only for late work, and only when
+   Studio applies the syllabus rule itself; Canvas's own late policy is
+   Canvas's to apply. */
+function lateBox(s, e) {
+  if (!s || !(s.late || (e && e.late_penalty && e.late_penalty.applied))) return '';
+  const policy = (S.ws && (S.ws.draft.late_policy || S.ws.late_policy)) || {};
+  if (policy.canvas_applies || policy.kind === 'canvas') return '';
+  if (!LATE_KINDS.includes(policy.kind)) {
+    return `<div class="lateBox muted"><b>Late penalty</b> · ${esc(policy.summary
+      || 'No late-work rule found in the syllabus.')} There is no penalty to scale.</div>`;
+  }
+  const share = lateShareOf(e);
+  const lp = (e && e.late_penalty) || {};
+  const note = !isScored(e)
+    ? 'Takes effect once this student has a score.'
+    : (lp.waived && !lp.applied
+      ? esc(lp.summary || 'Waived by your instructions.') + ' Move the slider to put some of it back.'
+      : (!lp.applied && lp.summary ? esc(lp.summary)
+        : `Syllabus: ${esc(policy.summary || '')}`));
+  const ticks = Array.from({ length: 11 }, (_, i) => `<span>${i * 10}</span>`).join('');
+  return `<div class="lateBox">
+      <div class="critHead">
+        <label class="lbl" for="lateShare">Late penalty applied</label>
+        <span class="val" id="lateVal">${lateValText(e, share)}</span>
+      </div>
+      <input type="range" id="lateShare" min="0" max="100" step="10" value="${share}"
+        aria-describedby="lateNote">
+      <div class="ticks">${ticks}</div>
+      <div class="lateNote" id="lateNote">${note}</div>
+    </div>`;
+}
+function lateValText(e, share) {
+  const full = lateFull(e);
+  const off = full ? Math.round(full * share) / 100 : 0;
+  const pts = full
+    ? ` <span class="sub">−${num(off)} of ${num(full)} pts</span>` : '';
+  return `${share}%${pts}`;
 }
 function wholePoints(n) {
   const x = Number(n);
@@ -4049,7 +4110,9 @@ function students() {
     const e = entryOf(s.user_id);
     if (S.filter === 'review') return reviewHold(s);
     if (S.filter === 'human') return !!(e && (e.source === 'human' || e.source === 'canvas'));
-    if (S.filter === 'ungraded') return !isScored(e);
+    // Not live on Canvas when the assignment was scanned. A slider score or a
+    // push since then does not take anyone off this list; a re-sync does.
+    if (S.filter === 'ungraded') return !liveAtScan(s);
     // The working set most of the time: whoever handed something in. Everyone
     // else is a roster entry with nothing to read, and scrolling past them is
     // the whole reason this chip exists.
@@ -4774,8 +4837,9 @@ function renderDetail() {
     tags += `<span class="tag">no score · ${esc(unscoredReason(s, e))}</span>`;
   }
   if (bump) tags += `<span class="tag ai">curved +${num(bump)}</span>`;
-  if (lateOff(e)) tags += `<span class="tag warn" title="${esc((e.late_penalty && e.late_penalty.summary) || '')}">late −${num(lateOff(e))}</span>`;
-  else if (e.late_penalty && e.late_penalty.waived) tags += `<span class="tag" title="${esc(e.late_penalty.summary || '')}">late penalty waived</span>`;
+  if (lateOff(e)) tags += `<span class="tag warn" id="lateTag" title="${esc((e.late_penalty && e.late_penalty.summary) || '')}">late −${num(lateOff(e))}</span>`;
+  else if (e.late_penalty && e.late_penalty.waived) tags += `<span class="tag" id="lateTag" title="${esc(e.late_penalty.summary || '')}">late penalty waived</span>`;
+  else if (lateFull(e)) tags += `<span class="tag" id="lateTag">late penalty off</span>`;
   if (e.human_ok) tags += '<span class="tag ok">reviewed by you</span>';
   if (e.source === 'human') tags += '<span class="tag edit">edited by you</span>';
   else if (e.source === 'canvas') tags += '<span class="tag edit">pulled from Canvas</span>';
@@ -4854,13 +4918,11 @@ function renderDetail() {
           + ` <b class="ltr">${letterOf(100 * total / possible)}</b>` : ''}</span>
       <span class="origNote">${scoreAdjustNote(e, earned, bump)}</span>
     </div>
+    ${lateBox(s, e)}
     ${bump ? `<div class="curveNote">
       This score includes a curve you applied${curveSteps(e)}.
       The earned score, ${num(earned)}, is kept underneath and is what comes back
-      if you remove the curve.</div>` : ''}
-    ${lateOff(e) ? `<div class="curveNote">${esc((e.late_penalty && e.late_penalty.summary)
-      || 'A late penalty from the syllabus was applied.')} The rubric above is the
-      score the work earned.</div>` : ''}`;
+      if you remove the curve.</div>` : ''}`;
 
   const autoShown = e.quiz_auto_score != null ? e.quiz_auto_score : s.quiz_auto_score;
   if (gradeIsPosted(s)) {
@@ -4923,7 +4985,17 @@ function renderDetail() {
   host.innerHTML = html;
   host.scrollTop = 0;
 
-  host.querySelectorAll('input[type=range]').forEach(r => {
+  const lateEl = $('#lateShare');
+  if (lateEl) lateEl.addEventListener('input', () => {
+    lateEl.dataset.touched = '1';
+    const share = Math.max(0, Math.min(100, Math.round(+lateEl.value / 10) * 10));
+    // The points follow once the server has priced the penalty; until then
+    // the percent is the part that is already certain.
+    const full = lateFull(entryOf(s.user_id));
+    $('#lateVal').innerHTML = full ? lateValText(entryOf(s.user_id), share) : `${share}%`;
+    queueSave(s.user_id);
+  });
+  host.querySelectorAll('input[type=range][data-cid]').forEach(r => {
     r.addEventListener('input', ev => {
       const el = ev.target;
       const c = crits.find(x => x.id === el.dataset.cid);
@@ -5033,23 +5105,52 @@ function queueSave(uid) {
 async function saveStudent(uid) {
   const crits = rubric();
   const scores = {};
-  document.querySelectorAll('#detail input[type=range]').forEach(el => {
+  document.querySelectorAll('#detail input[type=range][data-cid]').forEach(el => {
     const cap = +((crits.find(c => c.id === el.dataset.cid) || {}).points || 0);
     scores[el.dataset.cid] = Math.max(0, Math.min(cap, Math.round(+el.value)));
   });
   const comment = ($('#cmt') || {}).value || '';
   const postComment = !!($('#postCmt') || {}).checked;
+  const body = { scores, comment, post_comment: postComment, source: 'human' };
+  // Only a slider the instructor moved: sending it on every rubric save would
+  // undo a waiver from the instructions box.
+  const lateEl = $('#lateShare');
+  if (lateEl && lateEl.dataset.touched) body.late_share = Math.round(+lateEl.value / 10) * 10;
   try {
-    const r = await api(`/a/${S.ids.courseId}/${S.ids.assignmentId}/student/${uid}`,
-      { body: { scores, comment, post_comment: postComment, source: 'human' } });
+    const r = await api(`/a/${S.ids.courseId}/${S.ids.assignmentId}/student/${uid}`, { body });
     S.ws.draft.students[String(uid)] = r.student;
     setStatus('saved', 'ok');
     renderRoster();
     // The curved total, when there is one: the same number the roster shows.
     const card = $('.bigScore');
     if (card) card.innerHTML = `${num(finalOf(r.student))}<span class="of"> / ${S.ws.draft.points_possible || 0}</span>`;
-    const note = $('.origNote'); if (note) note.innerHTML = aiDeltaNote(r.student);
+    const pct = $('.totalCard .pct'), now = finalOf(r.student), max = +S.ws.draft.points_possible || 0;
+    if (pct) pct.innerHTML = (now != null && max)
+      ? (100 * now / max).toFixed(1) + `% <b class="ltr">${letterOf(100 * now / max)}</b>` : '';
+    const note = $('.origNote'); if (note) note.innerHTML = scoreAdjustNote(r.student, earnedOf(r.student), curveDelta(r.student));
+    paintLate(r.student);
   } catch (err) { setStatus('save failed: ' + err.message, 'err'); }
+}
+/* After a save: the slider's points and the late tag, without a re-render
+   that would scroll the pane back to the top. */
+function paintLate(e) {
+  const el = $('#lateShare');
+  if (!el) return;
+  const share = lateShareOf(e);
+  if (!el.matches(':active')) el.value = String(share);
+  const val = $('#lateVal'); if (val) val.innerHTML = lateValText(e, share);
+  const lp = e.late_penalty || {};
+  const noteEl = $('#lateNote');
+  if (noteEl && lp.applied && isScored(e)) {
+    const policy = (S.ws && (S.ws.draft.late_policy || S.ws.late_policy)) || {};
+    noteEl.textContent = `Syllabus: ${policy.summary || lp.summary || ''}`;
+  }
+  const tag = $('#lateTag');
+  const off = lateOff(e);
+  if (tag) {
+    tag.textContent = off ? `late −${num(off)}` : 'late penalty off';
+    tag.className = off ? 'tag warn' : 'tag';
+  }
 }
 
 /* -------------------------------------------------------------- work pane */

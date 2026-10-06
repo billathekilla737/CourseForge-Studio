@@ -92,6 +92,80 @@ class EditStudentKeepsTheCurvedTotalInStep(unittest.TestCase):
         self.assertEqual(entry["total"], 10)
 
 
+class TheLateSliderScalesThePenalty(unittest.TestCase):
+    """The student page slider: 0 to 100 percent of the syllabus late penalty,
+    set by hand, with or without the auto-grader having run."""
+
+    POLICY = {"kind": "flat_percent", "percent": 20.0, "interval": "day",
+              "grace_hours": 0.0, "floor_percent": 0.0, "max_days": None,
+              "canvas_applies": False, "summary": "20% off if late, from the syllabus."}
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.app = bare_app(self.tmp)
+        self.app.store.save_draft("1", "2", {
+            "rubric": RUBRIC, "points_possible": 20, "late_policy": self.POLICY,
+            "students": {
+                # Graded by hand: the auto-grader never attached a penalty.
+                "7": {"user_id": "7", "source": "human", "scores": {"c1": 8, "c2": 8},
+                      "total": 16},
+                # Auto-graded with the whole penalty on.
+                "8": {"user_id": "8", "source": "claude", "scores": {"c1": 8, "c2": 8},
+                      "total": 16, "final_total": 13,
+                      "late_penalty": {"kind": "flat_percent", "percent": 20.0,
+                                       "applied": True, "points": 3.2, "units": 1}},
+                # Waived by the instructions box.
+                "9": {"user_id": "9", "source": "claude", "scores": {"c1": 8, "c2": 8},
+                      "total": 16,
+                      "late_penalty": {"applied": False, "waived": True, "points": 0,
+                                       "summary": "Late penalty waived."}},
+            }})
+        late = {"late": True, "seconds_late": 3600, "status": "submitted"}
+        self.app.store.save_extracted("1", "2", {
+            uid: {"user_id": uid, "name": "S" + uid, **late} for uid in ("7", "8", "9")})
+
+    def test_a_hand_graded_late_student_gets_the_penalty_from_the_slider(self):
+        entry = self.app.edit_student("1", "2", "7", {"late_share": 50})
+        self.assertTrue(entry["late_penalty"]["applied"])
+        self.assertEqual(entry["late_penalty"]["points"], 3.2, "the full syllabus amount")
+        self.assertEqual(entry["late_share"], 50)
+        self.assertEqual(entry["final_total"], 14, "16 minus half of 3.2, rounded")
+        saved = self.app.store.draft("1", "2")["students"]["7"]
+        self.assertEqual(saved["final_total"], 14)
+
+    def test_zero_lifts_the_penalty_but_keeps_the_full_amount_on_record(self):
+        entry = self.app.edit_student("1", "2", "8", {"late_share": 0})
+        self.assertEqual(entry["final_total"], 16)
+        self.assertEqual(entry["late_penalty"]["points"], 3.2)
+        self.assertEqual(curve.final_total(entry, RUBRIC, 20), 16)
+
+    def test_the_share_snaps_to_tens_inside_the_range(self):
+        from courseforge import latepolicy
+        self.assertEqual(latepolicy.share_of({"late_share": 47}), 50)
+        self.assertEqual(latepolicy.share_of({"late_share": 140}), 100)
+        self.assertEqual(latepolicy.share_of({"late_share": -5}), 0)
+        self.assertEqual(latepolicy.share_of({}), 100, "no slider yet is the whole penalty")
+
+    def test_a_rubric_save_does_not_undo_a_waiver(self):
+        self.app.store.update_student("1", "2", "9", late_share=60)
+        entry = self.app.edit_student("1", "2", "9", {"scores": {"c1": 9, "c2": 8}})
+        self.assertFalse(entry["late_penalty"]["applied"])
+        self.assertTrue(entry["late_penalty"]["waived"])
+
+    def test_moving_the_slider_on_a_waived_student_puts_part_back(self):
+        entry = self.app.edit_student("1", "2", "9", {"late_share": 30})
+        self.assertTrue(entry["late_penalty"]["applied"])
+        self.assertEqual(entry["final_total"], 15, "16 minus 30% of 3.2")
+
+    def test_a_regrade_keeps_the_share(self):
+        self.app.edit_student("1", "2", "8", {"late_share": 40})
+        self.app.store.put_student("1", "2", "8", {
+            "user_id": "8", "source": "claude", "scores": {"c1": 9, "c2": 9},
+            "total": 18}, keep_human=False)
+        self.assertEqual(self.app.store.draft("1", "2")["students"]["8"]["late_share"], 40)
+
+
 class ATypedCanvasTotalKeepsItsCurve(unittest.TestCase):
     def test_a_worked_out_grade_is_a_whole_number(self):
         earned = {"total": 10, "scores": {"c1": 10}, "curve": {"flat": 3.6}}

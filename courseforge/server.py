@@ -202,6 +202,15 @@ class JobSink:
         self._jobs = jobs
         self._id = job_id
 
+    @property
+    def job_id(self) -> str:
+        return self._id
+
+    @property
+    def stopped(self) -> bool:
+        """True once Stop was pressed on this job. Only a cancellable job looks."""
+        return self._jobs.stop_requested(self._id)
+
     def __call__(self, message: str, done: int | None = None,
                  total: int | None = None) -> None:
         self._jobs.log(self._id, message, done, total)
@@ -213,7 +222,8 @@ class JobSink:
 
 MAX_BODY_BYTES = 16 * 1024 * 1024
 # Exceptions whose message is already a sentence for the person.
-PLAIN_ERRORS = ("Refused", "PushRefused", "HTTPError", "NotOnThisRoster")
+PLAIN_ERRORS = ("Refused", "PushRefused", "HTTPError", "NotOnThisRoster",
+                "ConfirmStale")
 # Finished jobs are kept so a page that closed the dialog can still read the
 # result, but not forever: each one holds its plan or draft in memory.
 JOB_KEEP_SECONDS = 60 * 60
@@ -252,13 +262,41 @@ class Jobs:
                     return job["id"]
         return None
 
-    def start(self, kind: str, fn, key: str = "") -> str:
+    def stop_requested(self, job_id: str) -> bool:
+        with self._lock:
+            return bool((self._jobs.get(job_id) or {}).get("stopping"))
+
+    def stop(self, job_id: str) -> dict:
+        """Ask a running job to stop. Only jobs started as cancellable can be.
+
+        The job ends itself at its next check; its in-flight Claude calls are
+        killed now so that check comes in seconds, not at the end of a read.
+        """
+        with self._lock:
+            job = self._jobs.get(job_id)
+            if not job:
+                return {"ok": False, "error": "no such job"}
+            if job.get("state") != "running":
+                return {"ok": False, "error": "this job has already finished"}
+            if not job.get("cancellable"):
+                return {"ok": False, "error": "this job cannot be stopped partway"}
+            job["stopping"] = True
+            job["message"] = "stopping…"
+            job["updated"] = time.time()
+        killed = llm.stop_owned(job_id)
+        return {"ok": True, "killed": killed}
+
+    def start(self, kind: str, fn, key: str = "", cancellable: bool = False) -> str:
         """Run fn on a thread and return its job id.
 
         With `key`, a job already running under the same key is returned
         instead of a second one being started: opening an assignment and
         pressing Re-sync in the same minute used to run two syncs of it side
         by side, and the second read files the first was still writing.
+
+        `cancellable` is a promise that fn checks its sink's `stopped` and
+        leaves things consistent when it does. Most jobs make no such promise:
+        a push stopped halfway would leave Canvas and this machine disagreeing.
         """
         existing = self.running(key)
         if existing:
@@ -269,6 +307,7 @@ class Jobs:
             self._sweep(now)
             self._jobs[job_id] = {"id": job_id, "kind": kind, "state": "running",
                                   "log": [], "items": {}, "updated": now, "key": key,
+                                  "cancellable": bool(cancellable),
                                   "started_at": datetime.now().isoformat(timespec="seconds")}
         sink = JobSink(self, job_id)
 
@@ -277,6 +316,10 @@ class Jobs:
                 result = fn(sink)
                 with self._lock:
                     self._jobs[job_id].update(state="done", result=result or {},
+                                              items={}, updated=time.time())
+            except grader.JobStopped as exc:
+                with self._lock:
+                    self._jobs[job_id].update(state="stopped", message=str(exc),
                                               items={}, updated=time.time())
             except llm.NotLoggedIn as exc:
                 with self._lock:
@@ -791,7 +834,10 @@ class App:
                   .get(str(user_id)) or {})
         was_total, was_source = before.get("total"), before.get("source")
         was_comment = before.get("comment") or ""
+        was_share = latepolicy.share_of(before) if before.get("late_penalty") else None
         changes = {k: v for k, v in body.items() if k != "user_id"}
+        if "late_share" in changes:
+            changes["late_share"] = latepolicy.share_of({"late_share": changes["late_share"]})
         if "post_comment" in changes:
             changes["post_comment"] = bool(changes["post_comment"])
         # Ticking "include this comment" is not a regrade.
@@ -818,6 +864,18 @@ class App:
         rubric = draft.get("rubric") or []
         possible = draft.get("points_possible") or 0
         extra = {}
+        # The late slider works without the auto-grader: a hand-graded late
+        # student gets the syllabus penalty here, and moving the slider on a
+        # waived one puts the penalty back at the chosen share.
+        current_lp = entry.get("late_penalty") or {}
+        if (entry.get("late_share") is not None and curve.is_scored(entry)
+                and ("late_share" in changes or not current_lp)
+                and not current_lp.get("applied")):
+            fresh = self._fresh_late(course_id, assignment_id, user_id, entry,
+                                     draft, rubric, possible)
+            if fresh:
+                extra.update(fresh)
+                entry = {**entry, **extra}
         if entry.get("late_penalty") and curve.is_scored(entry):
             extra["late_penalty"] = latepolicy.refresh(
                 entry, curve.earned_total(entry, rubric), possible)
@@ -825,11 +883,15 @@ class App:
         if curve.is_scored(entry) and (
                 entry.get("curve") or (entry.get("late_penalty") or {}).get("applied")):
             extra["final_total"] = curve.final_total(entry, rubric, possible)
-        if extra and any(entry.get(k) != v for k, v in extra.items()):
+        stored = draft["students"][str(user_id)]
+        if extra and any(stored.get(k) != v for k, v in extra.items()):
             draft = self.store.update_student(course_id, assignment_id, user_id, **extra)
             entry = draft["students"][str(user_id)]
+        now_share = (latepolicy.share_of(entry)
+                     if (entry.get("late_penalty") or {}).get("applied") else None)
+        share_moved = "late_share" in changes and now_share != was_share
         if (not flag_only
-                and (was_total != entry.get("total")
+                and (was_total != entry.get("total") or share_moved
                      or was_comment != (entry.get("comment") or ""))):
             name = (self.store.extracted(course_id, assignment_id)
                     .get(str(user_id), {}).get("name", ""))
@@ -837,6 +899,9 @@ class App:
             if was_total != entry.get("total"):
                 what.append("the score from %s to %s"
                             % (self._said(was_total), self._said(entry.get("total"))))
+            if share_moved:
+                what.append("the late penalty to %s%% of the syllabus amount"
+                            % (now_share if now_share is not None else 0))
             if was_comment != (entry.get("comment") or ""):
                 what.append("the comment")
             audit.record(
@@ -848,8 +913,37 @@ class App:
                 detail={"assignment_id": str(assignment_id),
                         "from_total": was_total, "to_total": entry.get("total"),
                         "was_source": was_source,
+                        "late_share": now_share if share_moved else None,
                         "comment_changed": was_comment != (entry.get("comment") or "")})
         return entry
+
+    def _fresh_late(self, course_id, assignment_id, user_id, entry: dict,
+                    draft: dict, rubric: list, possible) -> dict | None:
+        """The syllabus late penalty for one late student, priced now.
+
+        Returns the entry fields to change, or None when the student was on
+        time or the course has no rule Studio applies itself.
+        """
+        info = self.store.extracted(course_id, assignment_id).get(str(user_id)) or {}
+        if not info.get("late"):
+            return None
+        policy = draft.get("late_policy") or self.course_late_policy(course_id)
+        if not policy or policy.get("canvas_applies"):
+            return None
+        if (policy.get("kind") or "") not in latepolicy.APPLY_KINDS:
+            return None
+        fresh = latepolicy.attach(
+            {"total": curve.earned_total(entry, rubric), "scores": entry.get("scores"),
+             "flags": []},
+            info, policy, possible)
+        lp = fresh.get("late_penalty")
+        if not lp:
+            return None
+        flags = [f for f in (entry.get("flags") or [])
+                 if not str(f).startswith("late penalty")]
+        flags.extend(f for f in (fresh.get("flags") or [])
+                     if str(f).startswith("late penalty"))
+        return {"late_penalty": lp, "flags": flags}
 
     def _reprice_late(self, course_id, assignment_id, draft: dict, policy: dict) -> dict:
         """Replace a late cut Studio already applied, using the fractional day.
@@ -3413,6 +3507,10 @@ def make_handler(app: App):
             try:
                 if parts[1:] == ["settings"]:
                     return self._json(app.set_settings(body))
+                # /api/jobs/<id>/stop   -- Stop on the progress chip
+                if len(parts) == 4 and parts[1] == "jobs" and parts[3] == "stop":
+                    out = app.jobs.stop(parts[2])
+                    return self._json(out, 200 if out.get("ok") else 409)
 
                 # /api/setup/token  {token, base_url, force}
                 # Write-only: the token never comes back out of this server.
@@ -3526,7 +3624,7 @@ def make_handler(app: App):
                         policy = app.course_late_policy(cid)
                         job = app.jobs.start("grade", lambda log: grader.grade_assignment(
                             app.cfg, app.store, cid, aid, only=only, progress=log,
-                            late_policy=policy))
+                            late_policy=policy), cancellable=True)
                         return self._json({"job": job})
 
                     if action == "instructions":

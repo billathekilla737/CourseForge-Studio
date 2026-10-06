@@ -312,6 +312,11 @@ something. Everyone else is a roster entry with nothing to read. Whichever chip
 you pick is remembered, across assignments and across restarts, because it is a
 habit rather than a property of the assignment.
 
+**Ungraded** is everyone who did not have a finished grade live on Canvas when
+the assignment was scanned. Moving a slider or pushing a grade does not take a
+student off the list, so it holds the whole batch until you are done; the next
+sync rebuilds it from what Canvas shows then.
+
 ---
 
 ## How grading works
@@ -337,6 +342,21 @@ opening) and applies that rule: 10% per day, a flat percent, or no late work
 at all. The rubric cells stay as the work earned them. The number that posts
 is the earned score minus that dock. If Canvas already has a late policy
 turned on, Studio does not dock a second time and says so on the roster.
+
+A late student's page has a **Late penalty applied** slider under the score,
+from 0 to 100 percent of that syllabus dock in steps of 10. 100 is the whole
+penalty and 0 is none. It does not need the auto-grader: on a student you
+graded by hand, moving it applies the syllabus rule at the share you pick, and
+on one waived by your instructions it puts part of the penalty back. A re-grade
+keeps the share you set. The slider is hidden when Canvas does the docking,
+and it says so when the syllabus has no rule to scale.
+
+A grading run can be stopped: **Stop** in its progress dialog, or right-click
+the progress chip in the header and pick **Stop grading**. The Claude calls in
+flight are ended right away. Students who finished before the stop keep their
+new drafts, and nobody else is touched, so a run started before the custom
+instructions were written costs only the students it already finished. Other
+jobs (sync, push) cannot be stopped partway, and the menu says so.
 
 Claude returns strict JSON: per-criterion points and rationale, a comment, flags,
 a confidence level, and a `needs_human` boolean. Anything unparseable is recorded

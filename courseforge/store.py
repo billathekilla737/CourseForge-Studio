@@ -186,6 +186,11 @@ class Store:
                 if existing.get("curve"):
                     entry["curve"] = existing["curve"]
                     entry.pop("final_total", None)
+                # So is how much of the late penalty to apply: a re-grade
+                # re-prices the penalty, not the instructor's leniency.
+                if existing.get("late_share") is not None:
+                    entry["late_share"] = existing["late_share"]
+                    entry.pop("final_total", None)
                 # human_ok deliberately does NOT carry over: it meant "I read
                 # this score", and this is a different score.
                 entries[str(user_id)] = entry

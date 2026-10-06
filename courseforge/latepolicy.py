@@ -434,8 +434,38 @@ def waiver(instructions: str, student: dict | None, *, addressed: bool = False) 
     return ""
 
 
+def share_of(entry: dict | None) -> int:
+    """How much of the late penalty the instructor wants applied, 0 to 100.
+
+    Set by the slider on the student page, in steps of ten. A missing value is
+    the whole penalty, which is what every entry had before the slider existed.
+    """
+    raw = (entry or {}).get("late_share")
+    if raw is None:
+        return 100
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return 100
+    return int(max(0, min(100, round(value / 10.0) * 10)))
+
+
 def deduction(entry: dict, earned: float, possible: float | None = None) -> float:
-    """Points to take off the earned score. 0 if nothing applies.
+    """Points to take off the earned score, after the instructor's share.
+
+    ``late_penalty["points"]`` stays the full syllabus amount; the share on
+    the entry scales it here, so re-pricing the penalty never loses the
+    instructor's choice.
+    """
+    full = full_deduction(entry, earned, possible)
+    share = share_of(entry)
+    if share >= 100 or not full:
+        return full
+    return round(full * share / 100.0, 2)
+
+
+def full_deduction(entry: dict, earned: float, possible: float | None = None) -> float:
+    """Points the syllabus rule takes off the earned score. 0 if nothing applies.
 
     A per-day rule is that fraction of the assignment's points. 10% a day on
     a 100-point assignment is 10 points a day, so 0.5 days is 5 points off

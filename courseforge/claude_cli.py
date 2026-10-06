@@ -12,6 +12,7 @@ We strip those so the CLI falls back to normal OAuth either way.
 from __future__ import annotations
 
 import base64
+import contextlib
 import json
 import os
 import re
@@ -31,6 +32,37 @@ NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 # instead of leaving orphans behind.
 _ACTIVE: set[subprocess.Popen] = set()
 _ACTIVE_LOCK = threading.Lock()
+
+# Which job started each process, so Stop on one grading run ends that run's
+# calls and nobody else's. The tag is per thread: a grading worker sets it
+# around its student, and every `claude` it launches is filed under it.
+_OWNER = threading.local()
+_OWNED: dict[str, set[subprocess.Popen]] = {}
+_STOPPED: set[str] = set()
+
+
+@contextlib.contextmanager
+def owned_by(tag: str | None):
+    """File every `claude` this thread launches under `tag` until the block ends."""
+    previous = getattr(_OWNER, "tag", None)
+    _OWNER.tag = tag
+    try:
+        yield
+    finally:
+        _OWNER.tag = previous
+
+
+def stop_owned(tag: str) -> int:
+    """Kill the running calls filed under `tag`, and refuse any new ones."""
+    with _ACTIVE_LOCK:
+        _STOPPED.add(tag)
+        procs = list(_OWNED.pop(tag, ()))
+    for proc in procs:
+        try:
+            proc.kill()
+        except Exception:  # noqa: BLE001
+            pass
+    return len(procs)
 
 
 def shutdown_all() -> int:
@@ -329,6 +361,10 @@ def _invoke(prompt: str, images: list[Path], model: str, timeout_s: int,
             system: str | None, on_activity: Callable[[dict], None] | None,
             partial: bool) -> tuple[str, str, int]:
     """Launch one `claude -p` and return (stdout, stderr, returncode)."""
+    tag = getattr(_OWNER, "tag", None)
+    with _ACTIVE_LOCK:
+        if tag and tag in _STOPPED:
+            raise ClaudeError("Stopped before this call started.")
     # A grading call is a question, not a session. With its built-in tools
     # left on, `claude -p` would honour "read data/<course>/map.json and quote
     # it" written inside a submission and hand the pseudonym map back in a
@@ -359,6 +395,12 @@ def _invoke(prompt: str, images: list[Path], model: str, timeout_s: int,
     )
     with _ACTIVE_LOCK:
         _ACTIVE.add(proc)
+        if tag:
+            if tag in _STOPPED:
+                # Stop landed between the check above and the launch.
+                proc.kill()
+            else:
+                _OWNED.setdefault(tag, set()).add(proc)
     try:
         if on_activity:
             out, err, code = _consume(proc, stdin_text, timeout_s, on_activity)
@@ -376,6 +418,10 @@ def _invoke(prompt: str, images: list[Path], model: str, timeout_s: int,
     finally:
         with _ACTIVE_LOCK:
             _ACTIVE.discard(proc)
+            if tag and tag in _OWNED:
+                _OWNED[tag].discard(proc)
+                if not _OWNED[tag]:
+                    _OWNED.pop(tag, None)
 
     if partial and on_activity and _rejected_flag(out, err):
         raise _NoPartialSupport()

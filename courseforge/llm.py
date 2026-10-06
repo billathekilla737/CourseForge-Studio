@@ -56,6 +56,16 @@ def doctor() -> dict:
     return info
 
 
+def owned_by(tag: str | None):
+    """File the model calls this thread makes under one job, so Stop can end them."""
+    return claude_cli.owned_by(tag)
+
+
+def stop_owned(tag: str) -> int:
+    """End one job's in-flight calls. The API backend stops between students instead."""
+    return claude_cli.stop_owned(tag)
+
+
 def shutdown_all() -> int:
     """Stop in-flight model calls on exit. Only the CLI backend owns subprocesses."""
     return claude_cli.shutdown_all()

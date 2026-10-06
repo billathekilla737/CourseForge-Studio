@@ -805,15 +805,20 @@ function renderDock() {
   host.classList.toggle('show', !!DOCK.length);
   host.innerHTML = DOCK.map(J => {
     const pct = jobPct(J.info);
+    const stopping = !J.finished && !!((J.info && J.info.stopping) || J.stopQueued);
     const cls = J.state === 'error' ? 'bad'
-      : J.needsAnswer ? 'ask' : J.finished ? 'done' : '';
+      : J.needsAnswer ? 'ask' : J.state === 'stopped' ? 'stopped'
+        : J.finished ? 'done' : stopping ? 'stopping' : '';
     const right = J.state === 'error' ? 'failed'
       : J.needsAnswer ? 'needs you'
-        : J.finished ? 'done'
-          : pct == null ? clock((Date.now() - J.started) / 1000) : pct + '%';
+        : J.state === 'stopped' ? 'stopped'
+          : J.finished ? 'done'
+            : J.stopQueued ? 'stop queued' : stopping ? 'stopping…'
+              : pct == null ? clock((Date.now() - J.started) / 1000) : pct + '%';
     const fill = pct == null ? 100 : pct;
+    const canStop = jobCanStop(J);
     return `<button class="jobChip ${cls}" data-job="${J.id}"
-        title="${esc(J.title)} — ${esc(J.msg || '')}">
+        title="${esc(J.title)} — ${esc(J.msg || '')}${canStop ? ' (right-click to stop)' : ''}">
         ${J.finished || J.needsAnswer ? '' : '<span class="spin"></span>'}
         <span class="jcName">${esc(jobShort(J.title))}</span>
         <span class="jcBar"><i class="${pct == null && !J.finished
@@ -836,7 +841,123 @@ function renderDock() {
       dockDrop(J);
       openJob(J);
     };
+    btn.oncontextmenu = ev => {
+      const J = DOCK.find(x => String(x.id) === btn.dataset.job);
+      if (!J) return;
+      ev.preventDefault();
+      openJobMenu(J, ev.clientX, ev.clientY);
+    };
   });
+}
+
+/* ------------------------------------------------------------- stopping */
+/* Grading can be stopped: it checks between students and throws away a read
+   that was cut off. A push or a sync stopped halfway would leave Canvas and
+   this machine disagreeing, so those say so instead of offering a button that
+   cannot keep its promise.
+
+   Stop is a request that waits its turn. Pressed before the server has said
+   the run can stop (the first poll has not come back, or the send failed), it
+   is queued and goes in on the next poll that allows it. Nobody has to keep
+   watching for the moment it becomes possible. */
+function jobStoppable(J) {
+  return !!(J && (J.opts.stoppable || (J.info && J.info.cancellable)));
+}
+function jobCanStop(J) {
+  return !!(J && !J.finished && jobStoppable(J) && !J.stopQueued
+    && !(J.info && J.info.stopping));
+}
+
+function stopJob(J) {
+  if (!jobCanStop(J)) return;
+  J.stopQueued = true;
+  J.msg = 'stop queued — it goes in as soon as the run allows';
+  paintJob(J);
+  sendQueuedStop(J);
+}
+
+/* Called on every poll while a stop is waiting. */
+async function sendQueuedStop(J) {
+  if (!J.stopQueued || J.finished || J.stopSending) return;
+  const info = J.info;
+  if (!J.job || !info) return;                     // first poll not back yet
+  if (!('cancellable' in info)) {
+    // A server from before Stop existed never says yes. Say what fixes it
+    // once, and keep the request in case the run is restarted on a new one.
+    if (!J.stopOldServer) {
+      J.stopOldServer = true;
+      setStatus('Stop needs the updated Studio: close the small Studio window, '
+        + 'open it again, then reload this page', 'err');
+    }
+    return;
+  }
+  if (!info.cancellable) return;
+  J.stopSending = true;
+  try {
+    await api('/jobs/' + J.job + '/stop', { body: {} });
+    J.stopQueued = false;
+    J.info = { ...(J.info || {}), stopping: true };
+    J.msg = 'stopping…';
+    setStatus('stopping ' + J.title.toLowerCase() + '…');
+  } catch (err) {
+    // Left queued: the next poll tries again. A finished job clears it.
+    J.msg = 'stop queued — retrying (' + firstLine(err.message) + ')';
+  } finally {
+    J.stopSending = false;
+    paintJob(J);
+  }
+}
+
+function closeJobMenu() {
+  const m = $('#jobMenu');
+  if (m) m.remove();
+  document.removeEventListener('pointerdown', _jobMenuAway, true);
+  document.removeEventListener('keydown', _jobMenuKey, true);
+}
+function _jobMenuAway(ev) {
+  const m = $('#jobMenu');
+  if (m && !m.contains(ev.target)) closeJobMenu();
+}
+function _jobMenuKey(ev) {
+  if (ev.key === 'Escape') { ev.preventDefault(); closeJobMenu(); }
+}
+
+function openJobMenu(J, x, y) {
+  closeJobMenu();
+  const menu = document.createElement('div');
+  menu.id = 'jobMenu';
+  menu.className = 'rosterMenu';
+  menu.setAttribute('role', 'menu');
+  menu.setAttribute('aria-label', J.title);
+  const canStop = jobCanStop(J);
+  const why = J.finished ? 'Already finished'
+    : J.stopQueued ? 'Stop queued — goes in as soon as it can'
+      : (J.info && J.info.stopping) ? 'Stopping…'
+        : 'Only grading can be stopped partway';
+  menu.innerHTML = `<div class="rosterMenuHead">${esc(jobShort(J.title))}</div>
+    <button role="menuitem" data-act="open">Show progress</button>
+    <div class="sep"></div>
+    <button role="menuitem" data-act="stop" class="danger"${canStop ? '' : ' disabled'}
+      title="${canStop ? 'Students already finished keep their drafts. Nobody else is changed.' : esc(why)}">${
+      canStop ? 'Stop grading' : esc(why)}</button>`;
+  document.body.appendChild(menu);
+  // Keep it on screen: the dock sits at the top right.
+  const r = menu.getBoundingClientRect();
+  menu.style.left = Math.max(8, Math.min(x, innerWidth - r.width - 8)) + 'px';
+  menu.style.top = Math.max(8, Math.min(y, innerHeight - r.height - 8)) + 'px';
+  menu.querySelector('[data-act=open]').onclick = () => {
+    closeJobMenu();
+    // The same as a left click, which also knows about a waiting question.
+    const chip = $(`#jobDock [data-job="${J.id}"]`);
+    if (chip) chip.click();
+  };
+  menu.querySelector('[data-act=stop]').onclick = () => {
+    closeJobMenu();
+    stopJob(J);
+  };
+  (menu.querySelector('button:not([disabled])') || menu).focus();
+  document.addEventListener('pointerdown', _jobMenuAway, true);
+  document.addEventListener('keydown', _jobMenuKey, true);
 }
 
 /* ------------------------------------------------------------------ a job */
@@ -877,6 +998,10 @@ function runJob(title, start, onDone, opts = {}) {
       J.msg = info.message || info.state;
       J.log = (info.log || []).join('\n');
       if (info.state === 'running') {
+        if (J.stopQueued) {
+          J.msg = 'stop queued — it goes in as soon as the run allows';
+          sendQueuedStop(J);
+        }
         paintJob(J);
         J.timer = setTimeout(tick, J.docked ? 1400 : 700);
         return;
@@ -929,6 +1054,24 @@ function finishJob(J, info) {
     return;
   }
 
+  if (info.state === 'stopped') {
+    // Stopped on purpose. The page still reloads (onDone below) so the
+    // students finished before the stop show their drafts.
+    J.msg = info.message || 'Stopped.';
+    announce(J.title + ': stopped');
+    setStatus(firstLine(J.msg), 'ok');
+    paintJob(J);
+    if (J.docked) setTimeout(() => { if (J.finished && !J.node) dockDrop(J); }, 9000);
+    if (J.onDone) J.onDone(info.result);
+    return;
+  }
+
+  if (J.stopQueued) {
+    // It ran out before the queued stop could go in. Say so, so a finished
+    // run is not mistaken for a stopped one.
+    J.stopQueued = false;
+    setStatus(J.title + ' — finished before the stop could go in', 'err');
+  }
   J.msg = 'Done.';
   announce(J.title + ': done');
   paintJob(J);
@@ -970,6 +1113,8 @@ function openJob(J) {
       <div class="foot">
         <span class="jobHint" id="jobHint"></span>
         <span class="spacer"></span>
+        <button class="btn danger hidden" id="jobStop"
+          title="Students already finished keep their drafts. Nobody else is changed.">Stop</button>
         <button class="btn" id="jobClose">Close</button>
       </div>
     </div></div>`;
@@ -988,6 +1133,7 @@ function openJob(J) {
     J.release();
     dockAdd(J);
   };
+  $('#jobStop').onclick = () => stopJob(J);
   paintJob(J);
 }
 
@@ -1047,9 +1193,19 @@ function paintJobModal(J) {
     $('#jobEta').textContent = clock(elapsed) + ' elapsed';
   }
 
+  const stop = $('#jobStop');
+  if (stop) {
+    const stopping = running && !!(info.stopping || J.stopQueued);
+    stop.classList.toggle('hidden', !(running && jobStoppable(J)));
+    stop.disabled = stopping;
+    stop.textContent = J.stopQueued ? 'Stop queued' : stopping ? 'Stopping…' : 'Stop';
+  }
+
   const hint = $('#jobHint');
   if (running) {
-    hint.textContent = 'Close keeps it running — a progress chip stays up top.';
+    hint.textContent = jobCanStop(J)
+      ? 'Close keeps it running — a progress chip stays up top. Right-click the chip to stop.'
+      : 'Close keeps it running — a progress chip stays up top.';
   } else {
     hint.textContent = '';
     const spin = $('#jobSpin');
@@ -1067,6 +1223,8 @@ function paintJobModal(J) {
         msg.innerHTML += '<br>Run <code>claude</code> then <code>/login</code> in a plain terminal, ' +
           'and restart this tool from there.';
       }
+    } else if (J.state === 'stopped') {
+      msg.innerHTML = '<b>Stopped.</b> ' + esc(String(J.msg || '').replace(/^Stopped\.\s*/, ''));
     } else {
       msg.textContent = 'Done.';
     }

@@ -92,6 +92,10 @@ def _noop(message: str, done: int | None = None, total: int | None = None) -> No
     return None
 
 
+class JobStopped(RuntimeError):
+    """The instructor pressed Stop. Not a failure; the message says what was kept."""
+
+
 def _item(progress: Progress, key: str, state: str, detail: str = "",
           finished: bool = False) -> None:
     """Report live per-unit status, if this sink accepts it.
@@ -187,11 +191,30 @@ def _activity_sink(progress: Progress, key: str, model: str,
 
     return activity
 
-SYSTEM_PROMPT = f"""You are grading college coursework for a community college instructor.
+SYSTEM_PROMPT = f"""You are grading college coursework for a community college instructor. Grade the
+way an experienced instructor grades a stack of papers: in proportion, with the
+whole piece of work in view before any single line of the rubric.
 
-You are strict but fair, and you grade only what the rubric asks about. You never
-inflate a score to be kind and never dock points for things the rubric does not
-mention. You quote or point at specific evidence from the student's work for every
+How to score each criterion:
+
+1. Read the whole submission first. Decide which rating tier describes it as a
+   whole, the way an instructor who has seen hundreds of these would.
+2. Then check the rubric. Move down from that tier only for a defect whose
+   consequence you can state in one sentence: what it costs the work's purpose.
+   The script does not run. The reader cannot follow the layout. The deliverable
+   is not what was asked for. If you cannot name the consequence, it does not
+   move the score.
+3. Everything else you noticed is a note, not a deduction: a label missing from
+   an otherwise clear chart, a file named differently than asked, a typo, a
+   rough edge on strong work. Notes cost nothing. One of them may go in the
+   comment as the thing to do differently next time.
+4. Work that sits between two tiers gets the higher one.
+5. One real defect is one deduction. Do not take points for it again under a
+   second criterion as a side effect.
+
+You grade only what the rubric asks about: never a point off for something it
+does not mention, never a point off to be safe, never a point added to be kind.
+You quote or point at specific evidence from the student's work for every
 judgment. You never invent content the student did not write.
 
 If the work is missing, unreadable, or too fragmentary to judge, say so and set
@@ -456,6 +479,10 @@ def _sync_assignment(cfg: Config, client: CanvasClient, store: Store,
                 quizgrade.attach(entry, quiz_pack, sub)
             except Exception as exc:  # noqa: BLE001
                 progress(f"  could not read written answers: {exc}")
+        # Whether students could already see a finished grade when this scan
+        # ran. Pushes and timed pulls refresh canvas_score but leave this
+        # alone, so the Ungraded chip keeps what was still to do at the start.
+        entry["scan_live"] = gradesync.whole_grade_posted(entry)
         extracted[uid] = entry
 
     # Enrolled students with no submission row at all still need a card.
@@ -468,7 +495,7 @@ def _sync_assignment(cfg: Config, client: CanvasClient, store: Store,
             "status": "unsubmitted", "submitted_at": None, "late": False,
             "filenames": [], "parts": [], "body_text": "", "text": "", "words": 0,
             "unreadable": [], "images": [], "videos": [],
-            "sheets": [], "models": [],
+            "sheets": [], "models": [], "scan_live": False,
             "_files_dir": str(adir / "files"),
         }
         if uid in discussion:
@@ -732,19 +759,26 @@ def build_prompt(assignment: dict, rubric: list[dict], entry: dict,
                  "short: a student reads two sentences and skims anything longer, "
                  "so a long comment is a wasted one. Nothing that belongs in the "
                  "rationale belongs in the comment as well. Work that earns every "
-                 "point gets NO comment: return an empty string. Write the "
-                 "rationales either way, since those are the instructor's record.")
+                 "point gets at most one sentence: a note you actually noticed and "
+                 "would say out loud when handing the work back. Full points and "
+                 "nothing noticed: return an empty string, and do not go looking "
+                 "for one. Write the rationales either way, since those are the "
+                 "instructor's record.")
     lines.append(
         "Return ONLY this JSON object:\n"
         "{\n"
         f'  "criteria": [ {{ "id": <one of {ids}>, "points": <number>, '
-        '"rationale": "<2-3 sentences citing specific evidence from the work>" } ],\n'
+        '"rationale": "<Start with the tier you placed this in and why, citing the '
+        "work. Then 'Deductions:' with each defect and its one-sentence consequence, "
+        "or 'Deductions: none'. Then 'Notes:' with anything you noticed that did not "
+        "move the score, or 'Notes: none'. Three to five sentences.>\" } ],\n"
         '  "comment": "<to the student, second person. TWO sentences. Three only if the work '
         'genuinely needs it, never four. Under 45 words total. Say what cost the '
         'points and the one thing to do differently next time. No opening praise, '
-        'no summary of what they did, no sign-off. EMPTY STRING when the work earned '
-        'every point: there is nothing to account for, and casting about for advice '
-        'to give a perfect submission is what produces advice nobody asked for.>",\n'
+        'no summary of what they did, no sign-off. When the work earned every point: '
+        'ONE sentence if you have a note you actually noticed, otherwise EMPTY STRING. '
+        'Casting about for advice to give a perfect submission is what produces '
+        'advice nobody asked for.>",\n'
         '  "flags": ["<short tags such as late, missing part 4, possible AI text, off-prompt>"],\n'
         '  "confidence": "high" | "medium" | "low",\n'
         '  "needs_human": <true if you could not fairly grade this. A blank, empty, or n/a answer scored 0 is a grade, not a hold>,\n'
@@ -1339,14 +1373,32 @@ def grade_assignment(cfg: Config, store: Store, course_id, assignment_id,
         progress(late_policy["summary"], 0, total)
 
     roster = store.students(course_id)
+    # Stop from the progress chip. The page's sink says when it was pressed and
+    # which job this is; a print-style progress function has neither.
+    tag = getattr(progress, "job_id", None)
+
+    def stopped() -> bool:
+        return bool(getattr(progress, "stopped", False))
+
+    def one(uid):
+        if stopped():
+            return None
+        with llm.owned_by(tag):
+            return grade_one(cfg, assignment, rubric, extracted[uid],
+                             instructions, progress, roster, bool(wanted))
+
+    written: list[str] = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
-        futures = {
-            pool.submit(grade_one, cfg, assignment, rubric, extracted[uid],
-                        instructions, progress, roster, bool(wanted)): uid
-            for uid in targets
-        }
+        futures = {pool.submit(one, uid): uid for uid in targets}
         for future in concurrent.futures.as_completed(futures):
             uid = futures[future]
+            if stopped():
+                # Whatever comes back now was cut off mid-read or never ran.
+                # Nothing from it is saved; the students finished before the
+                # stop keep their drafts.
+                for pending in futures:
+                    pending.cancel()
+                break
             try:
                 result = future.result()
             except llm.NotLoggedIn:
@@ -1377,8 +1429,13 @@ def grade_assignment(cfg: Config, store: Store, course_id, assignment_id,
             # of the whole class still leaves those alone.
             store.put_student(course_id, assignment_id, uid, result,
                               keep_human=wanted is None)
+            written.append(uid)
             done += 1
             progress(f"graded {done}/{total}", done, total)
+
+    halted = stopped()
+    if halted:
+        targets = written
 
     draft = store.draft(course_id, assignment_id)
     entries = draft.get("students", {})
@@ -1432,7 +1489,12 @@ def grade_assignment(cfg: Config, store: Store, course_id, assignment_id,
                 "flagged_for_review": sum(
                     1 for uid in graded if (entries.get(uid) or {}).get("needs_human")),
                 "failed": len(failed),
-                "regrade": bool(only)})
+                "regrade": bool(only),
+                "stopped": halted})
+    if halted:
+        raise JobStopped(
+            f"Stopped. {_plural(len(written), 'student')} of {total} finished before "
+            "the stop and kept their drafts; nobody else was changed.")
     progress("done", total, total)
     return draft
 

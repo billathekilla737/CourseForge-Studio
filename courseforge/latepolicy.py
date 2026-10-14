@@ -667,6 +667,10 @@ def load(client, course_id, plain_html: Callable[[str], str]) -> dict:
     except Exception:  # noqa: BLE001
         canvas = None
     if isinstance(canvas, dict) and canvas.get("late_submission_deduction_enabled"):
+        # Studio grades lateness itself, always. Canvas's automatic deduction
+        # is switched off per student at the push (Status: None), and the
+        # course's Late Policies setting is never changed. When the syllabus
+        # has no rule of its own, Canvas's rule is the one Studio applies.
         interval = str(canvas.get("late_submission_interval") or "day").lower()
         if interval not in ("day", "hour"):
             interval = "day"
@@ -674,14 +678,47 @@ def load(client, course_id, plain_html: Callable[[str], str]) -> dict:
         floor = 0.0
         if canvas.get("late_submission_minimum_percent_enabled"):
             floor = float(canvas.get("late_submission_minimum_percent") or 0)
-        parsed["canvas_applies"] = True
-        parsed["kind"] = "canvas"
-        parsed["percent"] = percent
-        parsed["interval"] = interval
-        parsed["floor_percent"] = floor
-        parsed["source"] = "canvas"
-        parsed["summary"] = (
-            f"Canvas already deducts {_fmt(percent)}% per {interval} late"
-            + (f", not below {_fmt(floor)}%" if floor else "")
-            + ". Studio will not dock twice.")
+        parsed["canvas_late_on"] = True
+        parsed["canvas_policy"] = {"percent": percent, "interval": interval,
+                                   "floor_percent": floor}
+        tail = (" Canvas's own late deduction is turned off for each student "
+                "Studio posts, so it is never taken twice.")
+        if parsed.get("kind") not in APPLY_KINDS:
+            parsed["kind"] = "percent_per_hour" if interval == "hour" else "percent_per_day"
+            parsed["percent"] = percent
+            parsed["interval"] = interval
+            parsed["floor_percent"] = floor
+            parsed["source"] = "canvas"
+            parsed["summary"] = (
+                f"{_fmt(percent)}% per {interval} late"
+                + (f", not below {_fmt(floor)}%" if floor else "")
+                + ", from Canvas's late policy. Studio applies it." + tail)
+        else:
+            parsed["summary"] = (parsed.get("summary") or "") + tail
+        parsed["canvas_applies"] = False
     return parsed
+
+
+def true_lateness(sub: dict) -> tuple[bool, int]:
+    """Whether the work came in after its due date, and by how many seconds.
+
+    Canvas stops calling a submission late once its status is set to None,
+    which Studio does at the push so Canvas cannot take its own deduction.
+    The work was still late, and Studio's penalty depends on knowing that,
+    so a None status is checked against the submit time and the due date.
+    """
+    if sub.get("late"):
+        return True, int(sub.get("seconds_late") or 0)
+    if str(sub.get("late_policy_status") or "") != "none":
+        return False, 0
+    submitted, due = sub.get("submitted_at"), sub.get("cached_due_date")
+    if not submitted or not due:
+        return False, 0
+    try:
+        from datetime import datetime
+        when = datetime.fromisoformat(str(submitted).replace("Z", "+00:00"))
+        deadline = datetime.fromisoformat(str(due).replace("Z", "+00:00"))
+    except ValueError:
+        return False, 0
+    seconds = int((when - deadline).total_seconds())
+    return (True, seconds) if seconds > 0 else (False, 0)

@@ -218,10 +218,10 @@ class LoadFromAFakeCourse(unittest.TestCase):
         self.assertEqual(policy["kind"], "percent_per_day")
         self.assertFalse(policy["canvas_applies"])
 
-    def test_canvas_policy_wins_over_the_syllabus(self):
+    def _client(self, syllabus):
         class Client:
             def course_detail(self, cid, include=None):
-                return {"syllabus_body": "10% per day late."}
+                return {"syllabus_body": syllabus}
 
             def pages(self, cid):
                 return []
@@ -229,11 +229,44 @@ class LoadFromAFakeCourse(unittest.TestCase):
             def course_late_policy(self, cid):
                 return {"late_submission_deduction_enabled": True,
                         "late_submission_deduction": 10,
-                        "late_submission_interval": "day"}
+                        "late_submission_interval": "day",
+                        "late_submission_minimum_percent_enabled": True,
+                        "late_submission_minimum_percent": 50}
+        return Client()
 
-        policy = latepolicy.load(Client(), "1", lambda html: html)
-        self.assertTrue(policy["canvas_applies"])
-        self.assertEqual(policy["kind"], "canvas")
+    def test_studio_grades_lateness_even_when_canvas_has_a_policy(self):
+        policy = latepolicy.load(self._client("10% per day late."), "1", lambda html: html)
+        self.assertFalse(policy["canvas_applies"], "Studio applies it; Canvas's is switched off per student")
+        self.assertTrue(policy["canvas_late_on"])
+        self.assertEqual(policy["kind"], "percent_per_day")
+        self.assertIn("never taken twice", policy["summary"])
+
+    def test_with_no_syllabus_rule_canvas_rule_is_the_one_studio_applies(self):
+        policy = latepolicy.load(self._client("Welcome to class."), "1", lambda html: html)
+        self.assertEqual(policy["kind"], "percent_per_day")
+        self.assertEqual(policy["percent"], 10.0)
+        self.assertEqual(policy["floor_percent"], 50.0)
+        self.assertEqual(policy["source"], "canvas")
+
+
+class LatenessSurvivesCanvasStatusNone(unittest.TestCase):
+    def test_a_late_submission_is_late(self):
+        self.assertEqual(latepolicy.true_lateness({"late": True, "seconds_late": 90}), (True, 90))
+
+    def test_status_none_still_late_by_the_clock(self):
+        sub = {"late": False, "late_policy_status": "none",
+               "submitted_at": "2026-09-10T05:59:00Z", "cached_due_date": "2026-09-09T04:59:00Z"}
+        self.assertEqual(latepolicy.true_lateness(sub), (True, 25 * 3600))
+
+    def test_status_none_on_time_is_on_time(self):
+        sub = {"late": False, "late_policy_status": "none",
+               "submitted_at": "2026-09-08T05:59:00Z", "cached_due_date": "2026-09-09T04:59:00Z"}
+        self.assertEqual(latepolicy.true_lateness(sub), (False, 0))
+
+    def test_an_extension_is_respected(self):
+        sub = {"late": False, "late_policy_status": "extended",
+               "submitted_at": "2026-09-10T05:59:00Z", "cached_due_date": "2026-09-09T04:59:00Z"}
+        self.assertEqual(latepolicy.true_lateness(sub), (False, 0))
 
 
 class OneStudentUsesTheInstructions(unittest.TestCase):

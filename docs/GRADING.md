@@ -340,16 +340,29 @@ A late submission is still graded as if it were on time. After the scores come
 back, the Studio reads this course's syllabus (the late-work section, not the
 opening) and applies that rule: 10% per day, a flat percent, or no late work
 at all. The rubric cells stay as the work earned them. The number that posts
-is the earned score minus that dock. If Canvas already has a late policy
-turned on, Studio does not dock a second time and says so on the roster.
+is the earned score minus that dock.
+
+Studio always grades lateness itself. If the course has Canvas's automatic
+late deduction turned on (Grades → Late Policies), Studio applies that rule
+when the syllabus has none, and at the push sets each late submission's Canvas
+status to **None** just before its grade is written, so Canvas takes nothing
+off. The course's Late Policies setting itself is never changed; only the
+individual late submissions Studio posts are. The push confirmation says how
+many will be set to None. A course without a Canvas late policy keeps its
+"Late" labels untouched.
+
+A grade sync compares Canvas's *entered* score, not the score left after
+Canvas's deduction, so a deduction Canvas took is never copied back over your
+grade. Where Canvas already took one, the student's page shows "Canvas took
+−x late" until the next push undoes it.
 
 A late student's page has a **Late penalty applied** slider under the score,
 from 0 to 100 percent of that syllabus dock in steps of 10. 100 is the whole
 penalty and 0 is none. It does not need the auto-grader: on a student you
 graded by hand, moving it applies the syllabus rule at the share you pick, and
 on one waived by your instructions it puts part of the penalty back. A re-grade
-keeps the share you set. The slider is hidden when Canvas does the docking,
-and it says so when the syllabus has no rule to scale.
+keeps the share you set. It says so when neither the syllabus nor Canvas
+has a rule to scale.
 
 A grading run can be stopped: **Stop** in its progress dialog, or right-click
 the progress chip in the header and pick **Stop grading**. The Claude calls in

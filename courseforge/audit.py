@@ -43,6 +43,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Iterable
 
+from . import folders
+
 SCHEMA = 1
 DIR = "audit"
 CHAIN = "chain.json"
@@ -491,7 +493,7 @@ class Syncer(threading.Thread):
         try:
             for child in base.iterdir():
                 if child.is_dir() and folder(child).is_dir():
-                    out.append((child, child.name))
+                    out.append((child, folders.id_of(child)))
         except OSError:
             pass
         return out

@@ -654,6 +654,11 @@ class StateSyncer:
                     except Exception:  # noqa: BLE001
                         pass
                     try:
+                        from . import watchnotes
+                        watchnotes.reconcile(self.app)
+                    except Exception:  # noqa: BLE001
+                        pass
+                    try:
                         from .attendance import book as attendance_book
                         attendance_book.push_outstanding(self.app)
                     except Exception:  # noqa: BLE001

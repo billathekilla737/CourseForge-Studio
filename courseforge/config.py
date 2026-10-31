@@ -65,12 +65,22 @@ class Config:
     blend_timeout_s: int = 180
     blend_max_mb: int = 300             # refuse absurd files without launching
     blend_vision: bool = True           # send the contact sheet to the model
+    # A sync whose new files add up to more than this stops and asks first,
+    # naming the total, the file count and the students (grader.download_plan).
+    download_confirm_mb: int = 500
+    # data/Browse/<term>/<course>/<assignment> shortcuts into each synced
+    # assignment's files folder. Off by default: the folders themselves read
+    # "<id> - <name>" now (folders.py). Off also removes shortcuts made before.
+    browse_links: bool = False
     vision_model: str = "sonnet"        # opus vision is not worth the cost here
     # Carrying grading between machines through your own Canvas files.
     handoff_folder: str = "canvas-grader"
     handoff_auto: bool = True           # keep Canvas current once handed off once
     handoff_debounce_s: int = 45        # how long to let edits settle first
     max_images_per_student: int = 8
+    # Grade a video from a transcript made on this computer plus still frames
+    # sent as pictures (videoread.py). Off: videos are left to the instructor.
+    video_grading: bool = True
 
     # How stale the term schedule may be before opening it refetches from
     # Canvas in the background. The cached copy shows immediately either way.

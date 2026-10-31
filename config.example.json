@@ -35,6 +35,8 @@
   "blend_concurrency": 2,
   "blend_timeout_s": 180,
   "blend_max_mb": 300,
+  "_download_confirm_mb": "A sync whose new submission files add up to more than this many MB stops and asks before downloading, with the total size, file count and number of students. You can download them all or skip the files over 150 MB.",
+  "download_confirm_mb": 500,
   "blend_vision": true,
   "vision_model": "sonnet",
   "max_images_per_student": 8,

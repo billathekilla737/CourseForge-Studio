@@ -64,7 +64,7 @@
     if (typeof ensureCourse === 'function') await ensureCourse(cid);
     crumbs([
       { label: 'Courses', href: '#/' },
-      { label: (S.course && S.course.name) || S.tools.label || 'Course', href: '#/c/' + cid },
+      { label: courseTitle(S.course) || S.tools.label, href: '#/c/' + cid },
       { label: 'Course tools' },
     ]);
     $('#headerActions').innerHTML = '<button class="btn" id="toolsRefresh">Refresh</button>';

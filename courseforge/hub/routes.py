@@ -13,9 +13,10 @@ import time
 from datetime import date, datetime, timezone
 from pathlib import Path
 
-from .. import audit, gradesync, ledger
+from .. import audit, folders, gradestatus, ledger
 from ..areas import AREAS
 from ..routing import HTTPError, route
+from ..store import safe_id
 
 # Which hub card each area package reports into. Accessibility is three
 # packages (HTML restyling, Office documents, PDFs) and one card.
@@ -43,21 +44,70 @@ def picker(req):
     that asked Canvas how many submissions are waiting in five courses would
     take five calls to tell you something you are about to click into anyway.
     So a course that has never been opened here simply says so, and the first
-    visit fills it in.
+    visit fills it in. To Do is the same disk read. Re-reading it from Canvas
+    is the refresh job, which the home page runs only when asked.
+    """
+    return picker_payload(req.app, req.flag("refresh"))
+
+
+@route("POST", "/api/picker/refresh", area="hub")
+def picker_refresh(req):
+    """Re-read the course list and the assignment lists To Do is built from.
+
+    Reads only. A job, because one Canvas call per course in the term can
+    take a while. Body `{"term": "Fall 2026"}` limits the assignment reads
+    to that term; omit it, or send "__all", to read every course that is
+    not excluded. The course list itself is always re-read.
     """
     app = req.app
-    refresh = req.flag("refresh")
-    courses = [dict(c) for c in app.courses(refresh)]
-    for course in courses:
-        course.update(local_state(app, course.get("id")))
-    return {
-        "courses": courses,
-        "terms": app.term_summary(False),
-        "resume": _resume(courses),
-        # Past-due work still to grade, most days first. The page keeps
-        # five for the term on screen. Disk only, from the same pass as the counts.
-        "behind": take_behind(courses, limit=None),
-    }
+    body = req.body if isinstance(req.body, dict) else {}
+    term = str(body.get("term") or "")
+
+    def job(log):
+        return refresh_todo(app, term, log)
+
+    return req.job("picker.refresh", job)
+
+
+@route("POST", "/api/picker/status", area="hub")
+def picker_status(req):
+    """Check grading status in Canvas for the courses on screen, then To Do.
+
+    Reads only, and light: the assignment list and the submission rows, no
+    files. A course checked in the last few minutes is not asked again, so
+    the home page can start this on every load. Body `{"term": ...}` as for
+    /api/picker/refresh. The result is the picker payload plus `checked`,
+    the number of assignments Canvas was asked about.
+    """
+    app = req.app
+    body = req.body if isinstance(req.body, dict) else {}
+    term = str(body.get("term") or "")
+
+    def job(log):
+        return check_todo(app, term, log)
+
+    return req.job("picker.status", job)
+
+
+@route("POST", "/api/courses/{cid}/grade-status", area="hub")
+def course_status(req):
+    """Check grading status for one course's assignment list. Reads only.
+
+    Skipped when the course was checked in the last few minutes, unless the
+    body says `{"force": true}`. Returns the assignment list as
+    GET /api/courses/{cid}/assignments draws it, plus `checked`.
+    """
+    app = req.app
+    cid = req.params["cid"]
+    body = req.body if isinstance(req.body, dict) else {}
+    force = bool(body.get("force"))
+
+    def job(log):
+        out = check_course(app, cid, force=force, log=log)
+        out["assignments"] = app.assignments(cid)
+        return out
+
+    return req.job("grade.status", job)
 
 
 @route("GET", "/api/courses/{cid}/hub", area="hub")
@@ -129,11 +179,13 @@ def refresh(req):
     app = req.app
 
     def job(log):
-        log("Reading the assignment list from Canvas (reads only)", 0, 2)
+        log("Reading the assignment list from Canvas (reads only)", 0, 3)
         rows = app.assignments(cid, refresh=True)
-        log(f"{len(rows)} assignments in the list", 1, 2)
+        log(f"{len(rows)} assignments in the list", 1, 3)
+        check_course(app, cid, rows=app.store.assignments(cid), force=True)
+        log("Grading status checked", 2, 3)
         out = build_hub(app, cid)
-        log("Hub updated", 2, 2)
+        log("Hub updated", 3, 3)
         return out
 
     return req.job("hub.refresh", job)
@@ -157,24 +209,28 @@ def figures(app, cid, cdir: Path) -> dict:
     waiting = 0
     to_grade = 0
     open_work = []
+    # Graded once and handed in again: kept apart, so a regrade done as a
+    # favour never outranks work nobody has graded yet.
+    regrade_work = []
+    to_regrade = 0
+    status = gradestatus.load(app.store.root, cid)
     for r in rows:
         if not isinstance(r, dict):
             continue
-        n = int(r.get("needs_grading") or 0)
-        if not n:
+        state = gradestatus.state_for(cdir, r, status, app.store.read)
+        if state["graded"]:
             continue
-        aid = str(r.get("id") or "")
-        extracted = app.store.read(cdir / aid / "extracted.json", {}) or {}
-        draft = app.store.read(cdir / aid / "draft.json", {}) or {}
-        if not isinstance(extracted, dict):
-            extracted = {}
-        if not isinstance(draft, dict):
-            draft = {}
-        if gradesync.assignment_is_graded(
-                n, extracted, r.get("has_submissions"),
-                draft.get("students"), draft.get("rubric"),
-                draft.get("points_possible"),
-                graded_submissions_exist=r.get("graded_submissions_exist")):
+        if state["resubmitted"]:
+            to_regrade += state["resubmitted"]
+            regrade_work.append({
+                "id": r.get("id"),
+                "name": r.get("name") or "",
+                "resubmitted": state["resubmitted"],
+                "resubmitted_since": state.get("resubmitted_since") or "",
+                "due_at": r.get("due_at") or "",
+            })
+        n = state["fresh"]
+        if not n:
             continue
         to_grade += 1
         waiting += n
@@ -187,7 +243,7 @@ def figures(app, cid, cdir: Path) -> dict:
     graded = 0
     last: str | None = None
     try:
-        children = [p for p in cdir.iterdir() if p.is_dir() and p.name.isdigit()]
+        children = folders.children(cdir)
     except OSError:
         children = []
     for child in children:
@@ -213,6 +269,10 @@ def figures(app, cid, cdir: Path) -> dict:
         "writes_today": writes,
         "last_graded_at": last,
         "open_work": open_work,
+        "regrade_work": regrade_work,
+        "to_regrade": to_regrade,
+        "status_checked_at": status.get("checked_at"),
+        "status_stale": gradestatus.is_stale(status),
     }
 
 
@@ -223,7 +283,7 @@ def local_state(app, course_id) -> dict:
     the home list and the open course cannot disagree. A course that has never
     been opened here is left alone: reading it would create the folder.
     """
-    cdir = Path(app.store.root) / str(course_id)
+    cdir = folders.under(Path(app.store.root), course_id)
     if not cdir.is_dir():
         return {"known": False, "waiting": 0, "assignments": 0, "to_grade": 0, "graded": 0,
                 "writes_today": 0, "touched_at": None, "last_assignment": None}
@@ -234,13 +294,13 @@ def local_state(app, course_id) -> dict:
 
     newest_draft, newest_aid = 0.0, None
     try:
-        children = [p for p in cdir.iterdir() if p.is_dir() and p.name.isdigit()]
+        children = folders.children(cdir)
     except OSError:
         children = []
     for child in children:
         when = _mtime(child / "draft.json")
         if when > newest_draft:
-            newest_draft, newest_aid = when, child.name
+            newest_draft, newest_aid = when, folders.id_of(child)
 
     touched = max(newest_draft, _mtime(cdir / "assignments.json"),
                   _mtime(cdir / ledger.FILE))
@@ -258,7 +318,192 @@ def local_state(app, course_id) -> dict:
         "last_assignment": ({"id": newest_aid, "name": names.get(newest_aid or "", "")}
                             if newest_aid else None),
         "open_work": fig["open_work"],
+        "regrade_work": fig["regrade_work"],
+        "to_regrade": fig["to_regrade"],
+        "status_checked_at": fig["status_checked_at"],
     }
+
+
+def picker_payload(app, refresh_courses: bool = False) -> dict:
+    """The home page, from disk. `refresh_courses` re-reads the course list
+    only. Assignment lists, which To Do is built from, stay as saved until
+    `refresh_todo`.
+    """
+    courses = [dict(c) for c in app.courses(refresh_courses)]
+    for course in courses:
+        course.update(local_state(app, course.get("id")))
+    return {
+        "courses": courses,
+        "terms": app.term_summary(False),
+        "resume": _resume(courses),
+        # Past-due work still to grade, most days first. The page keeps
+        # five for the term on screen.
+        "behind": take_behind(courses, limit=None),
+        # Graded once and handed in again, oldest resubmission first. The
+        # To Do toggle shows these; they never join the list above.
+        "regrade": take_regrade(courses),
+    }
+
+
+def todo_courses(courses: list[dict], term: str = "") -> list[dict]:
+    """Courses whose assignment lists a To Do refresh should re-read.
+
+    Excluded courses are left alone. A term label limits the read to the
+    term on screen. A blank term, or "__all", reads every course.
+    """
+    label = (term or "").strip()
+    out = []
+    for course in courses:
+        if not isinstance(course, dict) or not course.get("id") or course.get("excluded"):
+            continue
+        if label and label != "__all" and (course.get("term_label") or "") != label:
+            continue
+        out.append(course)
+    return out
+
+
+def merge_assignment_rows(raw, previous: dict) -> list[dict]:
+    """The assignment-list cache, from a Canvas list plus the stamps already
+    saved here. Does not open an assignment folder: a home refresh must not
+    create one directory per assignment in a course nobody has graded yet.
+    """
+    rows = []
+    for item in raw or []:
+        if not isinstance(item, dict) or not item.get("id"):
+            continue
+        prev = previous.get(str(item.get("id")), {})
+        if not isinstance(prev, dict):
+            prev = {}
+        row = {
+            "id": item["id"],
+            "name": item.get("name") or "",
+            "points_possible": item.get("points_possible"),
+            "due_at": item.get("due_at"),
+            "published": item.get("published"),
+            "submission_types": item.get("submission_types") or [],
+            "has_rubric": bool(item.get("rubric")),
+            "is_discussion": bool(item.get("discussion_topic")),
+            "needs_grading": item.get("needs_grading_count"),
+            "has_submissions": bool(item.get("has_submitted_submissions")),
+            "graded_submissions_exist": bool(item.get("graded_submissions_exist")),
+            "synced_at": prev.get("synced_at"),
+            "graded_at": prev.get("graded_at"),
+            "has_instructions": bool(prev.get("has_instructions")),
+        }
+        if prev.get("_dir"):
+            row["_dir"] = prev["_dir"]
+        rows.append(row)
+    return rows
+
+
+def cache_assignment_list(app, course_id, raw) -> list[dict]:
+    """Store one course's assignment list. The course folder is created when
+    the list is saved, and not before, so a Canvas failure leaves no folder.
+    """
+    path = app.store.course_dir(course_id) / "assignments.json"
+    old = app.store.read(path, []) or []
+    previous = {}
+    if isinstance(old, list):
+        previous = {str(row.get("id")): row for row in old
+                    if isinstance(row, dict) and row.get("id")}
+    rows = merge_assignment_rows(raw, previous)
+    app.store.save_assignments(course_id, rows)
+    return rows
+
+
+def _canvas_line(exc: Exception) -> str:
+    line = str(exc).splitlines()[0].strip()[:300]
+    return line or "Canvas did not answer."
+
+
+def refresh_todo(app, term: str = "", log=None) -> dict:
+    """Re-read courses, then each assignment list To Do is drawn from.
+
+    One course that fails is named and skipped. The others still update.
+    If the course list itself cannot be read, nothing is written and the
+    page keeps what it was showing.
+    """
+    log = log or (lambda *_a, **_k: None)
+    try:
+        courses = [dict(c) for c in app.courses(True)]
+    except Exception as exc:  # noqa: BLE001
+        return {"error": _canvas_line(exc)}
+    targets = todo_courses(courses, term)
+    failed = []
+    total = max(len(targets), 1)
+    log("Reading assignment lists from Canvas (reads only)", 0, total)
+    for i, course in enumerate(targets, 1):
+        name = course.get("title") or course.get("name") or str(course.get("id"))
+        log("Reading assignments in %s" % name, i, total)
+        try:
+            raw = app.client.assignments(course["id"])
+            rows = cache_assignment_list(app, course["id"], raw)
+            gradestatus.check(app.client, app.store, course["id"], rows, force=True)
+        except Exception as exc:  # noqa: BLE001
+            failed.append({
+                "course_id": course.get("id"),
+                "name": name,
+                "error": _canvas_line(exc),
+            })
+    out = picker_payload(app, False)
+    out["failed"] = failed
+    if failed:
+        log("%d course list(s) could not be read" % len(failed), total, total)
+        out["sentence_done"] = ("To Do refreshed. %d course list(s) could not be read."
+                                % len(failed))
+    else:
+        log("To Do updated", total, total)
+        out["sentence_done"] = "To Do refreshed from Canvas."
+    return out
+
+
+def check_course(app, course_id, rows=None, force: bool = False, log=None) -> dict:
+    """Bring one course's grading status up to date. Reads only.
+
+    Without `rows` the assignment list is re-read first (one call), so the
+    counts the check is made against are Canvas's current ones. A course
+    checked within gradestatus.FRESH_S is left alone unless `force`.
+    """
+    log = log or (lambda *_a, **_k: None)
+    status = gradestatus.load(app.store.root, course_id)
+    if not force and rows is None and not gradestatus.is_stale(status):
+        return {"checked": 0, "checked_at": status.get("checked_at"), "skipped": True}
+    if rows is None:
+        log("Reading the assignment list from Canvas (reads only)")
+        rows = cache_assignment_list(app, course_id, app.client.assignments(course_id))
+    return gradestatus.check(app.client, app.store, course_id, rows, force=force, log=log)
+
+
+def check_todo(app, term: str = "", log=None) -> dict:
+    """The light To Do check: every stale course on screen, then the picker.
+
+    Uses the saved course list; the Refresh button is what re-reads it. Only
+    courses with an assignment list on this disk are checked: one never
+    opened here has nothing on To Do to correct. One course that fails is
+    named and skipped, as in refresh_todo.
+    """
+    log = log or (lambda *_a, **_k: None)
+    root = Path(app.store.root)
+    targets = [c for c in todo_courses([dict(c) for c in app.courses(False)], term)
+               if (folders.under(root, safe_id(c["id"])) / "assignments.json").is_file()
+               and gradestatus.is_stale(gradestatus.load(root, c["id"]))]
+    failed = []
+    checked = 0
+    total = max(len(targets), 1)
+    for i, course in enumerate(targets, 1):
+        name = course.get("title") or course.get("name") or str(course.get("id"))
+        log("Checking grading status in %s" % name, i - 1, total)
+        try:
+            checked += check_course(app, course["id"], force=False).get("checked", 0)
+        except Exception as exc:  # noqa: BLE001
+            failed.append({"course_id": course.get("id"), "name": name,
+                           "error": _canvas_line(exc)})
+    out = picker_payload(app, False)
+    out["checked"] = checked
+    out["courses_checked"] = len(targets) - len(failed)
+    out["failed"] = failed
+    log("Grading status checked", total, total)
+    return out
 
 
 def days_behind(due_at, today: date | None = None) -> int | None:
@@ -281,6 +526,44 @@ def days_behind(due_at, today: date | None = None) -> int | None:
     due_day = when.astimezone().date()
     today = today or datetime.now().astimezone().date()
     return (today - due_day).days
+
+
+def take_regrade(courses: list[dict], today: date | None = None) -> list[dict]:
+    """Assignments with resubmissions to regrade, the longest-waiting first.
+
+    `days_waiting` counts from the oldest resubmission, not the due date: the
+    work was late on purpose. The course rows lose `regrade_work` here. No
+    student is named.
+    """
+    rows = []
+    for course in courses:
+        work = course.pop("regrade_work", None) or []
+        if course.get("excluded"):
+            continue
+        for item in work:
+            if not isinstance(item, dict):
+                continue
+            try:
+                n = int(item.get("resubmitted") or 0)
+            except (TypeError, ValueError):
+                continue
+            if n <= 0:
+                continue
+            since = str(item.get("resubmitted_since") or "")
+            rows.append({
+                "course_id": course.get("id"),
+                "course_title": course.get("title") or course.get("name") or "",
+                "course_code": course.get("code") or "",
+                "assignment_id": item.get("id"),
+                "name": item.get("name") or "",
+                "resubmitted": n,
+                "resubmitted_since": since,
+                "due_at": str(item.get("due_at") or ""),
+                "days_waiting": max(days_behind(since, today) or 0, 0),
+            })
+    rows.sort(key=lambda r: (-r["days_waiting"], r["resubmitted_since"],
+                             str(r.get("name") or "").lower()))
+    return rows
 
 
 def take_behind(courses: list[dict], limit: int | None = 5,
@@ -459,7 +742,8 @@ def _grade_status(app, cid, cdir: Path) -> dict:
         age = time.time() - cache.stat().st_mtime if cache.is_file() else None
     except OSError:
         age = None
-    stale = age is None or age > STALE_AFTER_S
+    stale = (age is None or age > STALE_AFTER_S
+             or (bool(assignments) and fig["status_stale"]))
 
     recent = sorted(assignments, key=lambda a: str(a.get("graded_at") or a.get("synced_at") or ""), reverse=True)
     return {

@@ -50,7 +50,7 @@
     if (typeof ensureCourse === 'function') await ensureCourse(courseId);
     crumbs([
       { label: 'Courses', href: '#/' },
-      { label: (S.course && S.course.name) || 'Course', href: '#/c/' + courseId },
+      { label: courseTitle(S.course), href: '#/c/' + courseId },
       { label: 'Build' },
     ]);
     $('#headerActions').innerHTML = '';

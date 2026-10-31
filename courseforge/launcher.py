@@ -183,6 +183,7 @@ class Launcher:
         # The same background pieces `serve` starts, so the window and the
         # terminal run the same app.
         _app.start_handoff_worker()
+        _app.start_browse_refresh()
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
         self._set_state(OK, "Running")

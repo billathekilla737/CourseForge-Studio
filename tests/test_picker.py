@@ -204,5 +204,135 @@ class Resume(unittest.TestCase):
             [self.row(1, worked="2026-09-12T22:15:01+00:00", excluded=True)]))
 
 
+class TodoRefresh(unittest.TestCase):
+    """To Do is the saved assignment lists. Refresh re-reads those lists
+    from Canvas for the term on screen, and does not open a folder per
+    assignment to do it."""
+
+    def setUp(self):
+        from courseforge.store import Store
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.store = Store(self.tmp)
+        self.calls = []
+        self.fail = set()
+        self.lists = {}
+        self.course_flags = []
+
+        class Client:
+            def assignments(_self, course_id):
+                self.calls.append(course_id)
+                if course_id in self.fail:
+                    raise RuntimeError("Canvas did not answer")
+                return self.lists[course_id]
+
+            def grading_states(_self, course_id, assignment_ids):
+                self.status_calls.append((course_id, list(assignment_ids)))
+                return []
+
+        self.status_calls = []
+
+        class App:
+            store = self.store
+            client = Client()
+
+            def courses(_self, refresh=False):
+                self.course_flags.append(refresh)
+                return self.rows
+
+            def term_summary(_self, refresh=False):
+                return {"terms": [], "default": "Fall 2026"}
+
+        self.app = App()
+        self.rows = [
+            {"id": 101, "title": "Game Theory", "name": "Game Theory",
+             "code": "GAM 101", "term_label": "Fall 2026"},
+            {"id": 202, "title": "Spring Studio", "name": "Spring Studio",
+             "code": "ART 202", "term_label": "Spring 2027"},
+            {"id": 303, "title": "Hidden", "name": "Hidden", "code": "HID",
+             "term_label": "Fall 2026", "excluded": True},
+        ]
+        past = "2020-01-02T18:00:00Z"
+        self.lists[101] = [
+            {"id": 7, "name": "Pitch", "needs_grading_count": 4, "due_at": past,
+             "published": True, "points_possible": 10},
+            {"id": 8, "name": "Later", "needs_grading_count": 2,
+             "due_at": "2099-01-02T18:00:00Z"},
+        ]
+        self.lists[202] = [
+            {"id": 9, "name": "Spring work", "needs_grading_count": 3, "due_at": past},
+        ]
+
+    def test_a_plain_load_does_not_ask_canvas_for_assignments(self):
+        (self.tmp / "101").mkdir()
+        (self.tmp / "101" / "assignments.json").write_text(json.dumps([
+            {"id": 7, "name": "Pitch", "needs_grading": 4,
+             "due_at": "2020-01-02T18:00:00Z"},
+        ]), encoding="utf-8")
+        out = hub.picker_payload(self.app, False)
+        self.assertEqual(self.calls, [])
+        self.assertEqual(self.course_flags, [False])
+        self.assertEqual([row["name"] for row in out["behind"]], ["Pitch"])
+
+    def test_refresh_reads_this_term_and_keeps_stamps_without_new_folders(self):
+        saved = self.tmp / "101" / "assignments.json"
+        saved.parent.mkdir()
+        saved.write_text(json.dumps([{
+            "id": 7, "name": "Old name", "needs_grading": 1,
+            "due_at": "2020-01-02T18:00:00Z",
+            "synced_at": "2026-01-01T00:00:00",
+            "graded_at": "2026-01-02T00:00:00",
+            "has_instructions": True,
+            "_dir": "keep-me",
+        }]), encoding="utf-8")
+        notes = []
+        out = hub.refresh_todo(self.app, "Fall 2026",
+                               lambda msg, done, total: notes.append(msg))
+        self.assertEqual(self.calls, [101])
+        self.assertEqual(self.course_flags[0], True)
+        self.assertEqual([row["name"] for row in out["behind"]], ["Pitch"])
+        self.assertEqual(out["failed"], [])
+        self.assertIn("To Do updated", notes)
+        # The list and the light grading-status check beside it; still no
+        # folder per assignment.
+        kids = sorted(p.name for p in (self.tmp / "101").iterdir())
+        self.assertEqual(kids, ["assignments.json", "grade_status.json"])
+        self.assertEqual(self.status_calls, [(101, [7, 8])])
+        self.assertFalse((self.tmp / "202").exists())
+        self.assertFalse((self.tmp / "303").exists())
+        stored = json.loads(saved.read_text(encoding="utf-8"))
+        pitch = next(row for row in stored if row["id"] == 7)
+        self.assertEqual(pitch["needs_grading"], 4)
+        self.assertEqual(pitch["synced_at"], "2026-01-01T00:00:00")
+        self.assertEqual(pitch["graded_at"], "2026-01-02T00:00:00")
+        self.assertTrue(pitch["has_instructions"])
+        self.assertEqual(pitch["_dir"], "keep-me")
+
+    def test_one_course_failing_leaves_the_others(self):
+        self.fail.add(101)
+        self.rows[1]["term_label"] = "Fall 2026"
+        out = hub.refresh_todo(self.app, "Fall 2026", lambda *_a: None)
+        self.assertEqual([row["name"] for row in out["behind"]], ["Spring work"])
+        self.assertEqual(out["failed"][0]["name"], "Game Theory")
+        self.assertFalse((self.tmp / "101").exists())
+        self.assertTrue((self.tmp / "202" / "assignments.json").is_file())
+
+    def test_a_course_list_failure_writes_nothing(self):
+        def boom(_refresh=False):
+            raise RuntimeError("Could not read your courses from Canvas.")
+
+        self.app.courses = boom
+        out = hub.refresh_todo(self.app, "Fall 2026", lambda *_a: None)
+        self.assertEqual(out["error"], "Could not read your courses from Canvas.")
+        self.assertEqual(self.calls, [])
+        self.assertEqual(list(self.tmp.iterdir()), [])
+
+    def test_the_refresh_route_is_a_post_job(self):
+        from courseforge.routing import ROUTER
+        hit = [r for r in ROUTER.routes if r.pattern == "/api/picker/refresh"]
+        self.assertEqual(len(hit), 1)
+        self.assertEqual(hit[0].method, "POST")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

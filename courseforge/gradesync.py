@@ -44,7 +44,9 @@ def _same(a, b) -> bool:
 def canvas_grade_fields(sub: dict, me_id: str | int | None) -> dict:
     """The gradebook-side facts about one submission row, as stored on the
     extracted entry. `posted_at` is Canvas's own word for "visible to the
-    student"; null with a score present means the grade is there but hidden."""
+    student"; null with a score present means the grade is there but hidden.
+    `grade_matches_current_submission` turns false when the student hands in
+    again after being graded: the score is for an older attempt."""
     rubric: dict[str, float] = {}
     for cid, cell in (sub.get("rubric_assessment") or {}).items():
         if isinstance(cell, dict) and cell.get("points") is not None:
@@ -62,6 +64,7 @@ def canvas_grade_fields(sub: dict, me_id: str | int | None) -> dict:
         "canvas_state": sub.get("workflow_state"),
         "canvas_graded_at": sub.get("graded_at"),
         "canvas_posted_at": sub.get("posted_at"),
+        "canvas_grade_matches": sub.get("grade_matches_current_submission"),
         "canvas_grader_id": sub.get("grader_id"),
         "canvas_rubric": rubric,
         "canvas_comment": comment,
@@ -285,8 +288,7 @@ def assignment_is_graded(needs_grading, extracted, has_submissions=False,
     needs-grading count stays up after a gradebook post, so it is not the
     only signal.
     """
-    people = [s for s in (extracted or {}).values() if isinstance(s, dict)]
-    submitted = [s for s in people if str(s.get("status") or "") not in ("", "unsubmitted")]
+    submitted = turned_in(extracted)
     if not submitted:
         try:
             if int(needs_grading or 0) > 0:
@@ -298,18 +300,76 @@ def assignment_is_graded(needs_grading, extracted, has_submissions=False,
         # has_submitted_submissions false, so a list refresh never looked graded
         # until the assignment was opened and resynced.
         return bool(has_submissions or graded_submissions_exist)
+    return waiting_count(extracted, students, rubric, possible) == 0
+
+
+def turned_in(extracted) -> list[dict]:
+    people = [s for s in (extracted or {}).values() if isinstance(s, dict)]
+    return [s for s in people if str(s.get("status") or "") not in ("", "unsubmitted")]
+
+
+def student_still_open(info: dict, entry: dict | None = None,
+                       rubric: list | None = None, possible=None) -> bool:
+    """True when this one turned-in submission still needs a grade.
+
+    A score that is there but not yet posted is not open: it is graded and
+    waiting on the post. A quiz with its written answers unmarked, or a
+    submission with no score at all, is. So is a resubmission (see
+    is_resubmission): Canvas counts the new attempt as waiting until it is
+    graded.
+    """
+    if is_resubmission(info):
+        return True
+    recorded = (quizgrade.written_scores_recorded(entry, info)
+                and info.get("canvas_score") is not None
+                and not quizgrade.hold_for_review(entry, info))
+    if whole_grade_posted(info, entry, rubric, possible) or recorded:
+        return False
+    return _quiz_still_open(info) or info.get("canvas_score") is None
+
+
+def is_resubmission(info: dict) -> bool:
+    """True when the score Canvas holds was given to an earlier attempt.
+
+    The student handed in again after being graded, often over a placeholder
+    zero. Canvas says so with grade_matches_current_submission. A row read
+    before that field was kept here falls back on the dates: back in the
+    "submitted" state with a submit time after the grade.
+    """
+    if not isinstance(info, dict) or info.get("canvas_score") is None:
+        return False
+    match = info.get("canvas_grade_matches")
+    if match is not None:
+        return match is False
+    graded, sent = info.get("canvas_graded_at"), info.get("submitted_at")
+    return (info.get("canvas_state") == "submitted"
+            and bool(graded and sent) and str(sent) > str(graded))
+
+
+def waiting_count(extracted, students=None, rubric=None, possible=None) -> int:
+    """How many turned-in submissions still need a grade, by the rule above."""
+    return len(open_submissions(extracted, students, rubric, possible))
+
+
+def open_submissions(extracted, students=None, rubric=None, possible=None) -> list[dict]:
+    """The turned-in submissions that still need a grade, resubmissions included."""
     entries = students or {}
-    for info in submitted:
-        uid = str(info.get("user_id") or "")
-        entry = entries.get(uid)
-        recorded = (quizgrade.written_scores_recorded(entry, info)
-                    and info.get("canvas_score") is not None
-                    and not quizgrade.hold_for_review(entry, info))
-        if whole_grade_posted(info, entry, rubric, possible) or recorded:
-            continue
-        if _quiz_still_open(info) or info.get("canvas_score") is None:
-            return False
-    return True
+    return [info for info in turned_in(extracted)
+            if student_still_open(info, entries.get(str(info.get("user_id") or "")),
+                                  rubric, possible)]
+
+
+def work_status(sub: dict, assignment: dict | None = None) -> str | None:
+    """The `status` an extracted entry carries for one Canvas submission row.
+
+    Canvas reports workflow_state "graded" for a student who never turned
+    anything in but already has a posted zero, so whether work exists is read
+    from attempt and submitted_at (and, for a quiz, quizgrade.was_submitted).
+    """
+    really = bool(sub.get("submitted_at")) or bool(sub.get("attempt"))
+    if not really and quizgrade.was_submitted(sub, assignment):
+        really = True
+    return sub.get("workflow_state") if really else "unsubmitted"
 
 
 def pull_grades(cfg: Config, client: CanvasClient, store: Store,

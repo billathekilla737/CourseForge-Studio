@@ -94,9 +94,8 @@ class _Ctx:
         return self._client
 
     def course_dir(self, course_id) -> Path:
-        path = self.data_root / str(course_id)
-        path.mkdir(parents=True, exist_ok=True)
-        return path
+        from ..store import Store
+        return Store(Path(self.data_root)).course_dir(course_id)
 
 
 def _print_plan_rows(rows, skipped=None):

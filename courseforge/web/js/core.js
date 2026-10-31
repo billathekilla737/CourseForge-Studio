@@ -586,6 +586,21 @@ function courseTitle(c) {
   return c.title || c.name || ('Course ' + (c.id == null ? '' : c.id));
 }
 
+/* Courses / the class / the task. The middle piece is the course you are
+   actually in, resolved before the crumb is drawn, so a tab opened straight
+   on a task does not sit on the word "Course". */
+async function courseCrumbs(courseId, tail, href) {
+  try { await ensureCourse(courseId); } catch (_) { /* the id still labels it */ }
+  const here = S.route && S.route.courseId;
+  if (here && String(here) !== String(courseId)) return;
+  const course = S.course && String(S.course.id) === String(courseId) ? S.course : null;
+  crumbs([
+    { label: 'Courses', href: '#/' },
+    { label: courseTitle(course), href: href || ('#/c/' + courseId) },
+    ...(tail || []),
+  ]);
+}
+
 const LAST_ASSIGNMENT_KEY = 'cf.lastAssignment.';
 function rememberAssignment(courseId, assignmentId) {
   try { localStorage.setItem(LAST_ASSIGNMENT_KEY + courseId, String(assignmentId)); }

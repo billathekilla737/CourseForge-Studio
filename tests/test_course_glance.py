@@ -63,6 +63,8 @@ class TheHomeListDrawsTheCards(unittest.TestCase):
         hub = (Path(__file__).resolve().parents[1] / "courseforge" / "web" / "js"
                / "hub.js").read_text(encoding="utf-8")
         self.assertIn('id="behindH">To Do', hub)
+        self.assertIn('id="behindRefresh"', hub)
+        self.assertIn('refreshHomeFromCanvas()', hub)
         self.assertNotIn("Five assignments, by how many days", hub)
         self.assertIn("days behind", hub)
         self.assertIn('class="nm">${esc(assignment)}', hub)
@@ -73,6 +75,12 @@ class TheHomeListDrawsTheCards(unittest.TestCase):
         css_home = (Path(__file__).resolve().parents[1] / "courseforge" / "web"
                     / "style.css").read_text(encoding="utf-8")
         self.assertIn(".behindGrade", css_home)
+        self.assertIn(".behindHead", css_home)
+        self.assertIn("function refreshHomeFromCanvas", src)
+        self.assertIn("onclick = () => refreshHomeFromCanvas()", src)
+        self.assertIn("/picker/refresh", src)
+        self.assertIn("err.status === 404", src)
+        self.assertIn("/hub/refresh", src)
         self.assertIn(".acrossCol", css_home)
         self.assertIn("Every dated assignment in the term", hub)
         self.assertIn('title="${esc(note)}"', hub)

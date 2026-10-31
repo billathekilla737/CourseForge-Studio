@@ -62,9 +62,7 @@ class _CliApp:
         return self._client
 
     def course_dir(self, course_id) -> Path:
-        path = self.store.root / str(course_id)
-        path.mkdir(parents=True, exist_ok=True)
-        return path
+        return self.store.course_dir(course_id)
 
 
 def run(args, cfg) -> int:

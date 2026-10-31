@@ -59,10 +59,12 @@ class TheDownloadIsWholeOrAbsent(unittest.TestCase):
         dest = self.tmp / "9_essay.docx"
         seen = {}
 
-        def fetch(url, timeout):
+        def fetch(url, timeout, limit=None, sink=None):
             # while the bytes are being fetched, nothing is at the destination
             seen["existed_during_fetch"] = dest.exists()
-            return b"PK" + b"x" * 5000
+            body = b"PK" + b"x" * 5000
+            Path(sink).write_bytes(body)        # streamed to the .part file
+            return len(body)
 
         with mock.patch.object(self.client, "_fetch_bytes", fetch):
             out = self.client.download("https://school.example.edu/files/1/download", dest)
@@ -74,7 +76,7 @@ class TheDownloadIsWholeOrAbsent(unittest.TestCase):
 
     def test_an_empty_body_is_refused_and_leaves_nothing_behind(self):
         dest = self.tmp / "9_essay.docx"
-        with mock.patch.object(self.client, "_fetch_bytes", lambda url, timeout: b""):
+        with mock.patch.object(self.client, "_fetch_bytes", lambda url, timeout, limit=None, sink=None: 0):
             with self.assertRaises(RuntimeError):
                 self.client.download("https://school.example.edu/files/1/download", dest)
         self.assertEqual(list(self.tmp.iterdir()), [])
@@ -125,7 +127,7 @@ class OneSyncPerAssignmentAtATime(unittest.TestCase):
         inside = {"now": 0, "peak": 0}
         gate = threading.Lock()
 
-        def slow_sync(cfg, client, store, cid, aid, progress, me_id):
+        def slow_sync(cfg, client, store, cid, aid, progress, me_id, large=None):
             with gate:
                 inside["now"] += 1
                 inside["peak"] = max(inside["peak"], inside["now"])

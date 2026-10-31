@@ -373,6 +373,7 @@ class NameMap:
     def roster(self) -> list[dict]:
         """Tag, name and the parts worth matching on, for the @ picker."""
         return [{"tag": tag,
+                 "user_id": row.get("user_id") or "",
                  "name": row.get("name") or tag,
                  "sortable": row.get("sortable_name") or ""}
                 for tag, row in sorted(self.by_tag.items(),

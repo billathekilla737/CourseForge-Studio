@@ -4,7 +4,10 @@ from __future__ import annotations
 import unittest
 
 from courseforge import canvas_policy
-from courseforge.extract import rce_file_refs
+import tempfile
+from pathlib import Path
+
+from courseforge.extract import extract_file, rce_file_refs
 
 BASE = "https://mgccc.instructure.com"
 
@@ -55,6 +58,43 @@ class RceFileRefsStayOnCanvas(unittest.TestCase):
         self.assertEqual(len(refs), 1)
         self.assertEqual(refs[0]["tag"], "img")
         self.assertEqual(refs[0]["name"], "shot.png")
+
+    def test_an_empty_link_uses_the_title_filename(self):
+        """Canvas file links often have no visible text. The filename is
+        the title attribute, and without it the file is saved with no
+        extension and the extractor reports that it cannot read it."""
+        html = ('<a class="instructure_file_link" title="ColorTrigger.cs" '
+                'href="https://mgccc.instructure.com/users/7/files/111136056'
+                '?verifier=tok"></a>')
+        refs = rce_file_refs(html, BASE)
+        self.assertEqual(refs[0]["name"], "ColorTrigger.cs")
+        self.assertEqual(refs[0]["file_id"], "111136056")
+
+    def test_visible_filename_wins_over_the_title(self):
+        html = ('<a title="other.txt" href="https://mgccc.instructure.com/'
+                'files/3?verifier=tok">LampScript.cs</a>')
+        refs = rce_file_refs(html, BASE)
+        self.assertEqual(refs[0]["name"], "LampScript.cs")
+
+
+class ExtensionlessText(unittest.TestCase):
+    def test_a_text_file_with_no_extension_is_read(self):
+        folder = Path(tempfile.mkdtemp())
+        path = folder / "file_111136056"
+        path.write_text("public class Trigger { }\n", encoding="utf-8")
+        got = extract_file(path, "ColorTrigger.cs")
+        self.assertEqual(got.kind, "text")
+        self.assertIn("public class Trigger", got.text)
+        self.assertIn("```cs", got.text)
+        self.assertNotIn("no text extractor", got.note)
+
+    def test_a_binary_file_with_no_extension_stays_unreadable(self):
+        folder = Path(tempfile.mkdtemp())
+        path = folder / "file_9"
+        path.write_bytes(b"\x00\x01\x02\xff" * 40)
+        got = extract_file(path)
+        self.assertEqual(got.kind, "binary")
+        self.assertIn("no text extractor", got.note)
 
 
 class FileUrlAllowList(unittest.TestCase):

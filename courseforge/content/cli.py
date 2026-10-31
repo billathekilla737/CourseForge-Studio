@@ -94,7 +94,12 @@ def _client(cfg):
 
 
 def _build(cfg, course_id) -> BuildDir:
-    return BuildDir(Path(cfg.data) / str(course_id), course_id)
+    return BuildDir(_course_dir(cfg, course_id), course_id)
+
+
+def _course_dir(cfg, course_id) -> Path:
+    from ..store import Store
+    return Store(Path(cfg.data)).course_dir(course_id)
 
 
 def _manifest(args, build: BuildDir) -> tuple[dict, Path]:
@@ -210,7 +215,7 @@ def run(args, cfg) -> int:
         record["placed"] = result
         build.save_draft(record)
         from .. import ledger
-        ledger.record(Path(cfg.data) / str(course_id), "build",
+        ledger.record(_course_dir(cfg, course_id), "build",
                       sentence.replace("Create the", "Created the", 1).replace("Replace the", "Replaced the", 1),
                       url=result.get("html_url"), count=1, kind="place")
         print(f"Done: {result.get('html_url') or result.get('id')}")
@@ -268,7 +273,7 @@ def run(args, cfg) -> int:
                                         backup_dir=build.backups_dir)
         statemod.save(build, st)
         from .. import ledger
-        ledger.record(Path(cfg.data) / str(course_id), "build",
+        ledger.record(_course_dir(cfg, course_id), "build",
                       f"Pushed the {'pages' if verb == 'push-pages' else 'project'} manifest "
                       f"({result.get('count')} item(s), {'published' if publish else 'unpublished'}) in {name}.",
                       url=f"{cfg.base_url}/courses/{course_id}/modules", count=result.get("count"), kind="push")
@@ -305,7 +310,7 @@ def run(args, cfg) -> int:
             return 3
         result = rubricsmod.apply(client, course_id, entries, log=lambda m, *a: print("  " + m))
         from .. import ledger
-        ledger.record(Path(cfg.data) / str(course_id), "build",
+        ledger.record(_course_dir(cfg, course_id), "build",
                       f"Pushed {result['count']} rubric definition(s) in {_course_name(client, course_id)}.",
                       url=f"{cfg.base_url}/courses/{course_id}/rubrics", count=result["count"], kind="rubrics")
         for m in result.get("mismatches") or []:

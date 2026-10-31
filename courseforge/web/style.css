@@ -358,6 +358,17 @@ pre.hljs code{font:inherit;white-space:pre}
 .videoWrap{border:1px solid var(--line);border-radius:var(--radius);overflow:hidden;
   margin-bottom:12px;background:#14171b}
 .workVideo{display:block;width:100%;max-height:62vh;background:#000}
+.vidTranscript{margin-top:8px;border:1px solid var(--line);border-radius:var(--radius);
+  padding:6px 10px}
+.vidTranscript summary{cursor:pointer;font-weight:600}
+.vidTranscript summary .wc{font:11px var(--mono);font-weight:400;color:var(--muted)}
+.tsLines{max-height:40vh;overflow:auto;margin-top:6px;font-size:13px;line-height:1.5}
+.tsLine{padding:2px 0}
+.tsJump{font:11.5px var(--mono);color:var(--accent);background:none;border:0;
+  padding:0 4px 0 0;cursor:pointer}
+.tsJump:hover,.tsJump:focus-visible{text-decoration:underline}
+.studioSlot{display:flex;align-items:center;justify-content:center;
+  min-height:96px;background:rgba(127,127,127,.08)}
 .videoBar{display:flex;align-items:center;gap:6px;flex-wrap:wrap;padding:8px 10px;
   background:var(--bg);border-top:1px solid var(--line)}
 .videoSpeed{display:flex;gap:4px}
@@ -485,6 +496,57 @@ html.busy .btn, html.busy button{cursor:progress}
 .rrow .okTick{color:var(--accent);font-weight:700;font-size:11px}
 .rrow .cmtMark{margin-left:5px;padding:0 5px;border-radius:4px;font:700 9px/1.6 var(--sans);
   letter-spacing:.04em;text-transform:uppercase;color:var(--ai);background:var(--ai-soft)}
+.rrow .noteMark{margin-left:5px;padding:0 5px;border-radius:4px;font:700 9px/1.6 var(--sans);
+  letter-spacing:.04em;text-transform:uppercase;color:var(--warn);background:var(--warn-soft)}
+.rrow .noteMark.bad{color:var(--danger);background:var(--danger-soft);font-size:11px}
+.rrow .ovMark{margin-left:5px;padding:0 5px;border-radius:4px;font:700 10px/1.6 var(--sans);
+  border:1px solid currentColor}
+.ovMark.green,.tag.ovTag.green{color:var(--accent);background:var(--accent-soft);border-color:var(--accent)}
+.ovMark.yellow,.tag.ovTag.yellow{color:var(--warn);background:var(--warn-soft);border-color:var(--warn)}
+.ovMark.red,.tag.ovTag.red{color:var(--danger);background:var(--danger-soft);border-color:var(--danger)}
+.tag.ovTag{font-weight:600;cursor:pointer;font-family:var(--sans)}
+.tag.ovTag:hover{text-decoration:underline}
+.btn.ovBtn.green{border-color:var(--accent);color:var(--accent)}
+.btn.ovBtn.yellow{border-color:var(--warn);color:var(--warn)}
+.btn.ovBtn.red{border-color:var(--danger);color:var(--danger)}
+.modal.cmpModal{width:min(1320px,100%);max-height:94vh;display:flex;flex-direction:column}
+.cmpKey{display:block;margin-top:6px}
+.cmpCols{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:14px;min-height:0}
+@media (max-width:820px){.cmpCols{grid-template-columns:minmax(0,1fr)}}
+.cmpCol{display:flex;flex-direction:column;min-width:0;min-height:0}
+.cmpCol h4{margin:0 0 6px;font-size:13.5px}
+.cmpText{overflow:auto;max-height:64vh;white-space:pre-wrap;overflow-wrap:anywhere;
+  padding:10px 12px;border:1px solid var(--line);border-radius:var(--radius);
+  background:var(--bg);color:var(--ink);font:13px/1.65 var(--sans)}
+.cmpText.code{font:12.5px/1.55 var(--mono);white-space:pre;overflow-wrap:normal}
+mark.ovHit{background:rgba(233,168,33,.38);color:inherit;border-radius:2px;
+  box-shadow:inset 0 -2px 0 var(--gold);cursor:pointer}
+mark.ovHit:focus-visible{outline:2px solid var(--gold);outline-offset:1px}
+mark.ovHit.flash{background:rgba(233,168,33,.75);outline:2px solid var(--gold)}
+mark.ovSim{background:rgba(90,160,220,.30);color:inherit;border-radius:2px;
+  box-shadow:inset 0 -2px 0 var(--edit);cursor:pointer}
+mark.ovSim:focus-visible{outline:2px solid var(--edit);outline-offset:1px}
+mark.ovSim.flash{background:rgba(90,160,220,.6);outline:2px solid var(--edit)}
+.ovDim{color:var(--muted);text-decoration:underline dotted var(--rule)}
+.overlapFlag ul{margin:6px 0 4px;padding-left:18px}
+.overlapFlag.done{background:var(--accent-soft);border-color:var(--accent);color:var(--accent)}
+.overlapFlag .ovQuote{margin-top:4px;padding:6px 10px;border-left:3px solid currentColor;
+  background:var(--panel);color:var(--ink);font-size:12px;font-style:italic}
+.watchNotes{padding:11px 14px;border-radius:var(--radius);border:1px solid var(--line);
+  background:var(--panel);font-size:12.5px;line-height:1.55;margin-bottom:14px}
+.watchNotes ul{list-style:none;margin:8px 0 0;padding:0}
+.watchNotes li{padding:8px 0;border-top:1px solid var(--line)}
+.watchNotes li.concern .noteText{color:var(--danger)}
+.watchNotes .noteHead{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.watchNotes .noteBtns{margin-left:auto;display:flex;gap:6px}
+.watchNotes .noteText{margin-top:4px;white-space:pre-wrap}
+.watchNotes .noteLink{margin-top:4px;font-weight:600}
+.callout.watchPair{background:var(--panel);border-color:var(--line);color:var(--ink)}
+.callout.watchPair ul{margin:6px 0 0;padding-left:18px}
+.callout.watchPair li{margin:3px 0}
+.callout.watchPair .btn{margin-left:6px}
+#noteAbout{max-width:100%}
+.watchNotes p{margin:6px 0 0}
 .bulkBar{border-top:1px solid var(--line);padding:8px 12px;background:var(--panel);
   flex:0 0 auto}
 /* A toolbar group: its label, its buttons and the rule that ends it, as one
@@ -680,7 +742,7 @@ html.busy .btn, html.busy button{cursor:progress}
 .cfFrom{color:var(--muted);text-decoration:line-through}
 .cfArrow{color:var(--muted)}
 .cfTo{font-weight:600;color:var(--edit)}
-.cfDetail{margin-top:10px;font:12px var(--mono);color:var(--muted)}
+.cfDetail{margin-top:10px;font:12px var(--mono);color:var(--muted);white-space:pre-wrap}
 .cfNote{margin-top:12px;font-size:12px;color:var(--muted);line-height:1.6}
 
 /* ------------------------------------------------- the test editor, drilled */
@@ -1648,7 +1710,9 @@ a.acrossItem,a.acrossItem:visited{color:var(--ink)}
 /* Directly under Across your courses, in that column, so a long course list
    does not push it to the bottom of the page. */
 .behindGrade{margin-top:12px}
-.behindGrade h2{margin:0 0 7px;font-size:18px}
+.behindHead{display:flex;align-items:center;justify-content:space-between;gap:8px;margin:0 0 7px}
+.behindGrade h2{margin:0;font-size:18px}
+.behindHead .btn{flex:none}
 .behindList{display:flex;flex-direction:column;gap:4px}
 .behindItem{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:12px;
   align-items:center;width:100%;text-align:left;font:inherit;color:var(--ink);

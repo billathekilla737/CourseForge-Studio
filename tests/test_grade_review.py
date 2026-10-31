@@ -398,8 +398,10 @@ class GradeJsKeepsToTheContract(unittest.TestCase):
         # Bulk bar and context menu share one action list, so a new verb cannot
         # land on shift-click and be missing from right-click (or the reverse).
         self.assertIn("selectionItems(st)", self.src)
-        self.assertIn("js/grade.js?v=home-2",
-                      (WEB / "index.html").read_text(encoding="utf-8"))
+        # A version tag, so a browser does not keep the old script. Which tag
+        # it is changes with every release, so only its presence is checked.
+        self.assertRegex((WEB / "index.html").read_text(encoding="utf-8"),
+                         r"js/grade\.js\?v=[\w.-]+")
         self.assertIn('step="1"', self.src)
         self.assertNotIn("data-tiers", self.src)
         self.assertIn('id="rosterSort"', (WEB / "index.html").read_text(encoding="utf-8"))
@@ -465,7 +467,7 @@ class GradeJsKeepsToTheContract(unittest.TestCase):
         page = (WEB / "index.html").read_text(encoding="utf-8")
         self.assertIn("js/docview.js?v=docx-1", page)
         self.assertIn("js/pdfview.js?v=pdf-1", page)
-        self.assertIn("style.css?v=home-3", page)
+        self.assertRegex(page, r'"style\.css\?v=[\w.-]+"')
         self.assertIn("function pdfCard(", self.src)
         self.assertIn("pdfCard(p, url, reused)", body)
         self.assertIn("PdfView.take", body)
@@ -564,7 +566,7 @@ class GradeJsKeepsToTheContract(unittest.TestCase):
         self.assertNotIn('placeholder="Jack"', student)
         self.assertIn('placeholder="nickname"', student)
         page = (WEB / "index.html").read_text(encoding="utf-8")
-        self.assertIn("js/student.js?v=students-11", page)
+        self.assertRegex(page, r"js/student\.js\?v=[\w.-]+")
 
     def test_the_announcement_dialog_tolerates_no_schedule(self):
         body = self.src[self.src.index("function openAnnounce("):]

@@ -91,12 +91,11 @@
     S.pdf.viaA11y = (location.hash || '').indexOf('/a11y/') >= 0;
 
     showView('area');
-    crumbs([
-      { label: 'Courses', href: '#/' },
-      { label: (S.course && S.course.name) || S.pdf.courseLabel || 'Course', href: '#/c/' + cid },
+    await courseCrumbs(cid, [
       { label: 'Accessibility', href: '#/c/' + cid + '/a11y/html' },
       { label: 'PDFs' },
     ]);
+    if (String(S.pdf.courseId) !== String(cid)) return;
     if (!S.pdf.viaA11y && has('areaHead')) {
       areaHead('Accessibility', 'Back up, repair, describe, prove, upload. The originals stay on this computer.');
       if (has('areaTabs')) {

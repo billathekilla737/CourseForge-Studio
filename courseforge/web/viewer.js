@@ -11,8 +11,35 @@ import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
 
 let S = null;   // the single live viewer, or null
 
-const CLAY = new THREE.MeshStandardMaterial({ color: 0xc9ccd1, roughness: 0.85, metalness: 0.0 });
+/* Blender's solid viewport is a matte mid grey, not the white Principled
+   default. That white, under a room map plus two more lights, clips to a
+   flat highlight and the form disappears. */
+const PREVIEW_GREY = 0x8d9196;
+const CLAY = new THREE.MeshStandardMaterial({ color: PREVIEW_GREY, roughness: 1, metalness: 0 });
 const NORMALS = new THREE.MeshNormalMaterial();
+
+function isNearWhite(color) {
+  return color && color.r > 0.82 && color.g > 0.82 && color.b > 0.82;
+}
+
+/* A material with no image is the "they did not pack a texture" case.
+   Leave a real color (a red plastic, a blue glass) alone. Turn the white
+   default into the same grey clay uses, so Default and Textured agree. */
+function softenUntextured(root) {
+  root.traverse(obj => {
+    if (!obj.isMesh) return;
+    const mats = Array.isArray(obj.material) ? obj.material : (obj.material ? [obj.material] : []);
+    mats.forEach(mat => {
+      if (!mat || !mat.color || mat.map) return;
+      if (!isNearWhite(mat.color)) return;
+      mat.color.setHex(PREVIEW_GREY);
+      if ('roughness' in mat) mat.roughness = 1;
+      if ('metalness' in mat) mat.metalness = 0;
+      if ('emissive' in mat && isNearWhite(mat.emissive)) mat.emissive.setHex(0x000000);
+      mat.needsUpdate = true;
+    });
+  });
+}
 
 function teardown() {
   if (!S) return;
@@ -84,11 +111,13 @@ const BlendViewer = {
     scene.background = new THREE.Color(opts.background || 0x1c2026);
 
     // We export with export_lights=False, so without an environment map any
-    // metallic material renders black.
+    // metallic material renders black. The room is only a soft fill. A second
+    // pair of full-white lights on top of it clipped every grey to white.
     const pmrem = new THREE.PMREMGenerator(renderer);
     scene.environment = pmrem.fromScene(new RoomEnvironment(), 0.04).texture;
-    scene.add(new THREE.HemisphereLight(0xffffff, 0x334455, 1.6));
-    const key = new THREE.DirectionalLight(0xffffff, 1.4);
+    scene.environmentIntensity = 0.4;
+    scene.add(new THREE.HemisphereLight(0xc5c9d0, 0x2a3038, 0.45));
+    const key = new THREE.DirectionalLight(0xe7ebf0, 0.65);
     key.position.set(3, 5, 4);
     scene.add(key);
 
@@ -121,6 +150,7 @@ const BlendViewer = {
     if (!S) return;                       // disposed while loading
 
     const root = gltf.scene || gltf.scenes[0];
+    softenUntextured(root);
     S.root = root;
     scene.add(root);
     const { radius, center } = frameObject(root, camera, controls);

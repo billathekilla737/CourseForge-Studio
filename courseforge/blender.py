@@ -211,6 +211,244 @@ def _contact_sheet(out_dir: Path) -> str | None:
 
 
 # ------------------------------------------------------------------- report
+# The sections below were added so the grader reads lighting, camera, render and
+# texture facts from the file instead of from a student's typed notes. Each one
+# prints nothing when the stats predate it, so an older cached pass still reads.
+_REPORT_LIGHTS = 8
+_REPORT_IMAGES = 10
+_REPORT_EMPTIES = 8
+
+
+def _n(value) -> str:
+    """A number without float noise: 2.0 -> 2, 0.12345 -> 0.123."""
+    if isinstance(value, bool) or value is None:
+        return str(value)
+    if isinstance(value, (int, float)):
+        f = round(float(value), 3)
+        return str(int(f)) if f.is_integer() else str(f)
+    return str(value)
+
+
+def _vec(values) -> str:
+    if isinstance(values, (list, tuple)):
+        return "(" + ", ".join(_n(v) for v in values) + ")"
+    return _n(values)
+
+
+def _material_detail(mat: dict) -> list[str]:
+    out = []
+    for bsdf in (mat.get("principled") or [])[:2]:
+        normal = ("fed through a Normal Map node" if bsdf.get("normal_via_normal_map")
+                  else "fed through a Bump node" if bsdf.get("normal_via_bump")
+                  else "linked" if bsdf.get("normal_linked") else "not connected")
+        out.append(f"      {bsdf.get('node')}: Base Color {_vec(bsdf.get('base_color'))}, "
+                   f"Metallic {_vec(bsdf.get('metallic'))}, "
+                   f"Roughness {_vec(bsdf.get('roughness'))}, Normal {normal}")
+    for tex in (mat.get("textures") or [])[:6]:
+        feeds = ", ".join(tex.get("feeds") or []) or "nothing (not connected to the shader)"
+        out.append(f"      image {tex.get('image') or 'none'} "
+                   f"({tex.get('colorspace') or '?'}) -> {feeds}")
+    return out
+
+
+def _image_detail(images: list) -> list[str]:
+    rows = []
+    for img in images[:_REPORT_IMAGES]:
+        if "size" not in img:
+            continue                      # stats from before these fields existed
+        size = img.get("size") or [0, 0]
+        dims = f"{size[0]}x{size[1]}" if any(size) else "no pixels loaded"
+        pot = "" if not any(size) else (
+            ", power of two" if img.get("power_of_two") else ", not power of two")
+        rows.append(f"  - {img.get('name')}: {dims}{pot}, colour space "
+                    f"{img.get('colorspace')}, "
+                    + ("packed" if img.get("packed") else "external file")
+                    + (f", source {img.get('source')}" if img.get("source") not in
+                       (None, "FILE") else ""))
+    if not rows:
+        return []
+    more = len(images) - _REPORT_IMAGES
+    return (["Image sizes and colour spaces:"] + rows
+            + ([f"  - {more} more images omitted"] if more > 0 else []))
+
+
+_MOD_LABELS = {
+    "width": "width", "segments": "segments", "limit_method": "limit",
+    "use_clamp_overlap": "clamp overlap", "offset_type": "offset type",
+    "use_clip": "clipping", "use_axis": "axis", "use_bisect_axis": "bisect",
+    "count": "count", "fit_type": "fit", "use_constant_offset": "constant offset",
+    "use_relative_offset": "relative offset", "thickness": "thickness",
+    "levels": "viewport levels", "render_levels": "render levels",
+    "sculpt_levels": "sculpt levels", "operation": "operation", "solver": "solver",
+    "object": "object",
+}
+
+
+def _modifier_stack(mods: list) -> str:
+    """Modifiers top to bottom with their key settings: Mirror(clipping on) > Bevel(...)."""
+    if not any("settings" in m for m in mods):
+        return ""
+    parts = []
+    for mod in mods[:8]:
+        settings = mod.get("settings") or {}
+        bits = []
+        for key, val in settings.items():
+            label = _MOD_LABELS.get(key, key)
+            if key in ("use_axis", "use_bisect_axis") and isinstance(val, list):
+                axes = "".join(a for a, on in zip("XYZ", val) if on)
+                if key == "use_bisect_axis" and not axes:
+                    continue
+                bits.append(f"{label} {axes or 'none'}")
+            elif isinstance(val, bool):
+                bits.append(f"{label} {'on' if val else 'off'}")
+            else:
+                bits.append(f"{label} {_n(val)}")
+        off = "" if mod.get("show_render", True) else " render off"
+        parts.append(f"{mod.get('name')} {mod.get('type')}"
+                     + (f"({', '.join(bits)})" if bits else "") + off)
+    return " > ".join(parts)
+
+
+def _light_line(light: dict) -> str:
+    bits = [f"{light.get('name')} [{light.get('type')}] {_n(light.get('energy'))} "
+            + ("W/m2" if light.get("type") == "SUN" else "W")]
+    color = light.get("color")
+    if color and any(abs(c - 1) > 1e-3 for c in color):
+        bits.append(f"colour {_vec(color)}")
+    if light.get("type") == "AREA":
+        size = _n(light.get("size"))
+        if light.get("size_y") is not None:
+            size += f" x {_n(light.get('size_y'))}"
+        bits.append(f"{(light.get('shape') or '').lower()} {size} m")
+    elif light.get("type") == "SPOT":
+        bits.append(f"cone {_n(light.get('spot_size_deg'))} deg, blend "
+                    f"{_n(light.get('spot_blend'))}")
+    if light.get("type") in ("POINT", "SPOT"):
+        bits.append(f"radius/soft size {_n(light.get('shadow_soft_size'))}")
+    elif light.get("type") == "SUN" and light.get("sun_angle_deg") is not None:
+        bits.append(f"sun angle {_n(light['sun_angle_deg'])} deg")
+    if light.get("distance_to_subject") is not None:
+        bits.append(f"{_n(light['distance_to_subject'])} m from the subject")
+    if light.get("angle_from_camera_deg") is not None:
+        bits.append(f"{_n(light['angle_from_camera_deg'])} deg around the subject "
+                    "from the camera")
+    if light.get("elevation_deg") is not None:
+        bits.append(f"{_n(light['elevation_deg'])} deg above the subject")
+    if light.get("aim_off_subject_deg") is not None:
+        bits.append(f"aimed {_n(light['aim_off_subject_deg'])} deg off the subject")
+    if light.get("type") != "SUN":          # a sun's position does not matter
+        bits.append(f"at {_vec(light.get('location'))}")
+    if light.get("hide_render"):
+        bits.append("disabled in renders")
+    return "  - " + "; ".join(bits)
+
+
+def _scene_setup_lines(stats: dict) -> list[str]:
+    """Lights, camera, render, world and empties, read from the file."""
+    lines: list[str] = []
+    lights = stats.get("lights")
+    summary = stats.get("lighting") or {}
+    if lights is not None:
+        count = summary.get("count", len(lights))
+        head = f"Lights in the file: {count}."
+        if summary.get("key_fill_ratio") is not None:
+            head += (f" Strongest to second strongest (key:fill) "
+                     f"{_n(summary['key_fill_ratio'])}:1 "
+                     f"({summary.get('strongest')} over {summary.get('second')}).")
+        if summary.get("back_lights"):
+            head += (" Behind the subject (rim/back): "
+                     + ", ".join(summary["back_lights"]) + ".")
+            if summary.get("key_fill_ratio_front") is not None:
+                pair = summary.get("front_pair") or []
+                head += (f" Key:fill among the front lights "
+                         f"{_n(summary['key_fill_ratio_front'])}:1"
+                         + (f" ({pair[0]} over {pair[1]})" if len(pair) == 2 else "") + ".")
+        if summary.get("ratio_mixes_sun"):
+            head += " The ratio compares a sun (W/m2) with a lamp (W), so it is not like for like."
+        lines.append(head)
+        if lights:
+            lines.append("  Angles are measured around the subject in the ground plane: "
+                         "0 deg is beside the camera, 90 deg is to the side, 180 deg is "
+                         "directly behind the subject.")
+        for light in lights[:_REPORT_LIGHTS]:
+            lines.append(_light_line(light))
+        if len(lights) > _REPORT_LIGHTS:
+            lines.append(f"  - {len(lights) - _REPORT_LIGHTS} weaker lights omitted")
+
+    cams = stats.get("cameras")
+    if cams is not None:
+        active = cams.get("active")
+        if active:
+            text = (f"Active camera: {active.get('name')} ({active.get('type')}, "
+                    f"{_n(active.get('lens_mm'))} mm lens, "
+                    f"{_n(active.get('sensor_width_mm'))} mm sensor"
+                    + (f", ortho scale {_n(active['ortho_scale'])}" if active.get("ortho_scale")
+                       else "")
+                    + (", depth of field on" if active.get("dof") else "")
+                    + f") at {_vec(active.get('location'))}, rotation "
+                    f"{_vec(active.get('rotation_deg'))} deg.")
+            if active.get("subject_corners_in_frame") is not None:
+                text += (f" {active['subject_corners_in_frame']} of 8 corners of the "
+                         "subject's bounding box are inside the frame.")
+        else:
+            text = "Active camera: none set."
+        lines.append(text + f" Cameras in the file: {cams.get('count', 0)}.")
+
+    render = stats.get("render")
+    if render:
+        res = render.get("resolution") or ["?", "?"]
+        lines.append(
+            f"Render settings: engine {render.get('engine')}, EEVEE samples "
+            f"{render.get('eevee_samples')}, Cycles samples {render.get('cycles_samples')} "
+            f"(denoising {'on' if render.get('cycles_denoising') else 'off'}), "
+            f"resolution {res[0]}x{res[1]} at {render.get('resolution_percentage')}%, "
+            f"output {render.get('file_format')} {render.get('color_mode') or ''}"
+            .rstrip() + ("" if not render.get("film_transparent") else ", transparent film")
+            + ". Colour management: view transform "
+            f"{render.get('view_transform')}, look {render.get('look')}, exposure "
+            f"{_n(render.get('exposure'))}, gamma {_n(render.get('gamma'))}, display "
+            f"{render.get('display_device')}.")
+
+    world = stats.get("world")
+    if world:
+        if world.get("hdri"):
+            size = world.get("hdri_size")
+            text = (f"World {world.get('name')}: environment (HDRI) image "
+                    f"{world.get('hdri_image')}"
+                    + (f" {size[0]}x{size[1]}" if size else ""))
+        elif world.get("name"):
+            text = (f"World {world.get('name')}: no environment image, background colour "
+                    f"{_vec(world.get('background_color'))}")
+        else:
+            text = "World: none assigned to the scene"
+        if world.get("strength") is not None:
+            text += f", strength {_vec(world.get('strength'))}"
+        lines.append(text + ".")
+
+    empties = stats.get("empties")
+    if empties:
+        rows = []
+        for e in empties[:_REPORT_EMPTIES]:
+            bits = [f"{e.get('name')} [{e.get('display_type')}]",
+                    f"display size {_n(e.get('display_size'))}"]
+            if e.get("display_type") == "IMAGE":
+                size = e.get("image_size")
+                bits.append(f"image {e.get('image') or 'none'}"
+                            + (f" {size[0]}x{size[1]}" if size else ""))
+                bits.append(f"depth {e.get('image_depth')}")
+                bits.append(f"opacity {_n(e.get('opacity'))}"
+                            + (" (transparency on)" if e.get("use_alpha")
+                               else " (transparency off)"))
+            bits.append("locked from selection" if e.get("hide_select")
+                        else "selectable")
+            rows.append("  - " + "; ".join(bits))
+        lines.append(f"Empties: {len(empties)}"
+                     + (" (reference images first)" if any(
+                         e.get("display_type") == "IMAGE" for e in empties) else "") + ":")
+        lines.extend(rows)
+    return lines
+
+
 def scene_report(result: dict, filename: str) -> str:
     """Turn the raw stats into compact prose the model and the instructor can read.
 
@@ -238,23 +476,35 @@ def scene_report(result: dict, filename: str) -> str:
                  f"{counts.get('materials', 0)} materials, "
                  f"{counts.get('images', 0)} images.")
 
+    tris = totals.get("tris_render", 0) or 0
     lines.append(
         f"Geometry: {totals.get('verts', 0)} verts, {totals.get('faces', 0)} faces "
-        f"({totals.get('tris_render', 0)} tris at render). "
+        f"({tris} tris at render). "
         f"Face mix: {totals.get('quads', 0)} quads, {totals.get('tris', 0)} tris, "
         f"{totals.get('ngons', 0)} n-gons "
         f"({int(round(100 * (totals.get('quad_ratio') or 0)))}% quads).")
+    lines.append(f"Final Tris (Statistics overlay count): {tris}.")
 
-    problems = []
-    if totals.get("non_manifold_edges"):
-        problems.append(f"{totals['non_manifold_edges']} non-manifold edges")
-    if totals.get("loose_verts"):
-        problems.append(f"{totals['loose_verts']} loose verts")
-    if totals.get("loose_edges"):
-        problems.append(f"{totals['loose_edges']} loose edges")
-    if totals.get("zero_area_faces"):
-        problems.append(f"{totals['zero_area_faces']} zero-area faces")
-    lines.append("Mesh problems: " + (", ".join(problems) if problems else "none detected") + ".")
+    objects = stats.get("objects") or []
+    interior = totals.get("interior_faces")
+    if interior is None:
+        interior = sum((obj.get("mesh") or {}).get("interior_faces") or 0 for obj in objects)
+    inward = totals.get("inward_faces")
+    lines.append(
+        "Mesh audit from the file: "
+        f"{totals.get('non_manifold_edges', 0) or 0} non-manifold edges, "
+        f"{totals.get('loose_verts', 0) or 0} loose vertices, "
+        f"{totals.get('loose_edges', 0) or 0} loose edges, "
+        f"{totals.get('zero_area_faces', 0) or 0} zero-area faces, "
+        f"{interior} interior faces."
+        + (f" Inward faces: {inward}." if inward is not None else "")
+        + " This is the Face Orientation and Select Non Manifold check.")
+    lines.append(
+        "Merge by Distance does not leave its removed-vertex count in the file. "
+        "Doubles that remain are the loose vertices and non-manifold edges above.")
+    if totals.get("doubles") is not None:
+        lines.append(f"Doubles measured in the file: {totals.get('doubles')} vertices sit "
+                     "within 0.0001 m of another vertex (0 means none are left to merge).")
 
     def listing(items, limit=6):
         items = items or []
@@ -270,6 +520,30 @@ def scene_report(result: dict, filename: str) -> str:
     default_mats = [m["name"] for m in mats if m.get("default_name")]
     lines.append(f"Materials: {len(mats)} in use, {len(default_mats)} still default-named"
                  + (f" ({', '.join(default_mats[:5])})" if default_mats else "") + ".")
+    if mats:
+        lines.append("Material graphs (read from the file, not from a picture):")
+        for mat in mats[:12]:
+            nodes = ", ".join(mat.get("node_types") or []) or "no nodes"
+            images = ", ".join(mat.get("images") or []) or "no image texture"
+            lines.append(f"  - {mat.get('name')}: {nodes}; textures: {images}")
+            lines.extend(_material_detail(mat))
+        if len(mats) > 12:
+            lines.append(f"  - {len(mats) - 12} more materials omitted")
+
+    images = stats.get("images") or []
+    if images:
+        packed = [i.get("name") for i in images if i.get("packed")]
+        found = [i.get("name") for i in images
+                 if i.get("filepath") and not i.get("packed") and not i.get("missing")]
+        lines.append(f"Images packed into the .blend: {listing(packed)}.")
+        if found:
+            lines.append(f"Images linked from disk and present: {listing(found)}.")
+        lines.extend(_image_detail(images))
+
+    bounds = (scene or {}).get("bounds_size")
+    if bounds:
+        lines.append("Scene size in world units (width, depth, height): "
+                     + ", ".join(str(v) for v in bounds) + ".")
 
     lines.append(f"UVs: {listing(hyg.get('meshes_without_uvs'))} meshes have no UV map.")
     missing = hyg.get("missing_textures") or []
@@ -279,6 +553,7 @@ def scene_report(result: dict, filename: str) -> str:
 
     mods = hyg.get("live_modifiers") or []
     lines.append("Modifiers left live: " + (", ".join(mods) if mods else "none") + ".")
+    lines.extend(_scene_setup_lines(stats))
 
     anim = stats.get("animation") or {}
     if anim.get("actions"):
@@ -297,12 +572,41 @@ def scene_report(result: dict, filename: str) -> str:
             bits = [f"{obj['name']} [{obj['type']}]"]
             if mesh.get("faces") is not None:
                 bits.append(f"{mesh['faces']} faces, {mesh.get('ngons', 0)} n-gons")
+            if obj.get("dimensions"):
+                bits.append("size " + " x ".join(str(v) for v in obj["dimensions"]))
+            if obj.get("origin_offset"):
+                bits.append(f"origin offset {obj['origin_offset']}")
+            slots = [name for name in (obj.get("materials") or []) if name]
+            if slots:
+                bits.append("materials: " + ", ".join(slots[:4]))
+            if obj.get("vertex_groups"):
+                bits.append(f"{obj['vertex_groups']} vertex groups")
             if obj.get("modifier_types"):
                 bits.append("mods: " + "+".join(obj["modifier_types"]))
             if obj.get("unapplied_scale"):
                 bits.append(f"scale {obj['scale']}")
+            if obj.get("parent"):
+                bits.append(f"parent {obj['parent']}")
+            if obj.get("hidden"):
+                bits.append("hidden")
             if mesh and not mesh.get("has_uvs"):
                 bits.append("no UVs")
+            elif mesh.get("uv_outside_0_1"):
+                bits.append(f"{mesh['uv_outside_0_1']} UV loops outside 0-1")
+            if mesh.get("uv_overlap_estimate"):
+                bits.append(f"UV overlap {mesh['uv_overlap_estimate']}")
+            if mesh.get("shade_smooth"):
+                bits.append("shade smooth")
+            if mesh.get("doubles"):
+                bits.append(f"{mesh['doubles']} doubled verts")
+            if mesh.get("uv_islands") is not None:
+                bits.append(f"{mesh['uv_islands']} UV islands")
+            if mesh.get("texel_density_px_per_m") is not None:
+                bits.append(f"texel density {_n(mesh['texel_density_px_per_m'])} px/m "
+                            f"({mesh.get('texel_image')})")
+            stack = _modifier_stack(obj.get("modifiers") or [])
+            if stack:
+                bits.append("stack: " + stack)
             lines.append("  - " + "; ".join(bits))
 
     if result.get("default_scene"):
@@ -379,18 +683,25 @@ def cached_result(out_dir: Path, source: Path | None = None) -> dict | None:
 
 
 def apply_result(part: dict, result: dict, adir: Path, uid: str, stem: str,
-                 filename: str) -> dict:
+                 filename: str, home: Path | None = None) -> dict:
     """Turn one extraction into the part the work pane and the prompt read.
 
     The one place that decides what a Blender result looks like, so a reused
     pass and a fresh one are indistinguishable downstream.
     """
     out_dir = result_dir(adir, uid, stem)
-    # Artifacts must sit in files/ to be servable by the existing route.
+    # Artifacts must sit under files/ to be servable by the existing route:
+    # beside the .blend in the student's folder (`home`), or flat as
+    # <uid>_<stem> next to a .blend an older sync left flat.
+    files = adir / "files"
+    home = Path(home) if home else files
+    if home != files and files not in home.parents:
+        home = files
+    lead = f"{uid}_" if home == files else ""
     served: dict = {}
     for key, src, suffix in (("sheet", out_dir / "contact.png", "sheet.png"),
                              ("model", out_dir / "model.glb", "preview.glb")):
-        dest = adir / "files" / f"{uid}_{stem}.{suffix}"
+        dest = home / f"{lead}{stem}.{suffix}"
         if not dest.is_file() and src.is_file():
             try:
                 dest.parent.mkdir(parents=True, exist_ok=True)
@@ -398,7 +709,7 @@ def apply_result(part: dict, result: dict, adir: Path, uid: str, stem: str,
             except OSError:
                 continue
         if dest.is_file():
-            served[key] = dest.name
+            served[key] = dest.relative_to(files).as_posix()
 
     part["kind"] = "blend"
     part["note"] = ""
@@ -440,7 +751,7 @@ def attach_cached(store, course_id, assignment_id, extracted: dict) -> int:
             result = cached_result(result_dir(adir, str(uid), path.stem), path)
             if not result:
                 continue
-            apply_result(part, result, adir, str(uid), path.stem, path.name)
+            apply_result(part, result, adir, str(uid), path.stem, path.name, path.parent)
             touched = True
             found += 1
         if touched:
@@ -491,7 +802,7 @@ def process_assignment(cfg, store, course_id, assignment_id,
             # the part comes out identical to a freshly rendered one.
             earlier = cached_result(out_dir, path)
             if earlier:
-                apply_result(part, earlier, adir, uid, path.stem, name)
+                apply_result(part, earlier, adir, uid, path.stem, name, path.parent)
                 return True, f"{name}: already read, reused", True
         ok, why = looks_like_blend(path)
         if not ok:
@@ -512,7 +823,7 @@ def process_assignment(cfg, store, course_id, assignment_id,
             part["note"] = str(exc)[:400]
             return False, f"{name}: {exc}", False
 
-        data = apply_result(part, result, adir, uid, path.stem, name)
+        data = apply_result(part, result, adir, uid, path.stem, name, path.parent)
         return True, f"{name}: {data['stats'].get('faces', 0)} faces", False
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:

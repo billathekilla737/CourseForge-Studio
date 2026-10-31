@@ -29,7 +29,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from . import audit, identity, pseudonym
+from . import audit, folders, identity, pseudonym
 
 
 class NotOnThisRoster(KeyError):
@@ -67,12 +67,12 @@ def assert_clean(payload, names: list[str]) -> None:
 # ------------------------------------------------------------------ reading
 def _drafts(app, course_id):
     """(assignment id, assignment name, draft) for everything graded here."""
-    cdir = Path(app.store.root) / str(course_id)
+    cdir = folders.under(Path(app.store.root), course_id)
     names = {str(a.get("id")): a.get("name", "")
              for a in (app.store.assignments(course_id) or [])}
     out = []
     try:
-        children = sorted(p for p in cdir.iterdir() if p.is_dir() and p.name.isdigit())
+        children = folders.children(cdir)
     except OSError:
         return out
     for child in children:

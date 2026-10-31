@@ -4,18 +4,20 @@ from __future__ import annotations
 import concurrent.futures
 import json
 import re
+import shutil
 import threading
 from datetime import datetime
 from pathlib import Path
 from typing import Protocol
 from urllib.parse import unquote_plus
 
-from . import (audit, blender, curve, gradesync, humanize, latepolicy, llm,
-               nicknames, overlap, quizgrade, teaching)
-from .canvas import CanvasClient
+from . import (audit, blender, browse, curve, folders, gradesync, humanize, latepolicy,
+               llm, nicknames, overlap, quizgrade, teaching, videoread, watchnotes)
+from .canvas import MAX_DOWNLOAD_BYTES, CanvasClient
 from .config import Config
-from .extract import (ARCHIVE_EXT, Extracted, Submission, expand_archive,
-                      extract_submission, html_to_text, rce_file_refs)
+from .extract import (ARCHIVE_EXT, CODE_EXT, LINKED_KIND, Extracted, Submission,
+                      expand_archive, extract_submission, html_to_text, rce_file_refs,
+                      reread_nameless, with_linked_media)
 from .pseudonym import Pseudonymizer
 from .store import Store
 from .style import HUMANIZE_RULES
@@ -269,7 +271,8 @@ def _rubric_of(assignment: dict) -> list[dict]:
 def sync_assignment(cfg: Config, client: CanvasClient, store: Store,
                     course_id, assignment_id,
                     progress: Progress = _noop,
-                    me_id: str | int | None = None) -> dict:
+                    me_id: str | int | None = None,
+                    large: str | None = None) -> dict:
     """Pull everything needed to grade one assignment and cache it locally.
 
     `me_id` is this token's Canvas user id, used to tell the instructor's own
@@ -278,6 +281,11 @@ def sync_assignment(cfg: Config, client: CanvasClient, store: Store,
     One sync per assignment at a time (see _SYNC_LOCKS): a second one started
     while the first is running waits its turn instead of reading files the
     first is still writing.
+
+    `large` is the answer to "these files add up to N GB, download them?":
+    "all", "skip" (leave out each file over the download limit), or "ask".
+    None uses the answer remembered for this assignment, else asks. A sync
+    that has to ask returns {"download_check": {...}} and changes nothing.
     """
     lock = sync_lock(course_id, assignment_id)
     if not lock.acquire(blocking=False):
@@ -285,15 +293,89 @@ def sync_assignment(cfg: Config, client: CanvasClient, store: Store,
         lock.acquire()
     try:
         return _sync_assignment(cfg, client, store, course_id, assignment_id,
-                                progress, me_id)
+                                progress, me_id, large)
     finally:
         lock.release()
+
+
+LARGE_CHOICES = ("all", "skip", "ask")
+
+
+def _attachment_dest(adir: Path, uid: str, att: dict, sdir: Path | None = None) -> Path:
+    """files/<uid> - <name>/<file>. A copy an older sync left flat, as
+    files/<uid>_<file>, is used where it is until the migration moves it."""
+    name = _file_name(att.get('filename') or '') or 'file'
+    flat = adir / "files" / f"{uid}_{name}"
+    if flat.is_file():
+        return flat
+    return (sdir or folders.under(adir / "files", uid)) / name
+
+
+def _student_dir(store: Store, course_id, assignment_id, uid: str, sub: dict) -> Path:
+    """This student's folder, sized for the longest name about to go in it.
+    Named only: it is made when the first file is fetched into it."""
+    names = [_file_name(a.get("filename") or "") for a in (sub.get("attachments") or [])
+             if isinstance(a, dict)]
+    # "-pages/page-001.png" or "rce123_" may follow a name; leave room for it.
+    deepest = 1 + max([len(n) for n in names] + [40]) + 20
+    return store.student_dir(course_id, assignment_id, uid, deepest=deepest, create=False)
+
+
+def _turned_in(sub: dict) -> bool:
+    # A student who never submitted has a roster row and nothing to fetch.
+    # Downloading that row is what used to fill the sync log with errors.
+    return bool(sub.get("submitted_at") or sub.get("attempt") or (sub.get("body") or "").strip()
+                or sub.get("attachments"))
+
+
+def _needs_fetch(att: dict, dest: Path) -> tuple[bool, bool]:
+    """(fetch it, the copy on disk is incomplete).
+
+    A file on disk is trusted only when it is complete. Canvas says how big it
+    should be; an empty or short copy (a fetch that died part way) is fetched
+    again, never read as the work.
+    """
+    have = dest.stat().st_size if dest.is_file() else 0
+    want = int(att.get("size") or 0)
+    incomplete = dest.is_file() and (have == 0 or bool(want and have < want))
+    return bool((not dest.exists() or incomplete) and att.get("url")), incomplete
+
+
+def download_plan(submissions: list[dict], adir: Path) -> dict:
+    """What a sync is about to download, by Canvas's own file sizes.
+
+    Files already complete on disk are not counted, so a re-sync of a class
+    whose videos came down last time asks nothing. Counts only, no names.
+    """
+    sizes: list[int] = []
+    people: set[str] = set()
+    for sub in submissions or []:
+        if not isinstance(sub, dict) or not _turned_in(sub):
+            continue
+        uid = str(sub.get("user_id"))
+        for att in sub.get("attachments") or []:
+            if not isinstance(att, dict):
+                continue
+            fetch, _ = _needs_fetch(att, _attachment_dest(adir, uid, att))
+            if fetch:
+                sizes.append(int(att.get("size") or 0))
+                people.add(uid)
+    over = [n for n in sizes if n > MAX_DOWNLOAD_BYTES]
+    return {"bytes": sum(sizes), "files": len(sizes), "students": len(people),
+            "largest": max(sizes) if sizes else 0,
+            "over_limit": len(over), "over_limit_bytes": sum(over),
+            "limit_bytes": MAX_DOWNLOAD_BYTES}
+
+
+def _mb(n: int) -> str:
+    return f"{n / 1_000_000_000:.1f} GB" if n >= 1_000_000_000 else f"{n / 1_000_000:.0f} MB"
 
 
 def _sync_assignment(cfg: Config, client: CanvasClient, store: Store,
                      course_id, assignment_id,
                      progress: Progress = _noop,
-                     me_id: str | int | None = None) -> dict:
+                     me_id: str | int | None = None,
+                     large: str | None = None) -> dict:
     adir = store.assignment_dir(course_id, assignment_id)
 
     progress("fetching assignment")
@@ -311,6 +393,29 @@ def _sync_assignment(cfg: Config, client: CanvasClient, store: Store,
         course_id, assignment_id,
         history=bool(assignment.get("quiz_id")))
     store.write(adir / "submissions.json", submissions)
+
+    # Size the downloads before fetching any. Over the line, stop and ask:
+    # a class of screen recordings can be many gigabytes.
+    plan = download_plan(submissions, adir)
+    remembered = (store.draft(course_id, assignment_id) or {}).get("large_downloads")
+    choice = large if large in LARGE_CHOICES else (remembered if remembered in LARGE_CHOICES else "ask")
+    try:
+        free = shutil.disk_usage(adir).free
+    except OSError:
+        free = None
+    confirm_at = max(0, int(getattr(cfg, "download_confirm_mb", 500) or 0)) * 1_000_000
+    if choice == "ask" and plan["bytes"] > confirm_at:
+        progress(f"{_mb(plan['bytes'])} to download across {plan['students']} students:"
+                 " waiting for your answer")
+        return {"download_check": {**plan, "free_bytes": free,
+                                   "assignment_name": assignment.get("name", "")}}
+    if choice == "all" and free is not None and plan["bytes"] + 256_000_000 > free:
+        raise RuntimeError(f"Not enough free disk space: {_mb(plan['bytes'])} to download, "
+                           f"{_mb(free)} free. Nothing was downloaded.")
+    if plan["files"]:
+        progress(f"{_plural(plan['files'], 'file')} to download, {_mb(plan['bytes'])}"
+                 + (f"; skipping {plan['over_limit']} over {_mb(MAX_DOWNLOAD_BYTES)}"
+                    if choice == "skip" and plan["over_limit"] else ""))
 
     pseud = Pseudonymizer(students, enabled=cfg.pseudonymize)
     store.write(adir / "map.json", pseud.map_json())
@@ -349,25 +454,33 @@ def _sync_assignment(cfg: Config, client: CanvasClient, store: Store,
 
         files: list[Path] = []
         failed: list[str] = []
-        # A student who never submitted has a roster row and nothing to fetch.
-        # Downloading that row is what used to fill the sync log with errors.
-        turned_in = bool(sub.get("submitted_at") or sub.get("attempt") or (sub.get("body") or "").strip()
-                         or sub.get("attachments"))
-        if turned_in:
+        rce_refs = (rce_file_refs(sub.get("body"), cfg.base_url, getattr(cfg, "canvas_hosts", None))
+                    if _turned_in(sub) else [])
+        sdir = (_student_dir(store, course_id, assignment_id, uid, sub)
+                if _turned_in(sub) and (sub.get("attachments") or rce_refs) else None)
+        if _turned_in(sub):
             for att in (sub.get("attachments") or []):
                 safe = _file_name(att.get("filename") or "") or "file"
-                dest = adir / "files" / f"{uid}_{safe}"
-                # A file on disk is trusted only when it is complete. Canvas
-                # says how big it should be; an empty or short copy (a fetch
-                # that died part way) is fetched again, never read as the work.
-                have = dest.stat().st_size if dest.is_file() else 0
+                dest = _attachment_dest(adir, uid, att, sdir)
                 want = int(att.get("size") or 0)
-                incomplete = dest.is_file() and (have == 0 or (want and have < want))
+                fetch, incomplete = _needs_fetch(att, dest)
                 if incomplete:
+                    have = dest.stat().st_size if dest.is_file() else 0
                     progress(f"  {safe} on disk is incomplete ({have} of {want} bytes); fetching it again")
-                if (not dest.exists() or incomplete) and att.get("url"):
+                if fetch and choice == "skip" and want > MAX_DOWNLOAD_BYTES:
+                    progress(f"  skipped {safe} ({_mb(want)}), as you asked")
+                    failed.append(f"{safe} (skipped: {_mb(want)} is over the {_mb(MAX_DOWNLOAD_BYTES)}"
+                                  " limit. Re-sync and choose Download all to fetch it)")
+                    continue
+                if fetch:
                     try:
-                        client.download(att["url"], dest)
+                        dest.parent.mkdir(parents=True, exist_ok=True)
+                        # The size Canvas gave, agreed to above, is this
+                        # file's limit; anything else keeps the default.
+                        if want > MAX_DOWNLOAD_BYTES:
+                            client.download(att["url"], dest, max_bytes=want + 1_000_000)
+                        else:
+                            client.download(att["url"], dest)
                     except Exception as exc:  # noqa: BLE001
                         progress(f"  could not download {safe} — the rest of the assignment is still read")
                         failed.append(f"{safe} ({exc})")
@@ -378,14 +491,28 @@ def _sync_assignment(cfg: Config, client: CanvasClient, store: Store,
             # Students often paste a screenshot or a Word file into the text
             # box instead of attaching it. Those live in the student's files
             # and never appear in sub["attachments"].
-            for ref in rce_file_refs(sub.get("body"), cfg.base_url,
-                                     getattr(cfg, "canvas_hosts", None)):
+            for ref in rce_refs:
                 safe = _file_name(ref["name"]) or f"file_{ref['file_id']}"
-                dest = adir / "files" / f"{uid}_rce{ref['file_id']}_{safe}"
+                # An older sync kept these flat as files/<uid>_rce...; one
+                # still there is read where it is.
+                flat = adir / "files" / f"{uid}_rce{ref['file_id']}_{safe}"
+                home = flat.parent if flat.is_file() else sdir
+                lead = f"{uid}_" if home == flat.parent else ""
+                dest = home / f"{lead}rce{ref['file_id']}_{safe}"
+                # An earlier sync saved this under the file id because the
+                # link body was empty. The title has the real name now, so
+                # reuse the bytes instead of downloading them again.
+                legacy = home / f"{lead}rce{ref['file_id']}_file_{ref['file_id']}"
+                if not dest.exists() and legacy.is_file() and legacy != dest:
+                    try:
+                        legacy.replace(dest)
+                    except OSError:
+                        pass
                 if dest.exists():
                     files.append(dest)
                     continue
                 try:
+                    dest.parent.mkdir(parents=True, exist_ok=True)
                     client.download(ref["url"], dest)
                     files.append(dest)
                 except Exception as exc:  # noqa: BLE001
@@ -398,8 +525,11 @@ def _sync_assignment(cfg: Config, client: CanvasClient, store: Store,
         labels: dict[str, str] = {}
         for archive in [f for f in list(files) if f.suffix.lower() in ARCHIVE_EXT]:
             try:
-                members = expand_archive(archive, adir / "files",
-                                         prefix=f"{uid}_zip{archive.stem[:20]}_")
+                # Next to the archive: the student's folder, or files/ for a
+                # zip an older sync left there flat.
+                lead = f"{uid}_" if archive.parent == adir / "files" else ""
+                members = expand_archive(archive, archive.parent,
+                                         prefix=f"{lead}zip{archive.stem[:20]}_")
             except Exception as exc:  # noqa: BLE001
                 progress(f"  WARNING could not expand {archive.name}: {exc}")
                 failed.append(f"{archive.name} ({exc})")
@@ -412,11 +542,11 @@ def _sync_assignment(cfg: Config, client: CanvasClient, store: Store,
 
         parsed: Submission = extract_submission(sub.get("body"), files, labels)
         for part in parsed.parts:
-            # Files are stored as "<uid>_<name>" to keep the folder flat; show
-            # the student's own filename in the UI and in the prompt.
+            # Files sit in the student's folder, or flat as "<uid>_<name>"
+            # from an older sync; show the student's own filename either way.
             if part.label.startswith(f"{uid}_"):
                 part.label = part.label[len(uid) + 1:]
-                part.label = re.sub(r"^rce\d+_", "", part.label)
+            part.label = re.sub(r"^rce\d+_", "", part.label)
         for note in failed:
             # Surface download failures as an unreadable part so the UI and the
             # grading prompt both know something is missing, rather than
@@ -485,10 +615,18 @@ def _sync_assignment(cfg: Config, client: CanvasClient, store: Store,
         entry["scan_live"] = gradesync.whole_grade_posted(entry)
         extracted[uid] = entry
 
-    # Enrolled students with no submission row at all still need a card.
+    # Enrolled students with no submission row at all still need a card. But
+    # Canvas gives every active student a row, so when it sent rows and one
+    # roster name has none, that student has dropped since the roster was
+    # saved (students.json is not re-read, so tags stay put). No card: they
+    # would sit under Missing and in Remind missing. A post in the discussion
+    # still earns one.
+    rows_came_back = bool(submissions)
     for student in students:
         uid = str(student["id"])
         if uid in extracted:
+            continue
+        if rows_came_back and uid not in discussion:
             continue
         entry = {
             "user_id": uid, "name": student.get("name", ""), "pseudonym": pseud.tag(uid),
@@ -512,6 +650,7 @@ def _sync_assignment(cfg: Config, client: CanvasClient, store: Store,
     revived = blender.attach_cached(store, course_id, assignment_id, extracted)
     if revived:
         progress(f"reattached {_plural(revived, 'Blender result')} from an earlier pass")
+    extracted = with_linked_media(extracted, submissions)
 
     store.write(adir / "extracted.json", extracted)
 
@@ -528,6 +667,10 @@ def _sync_assignment(cfg: Config, client: CanvasClient, store: Store,
         "student_count": len(extracted),
     })
     draft.setdefault("students", {})
+    if large == "skip":
+        draft["large_downloads"] = "skip"
+    elif large == "all":
+        draft.pop("large_downloads", None)
     store.save_draft(course_id, assignment_id, draft)
 
     # Grades already in Canvas -- pushed from another machine, or typed into
@@ -541,6 +684,8 @@ def _sync_assignment(cfg: Config, client: CanvasClient, store: Store,
         progress(f"WARNING {_plural(len(merged['conflicts']), 'local grade')} disagree"
                  " with Canvas -- see the Conflicts filter")
     progress(f"synced {len(extracted)} students")
+    # data/Browse/<term>/<course>/<assignment>: a readable way into files/.
+    browse.refresh_quietly(cfg, store.root)
     return store.draft(course_id, assignment_id)
 
 
@@ -705,12 +850,26 @@ def build_prompt(assignment: dict, rubric: list[dict], entry: dict,
     if entry.get("unreadable"):
         lines.append("NOTE - these parts could not be converted to text: "
                      + "; ".join(entry["unreadable"]))
-    if entry.get("images") and len((entry.get("text") or "").split()) < 40:
+    blend = blend_report_present(entry)
+    if entry.get("images") and len((entry.get("text") or "").split()) < 40 and not blend:
         lines.append(
             "NOTE - the student's work is in the attached images: screenshots, "
             "photos, scanned PDF pages, or pictures pasted into a Word, "
             "PowerPoint or Excel file. Grade from what is visible in them. A "
             "short text extract is not the whole submission.")
+    if entry.get("videos_read"):
+        lines.append(
+            "NOTE - this submission is a video, read for you two ways: a "
+            "transcript of its audio, made automatically and able to mis-hear "
+            "words (names and game terms especially), and still frames spread "
+            "evenly through it, tiled three across on the attached sheets with "
+            "each frame's time in the corner. You see snapshots, not motion, and "
+            "you cannot hear tone or pacing. Grade what the transcript and frames "
+            "show, and cite times when you do. Where a criterion turns on "
+            "something only watching would show, score what the evidence "
+            "supports and say in that rationale what you could not see. Do not "
+            "mention the transcript or frames in the comment to the student: "
+            "write it as about their video.")
     if entry.get("videos"):
         # A submission that is part write-up, part screen recording still gets
         # graded on the write-up. Without this the model scores the video it
@@ -731,7 +890,46 @@ def build_prompt(assignment: dict, rubric: list[dict], entry: dict,
     lines.append(work if work.strip() else "(nothing submitted)")
     lines.append("")
 
-    if entry.get("sheets"):
+    if blend:
+        lines.append("## The .blend file")
+        lines.append(
+            "A Blender scene report in the work above was read from the "
+            "student's .blend. You have the file. Never say you could not open "
+            "a .blend, and never grade these facts from a screenshot when the "
+            "report states them.\n"
+            "\n"
+            "The assignment may also ask for a typed number or a screenshot. "
+            "The report already is that evidence:\n"
+            "- 'Final Tris' and 'N tris at render' are the Statistics triangle "
+            "count. Do not say the submission lacks a stated Tris number, and "
+            "do not tell the student to type it.\n"
+            "- When two reports are present, a filename containing blockout, "
+            "before, or backup is the before count and the other is the after "
+            "count. Do not say the before count is missing.\n"
+            "- The mesh audit line is the Face Orientation overlay and the "
+            "Select Non Manifold check. Do not require a Face Orientation "
+            "screenshot, and do not say normals or non-manifold are unproven.\n"
+            "- A .blend does not store how many vertices Merge by Distance "
+            "removed. Do not say the submission lacks a merge count, and do "
+            "not tell the student to provide one. Doubles that remain are the "
+            "loose vertices and non-manifold edges in the audit. When the report "
+            "gives a 'Doubles measured in the file' count, use that number.\n"
+            "- Lights (type, watts, colour, size, distance and angle around the "
+            "subject, key:fill ratio), the active camera and lens, render samples, "
+            "resolution, output format and colour management, the world HDRI, "
+            "image sizes and colour spaces, Principled BSDF inputs and what each "
+            "texture feeds, reference-image empties, modifier settings, UV islands "
+            "and texel density are all read from the file when the report lists "
+            "them. Students no longer type a self-check, lighting notes or an "
+            "export log. Do not say these values are unstated or missing, and do "
+            "not tell the student to write them down; grade them from the report.\n"
+            "- An F12 PNG is a picture of the model, not the model. Do not "
+            "lower a modeling score because that PNG is absent.\n"
+            "A written justification is still required when the assignment asks "
+            "for one and the text does not contain the argument. Do not use "
+            "that paragraph as a place to demand numbers the report already has.")
+        lines.append("")
+    elif entry.get("sheets"):
         lines.append("## About the attached contact sheet")
         lines.append(
             "One image is attached: a contact sheet of the student's 3D model, three "
@@ -790,6 +988,55 @@ def build_prompt(assignment: dict, rubric: list[dict], entry: dict,
     return "\n".join(lines)
 
 
+VIDEO_SHEETS_MAX = 8            # contact sheets per student, across every video
+VIDEOS_READ_MAX = 3             # past this, the rest wait for the instructor
+VIDEO_FLAG = "graded from a transcript and still frames"
+
+
+def read_videos(entry: dict, progress: Progress = _noop, label: str = "") -> dict:
+    """The entry with each downloaded video turned into a transcript (added to
+    the text) and contact sheets (sent as pictures). A video that cannot be
+    read stays listed as one to watch. The entry passed in is not modified."""
+    parts = [p for p in entry.get("parts") or []
+             if isinstance(p, dict) and p.get("kind") == "video" and p.get("path")
+             and Path(p["path"]).is_file()]
+    if not parts:
+        return entry
+    files_dir = Path(entry.get("_files_dir") or Path(parts[0]["path"]).parent)
+    root = files_dir.parent / "video"
+    texts, sheets, read_labels = [], [], []
+    for part in parts[:VIDEOS_READ_MAX]:
+        name = part.get("label") or Path(part["path"]).name
+        try:
+            reading = videoread.read(Path(part["path"]), root,
+                                     progress=lambda msg: _item(progress, label, msg, ""))
+        except Exception as exc:  # noqa: BLE001  the video stays one to watch
+            _item(progress, label, "could not read the video", str(exc)[:80])
+            continue
+        texts.append(videoread.as_text(name, reading))
+        sheets.extend(reading.get("sheets") or [])
+        read_labels.append(name)
+    if not read_labels:
+        return entry
+    def joined(before):
+        return "\n\n".join(t for t in [(before or "").strip(), *texts] if t)
+
+    text = joined(entry.get("text"))
+    out = {**entry, "text": text, "words": len(text.split())}
+    # body_text is what _work_for_model sends when a sync recorded it.
+    if out.get("body_text") is not None:
+        out["body_text"] = joined(out["body_text"])
+    return {**out,
+            "video_sheets": sheets[:VIDEO_SHEETS_MAX],
+            "videos_read": read_labels,
+            "videos": [v for v in entry.get("videos") or [] if v not in read_labels]}
+
+
+def blend_report_present(entry: dict) -> bool:
+    """True when the submission text includes a report read from a .blend."""
+    return "Blender scene report" in (entry.get("text") or "")
+
+
 def _num(value) -> str:
     try:
         f = float(value)
@@ -809,14 +1056,25 @@ def grade_one(cfg: Config, assignment: dict, rubric: list[dict], entry: dict,
     base = {"user_id": uid, "source": "claude",
             "graded_at": datetime.now().isoformat(timespec="seconds")}
 
+    # Claude takes no video, so a downloaded one is read into a transcript and
+    # still frames first. Done here, per student, so a re-grade of one student
+    # reads only that student's video; the reading is cached on disk.
+    if getattr(cfg, "video_grading", True) and entry.get("status") != "unsubmitted":
+        entry = read_videos(entry, progress, label)
+
     # A .blend-only or screenshot-only submission has no text but is still real
     # work, so "nothing to read" has to account for images too.
     has_work = (bool((entry.get("text") or "").strip())
                 or bool(entry.get("sheets")) or bool(entry.get("images")))
     if entry.get("status") == "unsubmitted" or not has_work:
         videos = entry.get("videos") or []
+        elsewhere = [p.get("label") for p in entry.get("parts") or []
+                     if isinstance(p, dict) and p.get("kind") == LINKED_KIND]
         if entry.get("status") == "unsubmitted":
             reason = "no submission"
+        elif elsewhere and not videos:
+            reason = f"{elsewhere[0].lower()} - open it in SpeedGrader and grade it yourself"
+            videos = elsewhere
         elif videos:
             # Video is never sent to a model: it is the most expensive thing a
             # student can turn in and the cheapest thing to watch. Say that
@@ -883,12 +1141,13 @@ def grade_one(cfg: Config, assignment: dict, rubric: list[dict], entry: dict,
                           pseud=Pseudonymizer(students or [], enabled=cfg.pseudonymize),
                           addressed=addressed)
 
-    # Student screenshots always go. The Blender contact sheet is optional:
-    # blend_vision is about that render, not about whether a PNG submission
-    # gets read.
+    # Student screenshots always go. The contact sheet does not, once the
+    # .blend has been read: the model was scoring the picture and missing
+    # facts the file already stated. blend_vision still sends the sheet when
+    # there is no scene report.
     images: list[Path] = []
     files_dir = Path(entry.get("_files_dir") or "")
-    if getattr(cfg, "blend_vision", True):
+    if getattr(cfg, "blend_vision", True) and not blend_report_present(entry):
         for name in (entry.get("sheets") or [])[:1]:
             if files_dir:
                 images.append(files_dir / name)
@@ -896,6 +1155,9 @@ def grade_one(cfg: Config, assignment: dict, rubric: list[dict], entry: dict,
         images.append(Path(path))
     cap = int(getattr(cfg, "max_images_per_student", 8) or 8)
     images = [p for p in images if p.is_file()][:cap]
+    # The video's frames come on top of the student's own pictures, not out of
+    # their allowance: a screenshot is never dropped to make room for a frame.
+    images += [Path(p) for p in entry.get("video_sheets") or [] if Path(p).is_file()]
 
     # Vision on opus is several times the price for no better judgment of whether
     # a chair looks like a chair. Never the other way round: see vision_model_for.
@@ -1053,6 +1315,13 @@ def grade_one(cfg: Config, assignment: dict, rubric: list[dict], entry: dict,
                       for cid, text in rationales.items()}
         spend += float(edited.get("cost_usd") or 0.0)
 
+    confidence = ("low" if (repaired or missing)
+                  else str(data.get("confidence") or "medium"))
+    if entry.get("videos_read"):
+        # Read, not watched. Never more sure than that.
+        flags = [*flags, VIDEO_FLAG] if VIDEO_FLAG not in flags else flags
+        if confidence == "high":
+            confidence = "medium"
     _item(progress, label, "scored", f"{total} pts", finished=True)
     out = {
         **base,
@@ -1061,8 +1330,7 @@ def grade_one(cfg: Config, assignment: dict, rubric: list[dict], entry: dict,
         "rationales": rationales,
         "comment": comment,
         "flags": flags,
-        "confidence": "low" if (repaired or missing)
-                      else str(data.get("confidence") or "medium"),
+        "confidence": confidence,
         "needs_human": needs_human,
         "needs_human_reason": reason,
         "cost_usd": round(spend, 4),
@@ -1344,7 +1612,10 @@ def grade_assignment(cfg: Config, store: Store, course_id, assignment_id,
     """Grade every student (or just `only`) and merge results into the draft."""
     adir = store.assignment_dir(course_id, assignment_id)
     assignment = store.assignment(course_id, assignment_id)
-    extracted = store.extracted(course_id, assignment_id)
+    # A Canvas recording synced before it was understood reads as empty work.
+    # So does a file saved with no name, read before files were read by their bytes.
+    extracted = reread_nameless(with_linked_media(store.extracted(course_id, assignment_id),
+                                                  store.read(adir / "submissions.json", [])))
     draft = store.draft(course_id, assignment_id)
     rubric = draft.get("rubric") or _rubric_of(assignment)
     instructions = store.instructions(course_id, assignment_id)
@@ -1495,6 +1766,15 @@ def grade_assignment(cfg: Config, store: Store, course_id, assignment_id,
         raise JobStopped(
             f"Stopped. {_plural(len(written), 'student')} of {total} finished before "
             "the stop and kept their drafts; nobody else was changed.")
+    try:
+        flags = overlap_flags(store, course_id, assignment_id)
+        waiting = [uid for uid in flags["students"] if uid not in flags["reviewed"]]
+        if waiting:
+            progress(f"{_plural(len(waiting), 'student')} share most of their wording "
+                     "with someone else: marked for you to check", total, total)
+        draft = store.draft(course_id, assignment_id)
+    except Exception:  # noqa: BLE001  the grades are saved; a scan must not fail them
+        pass
     progress("done", total, total)
     return draft
 
@@ -1561,15 +1841,7 @@ def overlap_check(cfg: Config, store: Store, course_id, assignment_id,
     progress(f"comparing {_plural(len(texts), 'submission')} "
              f"({len(texts) * (len(texts) - 1) // 2} pairs)")
 
-    # The prompt, the instructions and the rubric are what everyone shares.
-    boiler = "\n".join([
-        html_to_text(assignment.get("description") or ""),
-        store.instructions(course_id, assignment_id),
-        " ".join(f"{c.get('label','')} {c.get('detail','')}"
-                 for c in (store.draft(course_id, assignment_id).get("rubric")
-                           or _rubric_of(assignment))),
-    ])
-    report = overlap.compare(texts, boilerplate=boiler)
+    report = _measure_class(store, course_id, assignment_id, assignment, extracted, texts)
 
     names = {str(uid): (nicknames.shown(
         (extracted.get(str(uid)) or {}).get("name"), uid) or str(uid))
@@ -1617,9 +1889,16 @@ def overlap_check(cfg: Config, store: Store, course_id, assignment_id,
     for index, pair in enumerate(notable, start=1):
         a, b = labels.get(pair["a"], pair["a"]), labels.get(pair["b"], pair["b"])
         lines.append(f"## Pair {index}: {a} and {b}")
-        lines.append(f"Longest shared run: {pair['longest_words']} words. "
-                     f"{pair['containment']:.0%} of the shorter submission's "
-                     f"distinctive windows appear in the other.")
+        if pair.get("method") == "code":
+            lines.append(f"Matched as code: the same statements, keywords and operators "
+                         f"in the same order, with variable and function names allowed "
+                         f"to differ. Longest matching run: {pair.get('longest_lines')} "
+                         f"lines. {pair['containment']:.0%} of the shorter submission's "
+                         f"distinctive code appears in the other.")
+        else:
+            lines.append(f"Longest shared run: {pair['longest_words']} words. "
+                         f"{pair['containment']:.0%} of the shorter submission's "
+                         f"distinctive windows appear in the other.")
         for passage in pair["passages"][:3]:
             quoted = passage["text"][:600]
             if cfg.pseudonymize:
@@ -1704,6 +1983,228 @@ def _save_overlap(store: Store, course_id, assignment_id, out: dict) -> None:
     draft = store.draft(course_id, assignment_id)
     draft["overlap"] = out
     store.save_draft(course_id, assignment_id, draft)
+
+
+def _shared_text(store: Store, course_id, assignment_id, assignment: dict) -> str:
+    """The prompt, the instructions and the rubric: what everyone shares."""
+    return "\n".join([
+        html_to_text(assignment.get("description") or ""),
+        store.instructions(course_id, assignment_id),
+        " ".join(f"{c.get('label','')} {c.get('detail','')}"
+                 for c in (store.draft(course_id, assignment_id).get("rubric")
+                           or _rubric_of(assignment))),
+    ])
+
+
+# Bumped when the scan records something new, so drafts measured by an
+# older build are measured again the next time they are opened.
+OVERLAP_SCAN = 4
+_LEVEL_RANK = {"red": 3, "yellow": 2, "green": 1}
+
+
+def _measure_class(store: Store, course_id, assignment_id, assignment: dict,
+                   extracted: dict, texts: dict[str, str]) -> dict:
+    """compare() on the words, then the code files again with names allowed
+    to differ. Each pair keeps whichever reading finds more."""
+    boiler = _shared_text(store, course_id, assignment_id, assignment)
+    report = overlap.compare(texts, boilerplate=boiler)
+    code = {uid: overlap.code_tokens_of(extracted.get(uid) or {}, CODE_EXT) for uid in texts}
+    code = {uid: toks for uid, toks in code.items() if toks}
+    if len(code) >= 2:
+        coded = overlap.compare_code(code, texts, boilerplate=boiler)
+        report["pairs"] = overlap.merge_pairs(report["pairs"], coded["pairs"])
+    return report
+
+
+def overlap_stamp(store: Store, course_id, assignment_id) -> str:
+    """Changes whenever the submissions do, or a note names a new pair, so a
+    stale scan can be noticed."""
+    path = store.assignment_dir(course_id, assignment_id) / "extracted.json"
+    try:
+        st = path.stat()
+    except OSError:
+        return ""
+    pairs = ",".join(sorted("-".join(sorted(p)) for p in watchnotes.watched_pairs(store.root)))
+    return f"{OVERLAP_SCAN}:{st.st_mtime_ns}:{st.st_size}:{pairs}"
+
+
+def _match_sig(matches: list[dict]) -> list[str]:
+    return sorted({str(m.get("with")) for m in matches})
+
+
+def overlap_flags(store: Store, course_id, assignment_id) -> dict:
+    """Measure the whole class for near-identical submissions and mark who.
+
+    The same local measurement as overlap_check, with no model call, run on its
+    own after grading and whenever the grader opens on submissions it has not
+    measured. It marks a student for the instructor to look at and nothing
+    more: it is not a finding, and push only waits until they have looked.
+    A check already made stays made unless that student's matches change.
+
+    A pair the instructor named in a note (this one may have copied from that
+    one) is held to the lower "notable" bar instead, and is reported on every
+    assignment both turned in, flagged or not, under "watching".
+    """
+    assignment = store.assignment(course_id, assignment_id)
+    extracted = store.extracted(course_id, assignment_id)
+    stamp = overlap_stamp(store, course_id, assignment_id)
+    texts = {}
+    for uid, entry in extracted.items():
+        prose = overlap.student_prose(entry)
+        if prose.strip():
+            texts[str(uid)] = prose
+
+    def name(uid):
+        return nicknames.shown((extracted.get(uid) or {}).get("name"), uid) or uid
+
+    watched = {p for p in watchnotes.watched_pairs(store.root) if p <= set(texts)}
+    by_student: dict[str, list[dict]] = {}
+    watching: dict[str, list[dict]] = {}
+    levels: dict[str, dict] = {}
+    if len(texts) >= 2:
+        report = _measure_class(store, course_id, assignment_id, assignment,
+                                extracted, texts)
+        measured = {frozenset((p["a"], p["b"])): p for p in report["pairs"]}
+        for key, pair in measured.items():
+            named = key in watched
+            if not (overlap.flag_worthy(pair) or (named and pair["notable"])):
+                continue
+            passage = pair["passages"][0]["text"][:400] if pair["passages"] else ""
+            for me, other in ((pair["a"], pair["b"]), (pair["b"], pair["a"])):
+                by_student.setdefault(me, []).append({
+                    "with": other, "with_name": name(other),
+                    "containment": pair["containment"],
+                    "longest_words": pair["longest_words"],
+                    "longest_lines": pair.get("longest_lines"),
+                    "method": pair.get("method", "words"),
+                    "passage": passage,
+                    "watched": named,
+                })
+        # Every student's strongest match, coloured for the class list. A
+        # student who shares nothing past the class's common wording has none.
+        for key, pair in measured.items():
+            colour = overlap.level(pair, watched=key in watched)
+            if not colour:
+                continue
+            for me, other in ((pair["a"], pair["b"]), (pair["b"], pair["a"])):
+                best = levels.get(me)
+                if best and ((_LEVEL_RANK[best["level"]], best["containment"])
+                             >= (_LEVEL_RANK[colour], pair["containment"])):
+                    continue
+                levels[me] = {"level": colour, "with": other, "with_name": name(other),
+                              "containment": pair["containment"],
+                              "longest_words": pair["longest_words"],
+                              "longest_lines": pair.get("longest_lines"),
+                              "method": pair.get("method", "words")}
+        # Named pairs are reported even when nothing stands out: "they share
+        # 3% this week" is the answer to the question the note asked.
+        for key in watched:
+            pair = measured.get(key) or {}
+            a, b = sorted(key)
+            for me, other in ((a, b), (b, a)):
+                watching.setdefault(me, []).append({
+                    "with": other, "with_name": name(other),
+                    "containment": pair.get("containment", 0.0),
+                    "longest_words": pair.get("longest_words", 0),
+                    "flagged": any(m["with"] == other for m in by_student.get(me, [])),
+                })
+    for matches in by_student.values():
+        matches.sort(key=lambda m: (m["containment"], m["longest_words"]), reverse=True)
+
+    with store.lock:
+        draft = store.draft(course_id, assignment_id)
+        before = (draft.get("overlap_flags") or {}).get("reviewed") or {}
+        reviewed = {uid: mark for uid, mark in before.items()
+                    if uid in by_student and mark.get("with") == _match_sig(by_student[uid])}
+        out = {
+            "checked_at": datetime.now().isoformat(timespec="seconds"),
+            "stamp": stamp,
+            "n": len(texts),
+            "students": by_student,
+            "watching": watching,
+            "levels": levels,
+            "reviewed": reviewed,
+            "containment_at": overlap.FLAG_CONTAINMENT,
+            "words_at": overlap.FLAG_WORDS,
+        }
+        draft["overlap_flags"] = out
+        store.save_draft(course_id, assignment_id, draft)
+    return out
+
+
+def overlap_pair(store: Store, course_id, assignment_id, a, b) -> dict:
+    """Two submissions side by side, with the wording they share marked.
+
+    Measured the way the class scan measures: the prompt, the rubric and
+    anything most of the class has are left out of the match, and are
+    returned separately so the page can show them dimmed.
+    """
+    assignment = store.assignment(course_id, assignment_id)
+    extracted = store.extracted(course_id, assignment_id)
+    a, b = str(a), str(b)
+    if a == b or a not in extracted or b not in extracted:
+        raise ValueError("Pick two different students from this assignment.")
+    texts = {}
+    for uid, entry in extracted.items():
+        prose = overlap.student_prose(entry)
+        if prose.strip():
+            texts[str(uid)] = prose
+    boiler = _shared_text(store, course_id, assignment_id, assignment)
+    spans = overlap.pair_spans(texts.get(a, ""), texts.get(b, ""),
+                               overlap.common_windows(texts, boilerplate=boiler))
+    code = {uid: overlap.code_tokens_of(extracted.get(uid) or {}, CODE_EXT) for uid in texts}
+    code = {uid: toks for uid, toks in code.items() if toks}
+
+    def side(uid):
+        entry = extracted.get(uid) or {}
+        return {"user_id": uid,
+                "name": nicknames.shown(entry.get("name"), uid) or uid,
+                "text": texts.get(uid, ""), "code": uid in code, "similar": []}
+
+    out = {**spans, "a": {**side(a), **spans["a"]}, "b": {**side(b), **spans["b"]},
+           "assignment": assignment.get("name") or "", "code": None}
+    # Code is read a second time with names allowed to differ. Those runs come
+    # back as "similar": the same program under other names, drawn apart from
+    # the word-for-word match.
+    if a in code and b in code:
+        found = overlap.code_pair_spans(
+            texts[a], code[a], texts[b], code[b],
+            overlap.common_code_windows(code, boilerplate=boiler))
+        out["code"] = {"containment": found["containment"],
+                       "longest_lines": found["longest_lines"]}
+        out["a"]["similar"] = found["a"]["similar"]
+        out["b"]["similar"] = found["b"]["similar"]
+    return out
+
+
+def overlap_held(draft: dict, user_id) -> list[dict]:
+    """The matches still waiting for the instructor to look at, if any."""
+    flags = draft.get("overlap_flags") or {}
+    uid = str(user_id)
+    matches = (flags.get("students") or {}).get(uid) or []
+    return [] if uid in (flags.get("reviewed") or {}) else matches
+
+
+def mark_overlap_checked(store: Store, course_id, assignment_id,
+                         user_ids: list[str], checked: bool = True) -> dict:
+    with store.lock:
+        draft = store.draft(course_id, assignment_id)
+        flags = draft.setdefault("overlap_flags", {})
+        matches = flags.get("students") or {}
+        reviewed = flags.setdefault("reviewed", {})
+        changed = []
+        for uid in (str(u) for u in user_ids):
+            if uid not in matches:
+                continue
+            if checked:
+                reviewed[uid] = {"at": datetime.now().isoformat(timespec="seconds"),
+                                 "with": _match_sig(matches[uid])}
+            else:
+                reviewed.pop(uid, None)
+            changed.append(uid)
+        store.save_draft(course_id, assignment_id, draft)
+    return {"ok": True, "checked": bool(checked), "changed": changed,
+            "overlap_flags": flags}
 
 
 TEACHING_SYSTEM = """You are helping an instructor work out what to change about their

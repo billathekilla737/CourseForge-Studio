@@ -17,6 +17,8 @@ import threading
 from datetime import datetime, timezone
 from pathlib import Path
 
+from . import folders
+
 _LOCK = threading.Lock()
 FILE = "ledger.jsonl"
 
@@ -44,7 +46,7 @@ def record(course_dir: Path, area: str, sentence: str, url: str | None = None,
     # successful write, so putting it here means no area has to remember to.
     from . import audit
     audit.record(course_dir, area, kind or "write", sentence, url=url,
-                 count=count, course_id=Path(course_dir).name)
+                 count=count, course_id=folders.id_of(course_dir))
     return entry
 
 

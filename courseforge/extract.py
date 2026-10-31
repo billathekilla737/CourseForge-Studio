@@ -137,7 +137,34 @@ _RCE_IMG = re.compile(
     re.I | re.S,
 )
 _ALT = re.compile(r"""\balt\s*=\s*["']([^"']*)["']""", re.I)
+_TITLE = re.compile(r"""\btitle\s*=\s*["']([^"']*)["']""", re.I)
 _VERIFIER = re.compile(r"[?&]verifier=([A-Za-z0-9._-]+)")
+
+
+def _attr(tag_html: str, pattern: re.Pattern) -> str:
+    found = pattern.search(tag_html)
+    return htmllib.unescape(found.group(1)).strip() if found else ""
+
+
+def _file_label(text: str, title: str, alt: str, file_id: str) -> str:
+    """The filename a Canvas file link is actually pointing at.
+
+    The rich editor often leaves the link body empty and puts the filename
+    in the title attribute. A name with an extension wins, because that is
+    what tells the extractor the file is source, a picture, or a document.
+    """
+    def clean(value: str) -> str:
+        return unquote_plus(value or "").strip()
+
+    text, title, alt = clean(text), clean(title), clean(alt)
+
+    def has_ext(value: str) -> bool:
+        return bool(Path(value).suffix)
+
+    for candidate in (text, title, alt):
+        if candidate and has_ext(candidate):
+            return candidate
+    return text or title or alt or f"file_{file_id}"
 
 
 def rce_file_refs(raw: str | None, base_url: str = "",
@@ -169,13 +196,11 @@ def rce_file_refs(raw: str | None, base_url: str = "",
             parsed = urlparse("https:" + url)
             url = parsed.geturl()
 
-        name = ""
+        opening = match.group(0).split(">", 1)[0]
+        text = ""
         if tag == "a":
-            name = htmllib.unescape(re.sub(r"<[^>]+>", "", match.group("text"))).strip()
-        if not name:
-            alt = _ALT.search(match.group(0))
-            name = htmllib.unescape(alt.group(1)).strip() if alt else ""
-        name = unquote_plus(name or "").strip() or f"file_{fid}"
+            text = re.sub(r"<[^>]+>", "", match.group("text"))
+        name = _file_label(text, _attr(opening, _TITLE), _attr(opening, _ALT), fid)
 
         verifier = _VERIFIER.search(url)
         path = parsed.path or url.split("?")[0]
@@ -426,11 +451,48 @@ def _prepare_image(path: Path) -> Path:
     """PNG/JPEG stay as they are. BMP, TIFF and HEIC become a PNG beside them."""
     if path.suffix.lower() in VISION_EXT:
         return path
+    target = path.with_name(path.stem + "-vision.png")
     try:
-        prepared = _vision_copy(path.with_name(path.stem + "-vision.png"), path.read_bytes())
+        # Made once. A record read again on every page load would otherwise
+        # convert the same phone photo every time.
+        if target.is_file() and target.stat().st_mtime_ns >= path.stat().st_mtime_ns:
+            return target
+        prepared = _vision_copy(target, path.read_bytes())
         return prepared or path
     except OSError:
         return path
+
+
+def _code_lang(path: Path, label: str) -> str:
+    for candidate in (path.suffix.lower(), Path(label).suffix.lower()):
+        if candidate in CODE_EXT:
+            return candidate.lstrip(".")
+    return ""
+
+
+def _plain_text(path: Path, limit: int = 1_000_000) -> str | None:
+    """The file's text when it is plain text and the name did not say so.
+
+    A Canvas file link with an empty body is saved under the file id, with
+    no extension. Source in that file is still text. A binary file has a
+    zero byte or a block of control characters and is left for the note
+    that names the missing extractor.
+    """
+    try:
+        size = path.stat().st_size
+    except OSError:
+        return None
+    if size <= 0 or size > limit:
+        return None
+    raw = path.read_bytes()
+    sample = raw[:8192]
+    if b"\x00" in sample:
+        return None
+    bad = sum(1 for byte in sample if byte < 9 or 13 < byte < 32)
+    if sample and bad > len(sample) * 0.10:
+        return None
+    text = raw.decode("utf-8-sig", errors="replace").strip()
+    return text or None
 
 
 # --------------------------------------------------------------------- file
@@ -460,9 +522,53 @@ def extract_file(path: Path, label: str | None = None) -> Extracted:
     return first
 
 
+_ZIP_KIND = (("word/", ".docx"), ("ppt/", ".pptx"), ("xl/", ".xlsx"))
+
+
+def sniff_ext(path: Path) -> str:
+    """What a file is from its first bytes, for a file saved with no name.
+
+    A picture pasted into the Canvas text box from a phone comes down with an
+    empty title, so it is saved as file_<id> with no extension. Read by name it
+    was "no text extractor", and the student was graded as if they had sent
+    nothing. The bytes say what it is.
+    """
+    try:
+        with open(path, "rb") as fh:
+            head = fh.read(32)
+    except OSError:
+        return ""
+    if head.startswith(b"\xff\xd8\xff"):
+        return ".jpg"
+    if head.startswith(b"\x89PNG\r\n\x1a\n"):
+        return ".png"
+    if head[:6] in (b"GIF87a", b"GIF89a"):
+        return ".gif"
+    if head[:4] == b"RIFF" and head[8:12] == b"WEBP":
+        return ".webp"
+    if head.startswith(b"%PDF"):
+        return ".pdf"
+    if head[4:8] == b"ftyp":
+        brand = head[8:12]
+        if brand in (b"heic", b"heix", b"mif1", b"msf1", b"heim", b"heis"):
+            return ".heic"
+        return ".mov" if brand == b"qt  " else ".mp4"
+    if head.startswith(b"PK\x03\x04"):
+        try:
+            with zipfile.ZipFile(path) as zf:
+                names = zf.namelist()
+        except (zipfile.BadZipFile, OSError):
+            return ""
+        for prefix, ext in _ZIP_KIND:
+            if any(n.startswith(prefix) for n in names):
+                return ext
+        return ".zip"
+    return ""
+
+
 def _extract_file_once(path: Path, label: str | None = None) -> Extracted:
     label = label or path.name
-    ext = path.suffix.lower()
+    ext = path.suffix.lower() or sniff_ext(path)
     try:
         if ext in IMAGE_EXT:
             ready = _prepare_image(path)
@@ -523,6 +629,12 @@ def _extract_file_once(path: Path, label: str | None = None) -> Extracted:
             return Extracted(label, kind="binary", path=str(path),
                              note=f"legacy {ext} — ask the student to resubmit as "
                                   f"{'.xlsx' if ext == '.xls' else '.pptx'}")
+        plain = _plain_text(path)
+        if plain is not None:
+            lang = _code_lang(path, label)
+            if lang:
+                plain = "```" + lang + "\n" + plain + "\n```"
+            return Extracted(label, text=plain, path=str(path))
         return Extracted(label, kind="binary", path=str(path),
                          note=f"no text extractor for {ext or 'this file type'}")
     except Exception as exc:  # noqa: BLE001 - report, never crash a batch
@@ -646,6 +758,128 @@ def extract_submission(body_html: str | None, files: list[Path],
 _IMG = re.compile(r"<img\b[^>]*?\bsrc=\"([^\"]*)\"[^>]*>", re.I)
 _FILE_ID = re.compile(r"/files/(\d+)")
 
+# Canvas Studio and the older media recorder keep the recording in Canvas. The
+# submission carries a link to it, never an attachment, so there is nothing to
+# download and nothing to read: it came through as an empty submission.
+STUDIO_HOST = "instructuremedia.com"
+LINKED_KIND = "linked"
+
+
+def linked_media_part(sub) -> dict | None:
+    """A part for work that lives in Canvas, not in a file: a Canvas Studio or
+    media recording, or something turned in through another outside tool."""
+    if not isinstance(sub, dict) or sub.get("attachments"):
+        return None
+    if not (sub.get("submitted_at") or sub.get("attempt")):
+        return None
+    kind = sub.get("submission_type")
+    if kind == "media_recording" or sub.get("media_comment"):
+        label, video = "Canvas media recording", True
+    elif kind == "basic_lti_launch":
+        url = str(sub.get("external_tool_url") or sub.get("url") or "")
+        host = (urlparse(url).hostname or "").lower()
+        if host == STUDIO_HOST or host.endswith("." + STUDIO_HOST):
+            label, video = "Canvas Studio recording", True
+        else:
+            label, video = "Work turned in through an outside tool", False
+    else:
+        return None
+    note = ("recorded in Canvas, so it stays there and is not downloaded. "
+            "Watch it in SpeedGrader and grade it yourself" if video else
+            "it stays in that tool, so there is no file here. "
+            "Open it in SpeedGrader and grade it yourself")
+    return {"label": label, "kind": LINKED_KIND, "note": note, "words": 0,
+            "text": "", "path": None, "data": {"video": video}}
+
+
+NAMELESS_NOTE = "no text extractor for this file type"
+INLINE_NOTE = "student pasted images directly into the Canvas text box"
+
+
+def reread_nameless(extracted: dict | None) -> dict:
+    """Read again, by their bytes, files an earlier sync gave up on because
+    they had no name. Their parts, images, videos and text are put right, and
+    the "pasted images could not be downloaded" note goes once a picture is
+    found. Nothing is fetched; the entries passed in are not modified."""
+    if not extracted:
+        return extracted or {}
+    out = None
+    for uid, info in extracted.items():
+        if not isinstance(info, dict):
+            continue
+        parts = list(info.get("parts") or [])
+        fixed = []
+        for i, part in enumerate(parts):
+            if not (isinstance(part, dict) and part.get("kind") == "binary"
+                    and part.get("note") == NAMELESS_NOTE and part.get("path")):
+                continue
+            path = Path(part["path"])
+            if path.suffix or not path.is_file() or not sniff_ext(path):
+                continue
+            new = extract_file(path, part.get("label"))
+            if new.kind in ("binary", "error"):
+                continue
+            parts[i] = {"label": new.label, "kind": new.kind, "note": new.note,
+                        "words": new.words, "text": new.text, "path": new.path,
+                        "data": new.data}
+            fixed.append(new)
+        if not fixed:
+            continue
+        info = dict(info)
+        if any(p.kind == "image" for p in fixed):
+            parts = [p for p in parts if not (isinstance(p, dict) and p.get("kind") == "binary"
+                                              and str(p.get("note") or "").startswith(INLINE_NOTE))]
+        labels = {p.label for p in fixed}
+        info["parts"] = parts
+        info["unreadable"] = [u for u in info.get("unreadable") or []
+                              if u not in labels and not str(u).endswith("inline image(s)")]
+        info["images"] = [*(info.get("images") or []),
+                          *(p.path for p in fixed if p.kind == "image")]
+        info["videos"] = [*(info.get("videos") or []),
+                          *(p.label for p in fixed if p.kind == "video")]
+        added = "\n\n".join(f"--- {p.label} ---\n{p.text}" for p in fixed if p.text.strip())
+        if added:
+            def joined(before):
+                return "\n\n".join(t for t in [(before or "").strip(), added] if t)
+            info["text"] = joined(info.get("text"))
+            # body_text is what the grader sends when a sync recorded it.
+            if info.get("body_text") is not None:
+                info["body_text"] = joined(info["body_text"])
+            info["words"] = len(info["text"].split())
+        out = out if out is not None else dict(extracted)
+        out[uid] = info
+    return out if out is not None else extracted
+
+
+def with_linked_media(extracted: dict | None, submissions: list | None) -> dict:
+    """Entries turned in as a Canvas recording get a part that says so, and the
+    recording is listed with the videos so grading leaves it to the instructor.
+    A sync from before this was understood picks it up here without another
+    sync. The entries passed in are not modified."""
+    if not extracted:
+        return extracted or {}
+    found: dict[str, dict] = {}
+    for sub in submissions or []:
+        part = linked_media_part(sub)
+        if part and sub.get("user_id") is not None:
+            found[str(sub["user_id"])] = part
+    if not found:
+        return extracted
+    out = dict(extracted)
+    for uid, part in found.items():
+        info = out.get(uid)
+        if not isinstance(info, dict) or info.get("status") == "unsubmitted":
+            continue
+        if any(isinstance(p, dict) and p.get("kind") == LINKED_KIND
+               for p in info.get("parts") or []):
+            continue
+        info = dict(info)
+        info["parts"] = [*(info.get("parts") or []), part]
+        if part["data"]["video"]:
+            info["videos"] = [*(info.get("videos") or []), part["label"]]
+        out[uid] = info
+    return out
+
 
 def present_text_entries(extracted: dict | None, submissions: list | None,
                          files_dir: Path, course_id, assignment_id,
@@ -658,6 +892,7 @@ def present_text_entries(extracted: dict | None, submissions: list | None,
     file so they sit where the student put them. The stored extract is not
     modified.
     """
+    extracted = reread_nameless(with_linked_media(extracted, submissions))
     bodies: dict[str, str] = {}
     for sub in submissions or []:
         if isinstance(sub, dict) and sub.get("user_id") is not None:
@@ -691,9 +926,13 @@ def present_text_entries(extracted: dict | None, submissions: list | None,
 
 
 def _local_rce(files_dir: Path, uid: str, file_id: str) -> Path | None:
+    """The picture in the student's folder, or flat from an older sync."""
     if not files_dir.is_dir():
         return None
-    matches = sorted(files_dir.glob(f"{uid}_rce{file_id}_*"))
+    from .folders import find
+    home = find(files_dir, uid)
+    matches = sorted(home.glob(f"rce{file_id}_*")) if home else []
+    matches = matches or sorted(files_dir.glob(f"{uid}_rce{file_id}_*"))
     return matches[0] if matches else None
 
 
@@ -712,7 +951,7 @@ def _entry_html(raw: str, uid: str, files_dir: Path, course_id, assignment_id,
         if local is None:
             return ""
         url = (f"/api/a/{course_id}/{assignment_id}/file?name="
-               + quote(local.name))
+               + quote(local.relative_to(files_dir).as_posix()))
         return re.sub(r"\bsrc=\"[^\"]*\"", f'src="{url}"', match.group(0), count=1)
 
     return _IMG.sub(replace, html).strip()

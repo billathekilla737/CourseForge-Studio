@@ -40,9 +40,48 @@
 .stHit b{font-size:1.05rem}
 .stHit span{color:var(--muted)}
 .stCourses{margin:.2rem 0 .4rem;padding-left:1.1rem}
+.stCourseList{display:flex;flex-direction:column;gap:6px;margin-top:.4rem}
+.stCourse{border:1px solid var(--line);border-radius:8px;background:var(--panel)}
+.stCourse summary{display:flex;align-items:baseline;gap:8px;
+  padding:8px 12px;cursor:pointer;list-style:none}
+.stCourse summary::-webkit-details-marker{display:none}
+.stCourse summary::before{content:"▸";font-size:11px;color:var(--muted);margin-right:6px}
+.stCourse[open] summary::before{content:"▾"}
+.stCourse summary .nm{flex:1;font-weight:650;min-width:0}
+.stCourseMeta{flex:none;font-size:12px;font-weight:650;color:var(--muted);white-space:nowrap}
+.stCourseMeta.warn{color:var(--warn)}
+.stCourseMeta.bad{color:var(--danger)}
+.stCourseBody{padding:0 12px 10px 28px}
+.stCourseBody p{margin:.2rem 0 .4rem}
+.stCourseBare{margin:.35rem 0;font-weight:650}
+.stLateClass{margin:.45rem 0;border:1px solid var(--line);border-radius:8px;background:var(--panel)}
+.stLateClass summary{display:flex;align-items:baseline;gap:8px;padding:8px 12px;cursor:pointer;list-style:none}
+.stLateClass summary::-webkit-details-marker{display:none}
+.stLateClass summary::before{content:"▸";font-size:11px;color:var(--muted)}
+.stLateClass[open] summary::before{content:"▾"}
+.stLateClass summary .nm{flex:1;font-weight:650;min-width:0}
+.stLateClass summary .stRemind{flex:none}
+.stLateBody{padding:0 12px 8px 28px}
+.stWork{list-style:none;margin:0;padding:0}
+.stWork li{display:flex;flex-wrap:wrap;gap:4px 12px;align-items:baseline;
+  padding:7px 0;border-top:1px solid var(--line);font-size:13.5px}
+.stWork .missing{color:var(--danger);font-weight:650}
+.stWork .late{color:var(--warn);font-weight:650}
 .stHistory{list-style:none;margin:0;padding:0}
 .stHistory li{padding:.65rem 0;border-bottom:1px solid var(--line)}
 .stHistory li div{margin:.2rem 0}
 .stThread{border-bottom:1px solid var(--line);padding:.6rem 0}
 .stThread p{margin:.3rem 0 0;color:var(--muted)}
 #stNotes{width:100%;min-height:8rem;font:14px/1.5 var(--sans)}
+
+/* Notes from grading */
+.stWatchList{list-style:none;margin:8px 0 0;padding:0}
+.stWatchList li{padding:8px 0;border-top:1px solid var(--line)}
+.stWatchList li.concern .noteText{color:var(--danger)}
+.stWatchList li.resolved{opacity:.65}
+.stWatchList .noteHead{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.stWatchList .noteBtns{margin-left:auto;display:flex;gap:6px}
+.stWatchList .noteText{margin-top:4px;white-space:pre-wrap}
+.stWatchList .noteLink{margin-top:4px;font-weight:600}
+.stWatchAdd{display:flex;gap:8px;align-items:flex-start;flex-wrap:wrap;margin:10px 0 1.2rem}
+.stWatchAdd textarea{flex:1 1 260px;min-width:0}

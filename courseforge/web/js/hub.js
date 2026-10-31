@@ -238,8 +238,43 @@
     if (typeof S !== 'undefined' && Array.isArray(S.behind)) renderBehind(host, S.behind);
   }
 
+  /* Which list To Do shows: work nobody has graded yet, or resubmissions to
+     regrade. Remembered per browser; a blocked storage just starts on grading. */
+  function todoMode() {
+    if (S.todoMode) return S.todoMode;
+    try { S.todoMode = localStorage.getItem('cf.todoMode') === 'regrade' ? 'regrade' : 'grade'; }
+    catch (_) { S.todoMode = 'grade'; }
+    return S.todoMode;
+  }
+  function setTodoMode(mode) {
+    S.todoMode = mode;
+    try { localStorage.setItem('cf.todoMode', mode); } catch (_) { /* private mode */ }
+  }
+
+  /* Resubmissions, oldest first. Kept off the main list on purpose: they were
+     graded once, and a regrade should never outrank work nobody has graded. */
+  function regradeBody(rows) {
+    const list = (Array.isArray(rows) ? rows : []).slice(0, 5);
+    if (!list.length) return '<p class="behindEmpty">No resubmissions waiting.</p>';
+    return `<div class="behindList">${list.map(row => {
+      const course = row.course_title || row.course_code || '';
+      const code = row.course_code && row.course_code !== course ? row.course_code : '';
+      const klass = [code, course].filter(Boolean).join(' ') || 'Course';
+      const since = row.resubmitted_since && typeof fmtDate === 'function' ? fmtDate(row.resubmitted_since) : '';
+      const n = +row.resubmitted || 0;
+      const meta = [klass, since ? 'since ' + since : ''].filter(Boolean).join(' · ');
+      return `<a class="behindItem regradeItem" href="#/c/${esc(row.course_id)}/a/${esc(row.assignment_id)}"
+          title="Graded, then ${n} handed in again. Opens on the Resubmitted filter.">
+        <span class="behindText">
+          <span class="nm">${esc(row.name || 'Assignment')}</span>
+          <span class="m">${esc(meta)}</span></span>
+        <span class="n">${n} resubmitted</span></a>`;
+    }).join('')}</div>`;
+  }
+
   /* To Do, same name as the Canvas list. Five assignments past their due
-     date, furthest first. The number is calendar days, not submissions. */
+     date, furthest first. The number is calendar days, not submissions. The
+     toggle beside Refresh swaps in the resubmissions to regrade. */
   function renderBehind(host, rows) {
     if (!host) return;
     let mount = host.querySelector('#behindMount');
@@ -267,9 +302,45 @@
             <span class="n">${esc(label)}</span></a>`;
         }).join('')}</div>`
       : '<p class="behindEmpty">Nothing is past its due date.</p>';
+    const regrade = (typeof S !== 'undefined' && Array.isArray(S.regrade)) ? S.regrade : [];
+    const mode = todoMode();
+    const nRe = regrade.length;
     mount.innerHTML = `<section class="behindGrade" aria-labelledby="behindH">
-      <h2 id="behindH">To Do</h2>
-      ${body}</section>`;
+      <div class="behindHead">
+        <h2 id="behindH">To Do${mode === 'regrade' ? ' · Resubmitted' : ''}</h2>
+        <button type="button" class="btn sm" id="todoMode" aria-pressed="${mode === 'regrade'}"
+          title="${mode === 'regrade' ? 'Back to work nobody has graded yet'
+            : 'Assignments graded once where students have handed in again'}">${
+          mode === 'regrade' ? 'To grade' : 'Resubmitted' + (nRe ? ' (' + nRe + ')' : '')}</button>
+        <button type="button" class="btn sm" id="behindRefresh"
+          title="Re-read past-due work in this term from Canvas. Reads only.">Refresh</button>
+      </div>
+      ${mode === 'regrade' ? regradeBody(regrade) : body}</section>`;
+    const toggle = mount.querySelector('#todoMode');
+    if (toggle) {
+      toggle.onclick = () => {
+        setTodoMode(todoMode() === 'regrade' ? 'grade' : 'regrade');
+        renderBehind(host, rows);
+        const again = host.querySelector('#todoMode');
+        if (again) again.focus();
+      };
+    }
+    mount.querySelectorAll('.regradeItem').forEach(a => {
+      a.addEventListener('click', () => {
+        if (typeof setFilter === 'function') setFilter('resubmitted');
+        else { try { localStorage.setItem('cg.filter', 'resubmitted'); } catch (_) { /* private mode */ } }
+      });
+    });
+    const refresh = mount.querySelector('#behindRefresh');
+    if (refresh) {
+      refresh.onclick = () => {
+        if (typeof refreshHomeFromCanvas === 'function') refreshHomeFromCanvas();
+      };
+      if (typeof S !== 'undefined' && S.homeRefreshing) {
+        refresh.disabled = true;
+        refresh.setAttribute('aria-busy', 'true');
+      }
+    }
   }
 
   document.addEventListener('studio:picker', ev => renderAcross(ev.detail && ev.detail.host));

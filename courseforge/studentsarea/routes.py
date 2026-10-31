@@ -1,7 +1,8 @@
 """Routes for the per-student page."""
 from __future__ import annotations
 
-from .. import nicknames, statesync
+from .. import nicknames, statesync, watchnotes
+from ..confirm import ConfirmRequired, ConfirmStale
 from ..routing import HTTPError, route
 from . import assemble, risk
 # Attendance is its own package. Importing it here registers its routes
@@ -88,6 +89,35 @@ def live(req):
     return req.job("student.live", job)
 
 
+@route("POST", "/api/student/{uid}/work", area=AREA)
+def student_work(req):
+    """Late and missing items in each class this term. Reads only."""
+    uid = req.params["uid"]
+
+    def job(log):
+        return assemble.course_work(req.app, uid, log)
+
+    return req.job("student.work", job)
+
+
+@route("POST", "/api/student/{uid}/remind", area=AREA)
+def remind_student(req):
+    """One Canvas Inbox note listing this student's missing work in one class.
+
+    The first call is refused until the message has been shown and confirmed.
+    """
+    body = req.body if isinstance(req.body, dict) else {}
+    titles = body.get("items") if isinstance(body.get("items"), list) else []
+    try:
+        return req.app.remind_one_student(
+            req.params["uid"], body.get("course_id"), body.get("course_name") or "",
+            titles, body.get("confirm"))
+    except ConfirmRequired as exc:
+        raise HTTPError(409, exc.summary, **exc.payload())
+    except ConfirmStale as exc:
+        raise HTTPError(409, str(exc), confirm_stale=True)
+
+
 @route("POST", "/api/student/{uid}/notes", area=AREA)
 def save_notes(req):
     body = req.body if isinstance(req.body, dict) else {}
@@ -114,3 +144,42 @@ def save_notes(req):
             409,
             "Canvas has a newer copy of this note. Reload the page, then save again.",
         ) from None
+
+
+@route("GET", "/api/student/{uid}/watch", area=AREA)
+def watch_list(req):
+    """The instructor's notes on this student, newest first."""
+    return {"notes": watchnotes.for_student(req.app.store.root, req.params["uid"])}
+
+
+@route("POST", "/api/student/{uid}/watch", area=AREA)
+def watch_add(req):
+    """A note on this student, usually written from the grader on one assignment."""
+    body = req.body if isinstance(req.body, dict) else {}
+    try:
+        return watchnotes.add(
+            req.app, req.params["uid"], body.get("text"),
+            kind=str(body.get("kind") or "note"),
+            course_id=str(body.get("course_id") or ""),
+            assignment_id=str(body.get("assignment_id") or ""),
+            assignment_name=str(body.get("assignment_name") or ""),
+            about_user_id=str(body.get("about_user_id") or ""),
+            about_name=str(body.get("about_name") or ""),
+            user_name=str(body.get("user_name") or ""))
+    except ValueError as exc:
+        raise HTTPError(400, str(exc)) from None
+
+
+@route("POST", "/api/student/{uid}/watch/{nid}", area=AREA)
+def watch_change(req):
+    body = req.body if isinstance(req.body, dict) else {}
+    try:
+        return watchnotes.change(
+            req.app, req.params["uid"], req.params["nid"],
+            text=body.get("text"),
+            resolved=body.get("resolved") if "resolved" in body else None,
+            delete=bool(body.get("delete")))
+    except KeyError as exc:
+        raise HTTPError(404, str(exc.args[0] if exc.args else exc)) from None
+    except ValueError as exc:
+        raise HTTPError(400, str(exc)) from None

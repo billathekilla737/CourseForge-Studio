@@ -26,11 +26,8 @@
     S.record.cid = cid;
     S.record.filter = { student: '', area: '', month: '' };
     showView('area');
-    crumbs([
-      { label: 'Courses', href: '#/' },
-      { label: (S.course && S.course.name) || 'Course', href: '#/c/' + cid },
-      { label: 'Record' },
-    ]);
+    await courseCrumbs(cid, [{ label: 'Record' }]);
+    if (String(S.record.cid) !== cid) return;
     $('#headerActions').innerHTML = '';
     areaHead('Record of actions',
       'What the Studio did in this course, written down as it happened. '

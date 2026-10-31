@@ -149,6 +149,18 @@ class CrumbNamesThisCourseTest(unittest.TestCase):
             with self.subTest(file=name):
                 self.assertLess(body.index("await ensureCourse("), body.index("crumbs(["))
 
+    def test_a_task_opened_directly_names_the_course(self):
+        core = (WEB / "core.js").read_text(encoding="utf-8")
+        helper = core[core.index("async function courseCrumbs"):core.index("const LAST_ASSIGNMENT_KEY")]
+        self.assertIn("await ensureCourse(", helper)
+        self.assertIn("courseTitle(", helper)
+        grade = (WEB / "grade.js").read_text(encoding="utf-8")
+        body = grade[grade.index("async function openAssignment"):grade.index("function stopAutoPull")]
+        self.assertIn("courseCrumbs(", body)
+        self.assertIn("id=\"instrMention\"", grade)
+        self.assertIn("wireInstructionMentions", grade)
+        self.assertIn("/roster", grade[grade.index("function wireInstructionMentions"):])
+
 
 class DueDateScreenTest(unittest.TestCase):
     def test_editing_a_proposed_date_wakes_the_apply_button(self):

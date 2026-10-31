@@ -479,6 +479,7 @@ async function openStudent(userId, courseId) {
   }
 
   const shown = data.display_name || studentLabel(data);
+  latePageStudent = { id: String(userId), name: data.name || shown || '' };
   if (data.nickname) nickById[String(userId)] = data.nickname;
   $('#areaTitle').textContent = shown || ('Student ' + userId);
   document.title = (shown || 'Student') + ' · CourseForge Studio';
@@ -507,6 +508,29 @@ async function openStudent(userId, courseId) {
         <div><span class="muted">On the accommodation list</span> ${data.on_roster ? 'yes' : 'no'}</div>
       </section>
 
+      <section id="stWatchSec">
+        <h3>Notes from grading</h3>
+        <p class="muted">Notes you wrote on this student, most from the grader on one
+          assignment. Open notes show beside their work on every assignment you grade.
+          Nothing here is sent to Claude.</p>
+        <div id="stWatch"></div>
+        <div class="stWatchAdd">
+          <select id="stWatchKind" aria-label="Kind of note">
+            <option value="note">General note</option>
+            <option value="integrity">Academic integrity concern</option>
+          </select>
+          <textarea id="stWatchText" rows="2" maxlength="2000"
+            placeholder="Add a note that is not about one assignment"></textarea>
+          <button class="btn" id="stWatchSave" type="button">Add note</button>
+        </div>
+      </section>
+
+      <section id="stLateSec">
+        <h3>Late and missing</h3>
+        <p class="muted" id="stLateNote">Reading each class…</p>
+        <div id="stLateBody"></div>
+      </section>
+
       <section id="stRiskSec" hidden>
         <h3>How they're doing in each class</h3>
         <div id="stRiskBody"></div>
@@ -514,10 +538,9 @@ async function openStudent(userId, courseId) {
 
       <section>
         <h3>Courses</h3>
-        ${refs.length ? `<ul class="stCourses">${refs.map(c => `<li>${
-          c.id ? `<a href="#/c/${esc(c.id)}/grade">${esc(c.name || c.id)}</a>`
-                    : esc(c.name || '')
-        }</li>`).join('')}</ul>` : '<p class="muted">No course on this login.</p>'}
+        <p class="muted" id="stCourseNote">Open a class to see what is late or missing, and for how long.
+          This term only.</p>
+        ${courseDropdowns(refs)}
       </section>
 
       <section>
@@ -638,8 +661,323 @@ async function openStudent(userId, courseId) {
     }
   };
 
-  paintStudentLive(userId);
+  paintWatchNotes(userId, data.watch_notes || []);
+
+  const pageGen = ++studentPageGen;
+  paintStudentWork(userId, pageGen);
+  paintStudentLive(userId, pageGen);
   paintStudentRisk(userId);
+}
+
+let studentPageGen = 0;
+
+function paintWatchNotes(userId, notes) {
+  const host = document.getElementById('stWatch');
+  if (!host) return;
+  const base = '/student/' + encodeURIComponent(userId) + '/watch';
+  host.innerHTML = notes.length ? `<ul class="stWatchList">${notes.map(n => `
+      <li class="${n.kind === 'integrity' ? 'concern' : ''}${n.resolved ? ' resolved' : ''}">
+        <div class="noteHead">
+          <span class="tag ${n.kind === 'integrity' && !n.resolved ? 'danger' : ''}">${
+            n.kind === 'integrity' ? 'integrity concern' : 'note'}${n.resolved ? ' · resolved' : ''}</span>
+          ${n.course_id && n.assignment_id
+            ? `<a href="#/c/${esc(n.course_id)}/a/${esc(n.assignment_id)}">${esc(n.assignment_name || 'the assignment')}</a>`
+            : '<span class="muted">not about one assignment</span>'}
+          <span class="muted">${esc(typeof fmtDate === 'function' ? fmtDate(n.created) : n.created)}</span>
+          <span class="noteBtns">
+            <button class="btn sm" data-wres="${esc(n.id)}">${n.resolved ? 'Reopen' : 'Resolve'}</button>
+            <button class="btn sm" data-wdel="${esc(n.id)}">Delete</button></span>
+        </div>
+        ${!n.about_user_id ? '' : String(n.user_id) === String(userId)
+          ? `<div class="noteLink">May have copied from <a href="#/student/${esc(n.about_user_id)}">${
+              esc(studentLabel({ user_id: n.about_user_id, name: n.about_name }))}</a></div>`
+          : `<div class="noteLink">Named as the possible source in your note on <a href="#/student/${
+              esc(n.user_id)}">${esc(studentLabel({ user_id: n.user_id, name: n.user_name }))}</a></div>`}
+        <div class="noteText">${esc(n.text)}</div>
+      </li>`).join('')}</ul>`
+    : '<p class="muted">No notes yet. Use Note… beside a submission in the grader, or add one here.</p>';
+
+  const update = async (nid, body) => {
+    try {
+      const r = await api(base + '/' + encodeURIComponent(nid), { body });
+      const next = notes.map(n => n.id === nid ? r.note : n).filter(n => !n.deleted);
+      paintWatchNotes(userId, next);
+      setStatus(body.delete ? 'note deleted' : (body.resolved ? 'note resolved' : 'note reopened'), 'ok');
+    } catch (err) { setStatus('could not change the note: ' + err.message, 'err'); }
+  };
+  host.querySelectorAll('[data-wres]').forEach(btn => btn.onclick = () => {
+    const note = notes.find(n => n.id === btn.dataset.wres) || {};
+    update(btn.dataset.wres, { resolved: !note.resolved });
+  });
+  host.querySelectorAll('[data-wdel]').forEach(btn => btn.onclick = () =>
+    askConfirm({ summary: 'Delete this note from the student page and the grader. '
+      + 'Resolve it instead to keep it here.' },
+    () => update(btn.dataset.wdel, { delete: true }),
+    { title: 'Delete this note?', verb: 'Yes, delete it',
+      note: 'Removes the note here and the copy in your Canvas files. Nothing in the course changes.' }));
+
+  const save = document.getElementById('stWatchSave');
+  if (save) save.onclick = async () => {
+    const box = document.getElementById('stWatchText');
+    const text = (box && box.value || '').trim();
+    if (!text) { setStatus('write something in the note first', 'err'); return; }
+    save.disabled = true;
+    try {
+      const r = await api(base, { body: { text,
+        kind: (document.getElementById('stWatchKind') || {}).value || 'note' } });
+      box.value = '';
+      paintWatchNotes(userId, [r.note, ...notes]);
+      setStatus('note added', 'ok');
+    } catch (err) {
+      setStatus('could not add the note: ' + err.message, 'err');
+    } finally {
+      save.disabled = false;
+    }
+  };
+}
+
+function courseDropdowns(refs) {
+  if (!refs.length) return '<p class="muted">No course on this login.</p>';
+  return `<div class="stCourseList" id="stCourseList">${refs.map(c => {
+    const name = c.name || c.id || 'Course';
+    if (!c.id) return `<p class="stCourseBare">${esc(name)}</p>`;
+    return `<details class="stCourse" data-cid="${esc(c.id)}">
+      <summary>
+        <span class="nm">${esc(name)}</span>
+        <span class="stCourseMeta" data-state="busy">Waiting</span>
+      </summary>
+      <div class="stCourseBody">
+        <p><a href="#/c/${esc(c.id)}/grade">Open the course</a></p>
+        <p class="muted stBusy">Waiting to read this class.</p>
+      </div>
+    </details>`;
+  }).join('')}</div>`;
+}
+
+function workCount(missing, late) {
+  if (!missing && !late) return 'Nothing late or missing';
+  const bits = [];
+  if (missing) bits.push(missing === 1 ? '1 missing' : missing + ' missing');
+  if (late) bits.push(late === 1 ? '1 late' : late + ' late');
+  return bits.join(', ');
+}
+
+function workItemHtml(item, courseId) {
+  const due = item.due_at && typeof fmtDate === 'function' ? fmtDate(item.due_at) : '';
+  const title = item.title || 'Assignment';
+  const name = item.assignment_id
+    ? `<a href="#/c/${esc(courseId)}/a/${esc(item.assignment_id)}">${esc(title)}</a>`
+    : esc(title);
+  return `<li>${name}<span class="${item.kind === 'missing' ? 'missing' : 'late'}">${
+    esc(item.label || item.kind || '')}</span>${
+    due ? `<span class="muted">due ${esc(due)}</span>` : ''}</li>`;
+}
+
+function courseStillHere() {
+  return !!document.getElementById('stCourseList');
+}
+
+function studentPageOpen() {
+  const view = document.getElementById('viewArea');
+  return !!(document.getElementById('stCourseList') && view && !view.classList.contains('hidden'));
+}
+
+function setNote(line) {
+  ['stCourseNote', 'stLateNote', 'stuLateNote'].forEach(id => {
+    const el = document.getElementById(id);
+    if (el) el.textContent = line;
+  });
+}
+
+function lateListHtml(courses) {
+  const shown = (courses || []).filter(course =>
+    course && (course.error || course.unread || (course.items || []).length));
+  if (!shown.length) return '<p class="muted">Nothing is late or missing this term.</p>';
+  return shown.map(course => {
+    const name = course.course || 'Class';
+    const items = course.items || [];
+    const missing = items.filter(item => item.kind === 'missing').length;
+    const late = items.filter(item => item.kind === 'late').length;
+    const bits = [];
+    if (missing) bits.push(missing === 1 ? '1 missing' : missing + ' missing');
+    if (late) bits.push(late === 1 ? '1 late' : late + ' late');
+    const meta = course.error ? 'Could not read' : (course.unread ? 'Not read' : bits.join(', '));
+    const rows = items.map(item => {
+      const due = item.due_at && typeof fmtDate === 'function' ? fmtDate(item.due_at) : '';
+      const title = item.title || 'Assignment';
+      const link = item.assignment_id && course.course_id
+        ? `<a href="#/c/${esc(course.course_id)}/a/${esc(item.assignment_id)}">${esc(title)}</a>`
+        : esc(title);
+      return `<li>${link}
+        <span class="${item.kind === 'missing' ? 'missing' : 'late'}">${esc(item.label || item.kind || '')}</span>
+        ${due ? `<span class="muted">due ${esc(due)}</span>` : ''}</li>`;
+    }).join('');
+    const body = course.error
+      ? `<p class="err">${esc(course.error)}</p>`
+      : (course.unread
+        ? '<p class="muted">This class was not read.</p>'
+        : `<ul class="stWork">${rows}</ul>`);
+    const remind = items.length && course.course_id
+      ? `<button type="button" class="btn sm stRemind" data-course="${esc(course.course_id)}"
+          data-name="${esc(name)}">Remind</button>`
+      : '';
+    return `<details class="stLateClass">
+      <summary><span class="nm">${esc(name)}</span><span class="stCourseMeta${
+        missing ? ' bad' : (late ? ' warn' : '')}">${esc(meta)}</span>${remind}</summary>
+      <div class="stLateBody">${body}</div>
+    </details>`;
+  }).join('');
+}
+
+let latePageStudent = { id: '', name: '' };
+let lateReminderItems = {};
+
+function paintLateList(courses, message) {
+  lateReminderItems = {};
+  (courses || []).forEach(course => {
+    if (!course || course.course_id == null) return;
+    lateReminderItems[String(course.course_id)] = (course.items || [])
+      .map(item => item.title || 'Assignment');
+  });
+  ['stLateBody', 'stuLateBody'].forEach(id => {
+    const host = document.getElementById(id);
+    if (!host) return;
+    host.innerHTML = message
+      ? `<p class="muted">${esc(message)}</p>`
+      : lateListHtml(courses);
+    host.querySelectorAll('.stRemind').forEach(btn => {
+      const stop = ev => { ev.preventDefault(); ev.stopPropagation(); };
+      btn.onmousedown = stop;
+      btn.onclick = ev => {
+        stop(ev);
+        const id = btn.getAttribute('data-course');
+        remindLateCourse(id, btn.getAttribute('data-name') || 'this course',
+          lateReminderItems[id] || []);
+      };
+    });
+  });
+}
+
+async function remindLateCourse(courseId, courseName, titles) {
+  if (!latePageStudent.id || !titles.length) return;
+  try {
+    const sent = await postConfirmed(
+      token => api('/student/' + encodeURIComponent(latePageStudent.id) + '/remind', {
+        body: {
+          course_id: courseId,
+          course_name: courseName,
+          items: titles,
+          confirm: token,
+        },
+      }),
+      { verb: 'Yes, send it',
+        note: 'One private Canvas Inbox message. A sent message cannot be unsent.' });
+    if (sent) setStatus('Reminder sent', 'ok');
+  } catch (err) {
+    setStatus(firstLine(err.message), 'err');
+  }
+}
+
+function setCourseBusy(info, startedAt) {
+  if (!courseStillHere()) return;
+  const secs = Math.max(0, Math.round((Date.now() - (startedAt || Date.now())) / 1000));
+  const msg = (info && info.message) || 'Reading late and missing work';
+  const idle = Number(info && info.idle_s) || 0;
+  const done = info && info.done;
+  const total = info && info.total;
+  const frac = total ? `${done || 0} of ${total}` : '';
+  const stall = idle > 15 ? ` No update for ${Math.round(idle)}s.` : '';
+  setNote([msg, frac, secs + 's'].filter(Boolean).join(' · ') + '.' + stall);
+  document.querySelectorAll('#stCourseList .stCourse').forEach(el => {
+    const meta = el.querySelector('.stCourseMeta');
+    if (!meta || meta.dataset.state === 'done') return;
+    const name = (el.querySelector('.nm') && el.querySelector('.nm').textContent) || '';
+    const current = name && msg.indexOf(name.slice(0, 24)) !== -1;
+    meta.textContent = current ? 'Reading now' : (frac || ('Reading · ' + secs + 's'));
+    const busy = el.querySelector('.stBusy');
+    if (busy) busy.textContent = current ? msg : (frac ? ('Waiting. ' + frac + ' read.') : 'The read is running.');
+  });
+}
+
+function finishCourseRead(message, metaText) {
+  const courseNote = document.getElementById('stCourseNote');
+  if (courseNote) courseNote.textContent = message;
+  const lateNote = document.getElementById('stLateNote');
+  if (lateNote) lateNote.textContent = message;
+  paintLateList(null, message);
+  document.querySelectorAll('#stCourseList .stCourse').forEach(el => {
+    const meta = el.querySelector('.stCourseMeta');
+    const busy = el.querySelector('.stBusy');
+    if (meta && meta.dataset.state !== 'done') {
+      meta.textContent = metaText || 'Could not read';
+      meta.dataset.state = 'done';
+      if (metaText === 'Could not read' || metaText === 'Needs a restart') meta.classList.add('bad');
+    }
+    if (busy) busy.textContent = message;
+  });
+}
+
+function paintCourseWork(live) {
+  const work = live && live.work;
+  if (!Array.isArray(work)) {
+    finishCourseRead(
+      'The read finished, and this Studio window does not have the late and missing list yet. Close CourseForge Studio and open it again, then reload this page.',
+      'Needs a restart');
+    return;
+  }
+  const byId = {};
+  work.forEach(row => { if (row && row.course_id != null) byId[String(row.course_id)] = row; });
+  const term = (live && live.term) || 'this term';
+  document.querySelectorAll('#stCourseList .stCourse').forEach(el => {
+    const meta = el.querySelector('.stCourseMeta');
+    const body = el.querySelector('.stCourseBody');
+    const row = byId[String(el.dataset.cid || '')];
+    const open = `<p><a href="#/c/${esc(el.dataset.cid)}/grade">Open the course</a></p>`;
+    if (meta) meta.dataset.state = 'done';
+    if (row && (row.items || []).length) el.open = true;
+    if (!row) {
+      if (meta) meta.textContent = 'Not in this term';
+      if (body) body.innerHTML = open + '<p class="muted">Late and missing work is read for this term.</p>';
+      return;
+    }
+    if (row.unread) {
+      if (meta) meta.textContent = 'Not read';
+      if (body) body.innerHTML = open + '<p class="muted">Submissions for this class were not read.</p>';
+      return;
+    }
+    if (row.error) {
+      if (meta) { meta.textContent = 'Could not read'; meta.classList.add('bad'); }
+      if (body) body.innerHTML = open + `<p class="err">${esc(row.error)}</p>`;
+      return;
+    }
+    const items = row.items || [];
+    const missing = items.filter(item => item.kind === 'missing').length;
+    const late = items.filter(item => item.kind === 'late').length;
+    if (meta) {
+      meta.textContent = workCount(missing, late);
+      meta.classList.toggle('bad', missing > 0);
+      meta.classList.toggle('warn', !missing && late > 0);
+    }
+    if (!body) return;
+    body.innerHTML = open + (items.length
+      ? `<ul class="stWork">${items.map(item => workItemHtml(item, el.dataset.cid)).join('')}</ul>`
+      : '<p class="muted">Nothing is late or missing.</p>');
+  });
+  const n = countLateRows(work);
+  const line = n
+    ? (n + (n === 1 ? ' item is' : ' items are') + ' late or missing for ' + term + '.')
+    : ('Nothing is late or missing for ' + term + '.');
+  const courseNote = document.getElementById('stCourseNote');
+  if (courseNote) courseNote.textContent = line;
+  const lateNote = document.getElementById('stLateNote');
+  if (lateNote) lateNote.textContent = line;
+  paintLateList(work);
+}
+
+function countLateRows(courses) {
+  let n = 0;
+  (courses || []).forEach(course => { n += (course.items || []).length; });
+  return n;
 }
 
 function paintStudentRisk(userId) {
@@ -685,11 +1023,65 @@ function paintStudentRisk(userId) {
     }).join('')}</ul>`;
 }
 
+/* The class list has its own read, so a slow quiz-extra pass cannot leave
+   every dropdown on "Waiting" with no sign of life. studentWorkOwned is set
+   once that read has started; the extras job must not paint over it. */
+let studentWorkOwned = false;
+
+async function watchJob(jobId, startedAt, onTick, still) {
+  const deadline = startedAt + 10 * 60 * 1000;
+  for (;;) {
+    if (still ? !still() : !courseStillHere()) return null;
+    if (Date.now() > deadline) {
+      const err = new Error('Stopped waiting after 10 minutes. Reload this page to try again.');
+      err.timedOut = true;
+      throw err;
+    }
+    const info = await api('/jobs/' + jobId);
+    if (still ? !still() : !courseStillHere()) return null;
+    if (onTick) onTick(info);
+    if (info.state === 'done' || info.state === 'error') return info;
+    await new Promise(resolve => setTimeout(resolve, 400));
+  }
+}
+
+async function paintStudentWork(userId, pageGen) {
+  const still = () => pageGen === studentPageGen && studentPageOpen();
+  studentWorkOwned = false;
+  const startedAt = Date.now();
+  setCourseBusy({ message: 'Starting the late and missing read' }, startedAt);
+  let started;
+  try {
+    started = await api('/student/' + encodeURIComponent(userId) + '/work',
+      { method: 'POST', body: {} });
+  } catch (err) {
+    if (!still()) return;
+    if (err && err.status === 404) return;
+    finishCourseRead(err.message || 'Could not start the read.', 'Could not read');
+    return;
+  }
+  if (!still()) return;
+  studentWorkOwned = true;
+  try {
+    const info = await watchJob(started.job, startedAt, step => setCourseBusy(step, startedAt), still);
+    if (!info || !still()) return;
+    if (info.state === 'error') {
+      finishCourseRead(info.error || 'The read failed.', 'Could not read');
+      return;
+    }
+    paintCourseWork(info.result || {});
+  } catch (err) {
+    if (courseStillHere()) finishCourseRead(err.message || 'The read failed.', 'Could not read');
+  }
+}
+
 /* Stays on this page. The old job dialog walked every course ever taught
    and covered the record while it counted. */
-async function paintStudentLive(userId) {
+async function paintStudentLive(userId, pageGen) {
   const box = $('#stLive');
   const extras = $('#stExtras');
+  const startedAt = Date.now();
+  const still = () => pageGen === studentPageGen && studentPageOpen();
   const paint = (live) => {
     if (!box || !extras || !live) return;
     const quizzes = live.quiz_extras || [];
@@ -717,21 +1109,75 @@ async function paintStudentLive(userId) {
   try {
     const started = await api('/student/' + encodeURIComponent(userId) + '/live',
       { method: 'POST', body: {} });
-    const id = started.job;
-    for (;;) {
-      const info = await api('/jobs/' + id);
-      if (box && info.message) box.textContent = info.message;
-      if (info.state === 'done') { paint(info.result || {}); return; }
-      if (info.state === 'error') {
-        if (box) box.textContent = info.error || 'Could not read extras. The rest of the page is still good.';
-        return;
-      }
-      await new Promise(resolve => setTimeout(resolve, 400));
+    const info = await watchJob(started.job, startedAt, step => {
+      if (box && step.message) box.textContent = step.message;
+      if (!studentWorkOwned) setCourseBusy(step, startedAt);
+    }, still);
+    if (!info || !still()) return;
+    if (info.state === 'error') {
+      if (box) box.textContent = info.error || 'Could not read extras. The rest of the page is still good.';
+      if (!studentWorkOwned) finishCourseRead(info.error || 'Could not read this class.', 'Could not read');
+      return;
     }
-  } catch (_) {
+    paint(info.result || {});
+    if (!studentWorkOwned) paintCourseWork(info.result || {});
+  } catch (err) {
     if (box) box.textContent = 'Could not read extras. The rest of the page is still good.';
+    if (!studentWorkOwned && courseStillHere()) {
+      finishCourseRead(err.message || 'Could not read this class.', 'Could not read');
+    }
+  }
+}
+
+let latePanelGen = 0;
+
+async function loadStudentLate(userId) {
+  const gen = ++latePanelGen;
+  const body = document.getElementById('stuLateBody');
+  const note = document.getElementById('stuLateNote');
+  if (!body) return;
+  const still = () => gen === latePanelGen && document.getElementById('stuLateBody') === body;
+  const startedAt = Date.now();
+  if (note) note.textContent = 'Reading each class…';
+  let started;
+  try {
+    started = await api('/student/' + encodeURIComponent(userId) + '/work',
+      { method: 'POST', body: {} });
+  } catch (err) {
+    if (!still()) return;
+    const message = err && err.status === 404
+      ? 'Close CourseForge Studio and open it again, then reload this page.'
+      : ((err && err.message) || 'Could not read late and missing work.');
+    if (note) note.textContent = err && err.status === 404 ? 'Needs a restart' : 'Could not read';
+    body.innerHTML = `<p class="muted">${esc(message)}</p>`;
+    return;
+  }
+  if (!still()) return;
+  try {
+    const info = await watchJob(started.job, startedAt, step => {
+      if (still()) setCourseBusy(step, startedAt);
+    }, still);
+    if (!info || !still()) return;
+    if (info.state === 'error') {
+      if (note) note.textContent = 'Could not read';
+      body.innerHTML = `<p class="err">${esc(info.error || 'The read failed.')}</p>`;
+      return;
+    }
+    const result = info.result || {};
+    const work = result.work || [];
+    const term = result.term || 'this term';
+    const n = countLateRows(work);
+    if (note) note.textContent = n
+      ? (n + (n === 1 ? ' item is' : ' items are') + ' late or missing for ' + term + '.')
+      : ('Nothing is late or missing for ' + term + '.');
+    body.innerHTML = lateListHtml(result.work || []);
+  } catch (err) {
+    if (!still()) return;
+    if (note) note.textContent = 'Could not read';
+    body.innerHTML = `<p class="err">${esc(err.message || 'The read failed.')}</p>`;
   }
 }
 
 window.openStudent = openStudent;
 window.openStudents = openStudents;
+window.loadStudentLate = loadStudentLate;

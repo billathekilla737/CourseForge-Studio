@@ -96,18 +96,14 @@
      only needs the body. Arriving straight on #/c/<cid>/docs/<kind> borrows
      a11y.js's chrome when it is loaded, and paints a plain head when it is
      not, so the area is never a blank screen. */
-  function openDocs(courseId, rest) {
+  async function openDocs(courseId, rest) {
     rest = Array.isArray(rest) ? rest : [];
     const kindId = docsKindOf(rest[0]) ? rest[0] : 'pptx';
     if (typeof openA11y === 'function') {
       return openA11y(courseId, [kindId].concat(rest.slice(1)));
     }
     showView('area');
-    crumbs([
-      { label: 'Courses', href: '#/' },
-      { label: (S.course && S.course.name) || 'Course', href: '#/c/' + courseId },
-      { label: 'Documents' },
-    ]);
+    await courseCrumbs(courseId, [{ label: 'Documents' }]);
     $('#headerActions').innerHTML = '';
     areaHead('Documents', 'Fetch, scan, fix, verify, upload. The originals are kept here.');
     areaTabs(DOCS_KINDS.map(k => ({ id: k.id, label: k.label, group: k.group, title: k.title })), kindId,

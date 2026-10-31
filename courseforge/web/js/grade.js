@@ -1999,10 +1999,11 @@ async function renderStorage() {
    is what you came back for most mornings; the rest of the courses and the
    four cross-course tools share the row underneath.
 
-   Everything on this screen is read off this machine. The counts beside a
-   course come from the assignment list already cached for it, so a course you
-   have never opened says so rather than the page making five Canvas calls to
-   tell you something you are about to click into anyway. */
+   Everything on this screen is read off this machine until Refresh from
+   Canvas. That button, and the Refresh button on To Do, re-read the course
+   list and the assignment lists for the term on screen. To Do is those
+   lists. A course you have never opened says so on a plain visit, rather
+   than the page making a Canvas call per course just to draw. */
 function homeListTools(on) {
   ['btnExpand', 'btnCollapse'].forEach(id => {
     const el = document.getElementById(id);
@@ -2034,17 +2035,23 @@ function setAllGlance(open) {
   try { localStorage.setItem('cg.glance', JSON.stringify(all)); } catch (_) { /* private mode */ }
 }
 
+/* Bumped by every home-list load and by Refresh from Canvas, so a slow
+   answer cannot paint over a newer one. */
+let homePaintSeq = 0;
+
 async function openCourses(refresh) {
+  const paintSeq = ++homePaintSeq;
   const tb = $('#teachBar'); if (tb) tb.classList.add('hidden');
   // The strip repaints before the new list arrives. Drop the previous
   // term's five so they do not sit under a different term's courses.
   S.behind = null;
+  S.regrade = null;
   showView('picker');
   crumbs([{ label: 'Courses' }]);
   $('#pickerTitle').textContent = 'Your courses';
   $('#pickerResume').innerHTML = '';
   homeListTools(true);
-  $('#btnRefresh').onclick = () => openCourses(true);
+  $('#btnRefresh').onclick = () => refreshHomeFromCanvas();
   $('#headerActions').innerHTML =
     '<a class="btn" href="#/schedule">Term schedule</a>'
     + '<button class="btn" id="btnToken" title="Replace the saved Canvas token">'
@@ -2084,12 +2091,151 @@ async function openCourses(refresh) {
     clearTimeout(slow);
     clearTimeout(kill);
   }
+  if (paintSeq !== homePaintSeq || S.homeRefreshing) return;
   try {
     paintHome(picked);
   } catch (err) {
     const msg = 'Could not draw the course list: ' + firstLine(err.message);
     $('#pickerHint').textContent = msg;
     setStatus(msg, 'err');
+    return;
+  }
+  if (!canvasDown) checkHomeStatus(paintSeq);
+}
+
+/* To Do is drawn from disk at once, then corrected behind it: the server asks
+   Canvas whether the listed work is still waiting (submission states only,
+   no files) for any course not checked in the last few minutes. Reads only.
+   Quiet, and the list is drawn again only when Canvas was actually asked. */
+async function checkHomeStatus(paintSeq) {
+  if (S.homeRefreshing || S.homeChecking) return;
+  S.homeChecking = true;
+  try {
+    let started;
+    try {
+      started = await api('/picker/status', { body: { term: S.term || '__all' } });
+    } catch (err) {
+      if (err && err.status === 404) return;      // an older server: nothing to do
+      throw err;
+    }
+    let info = null;
+    for (let i = 0; i < 600; i++) {
+      info = await api('/jobs/' + started.job);
+      if (!info || info.state !== 'running' || !homeStill(paintSeq)) break;
+      await new Promise(resolve => setTimeout(resolve, 700));
+    }
+    if (!homeStill(paintSeq) || S.homeRefreshing) return;
+    if (!info || info.state !== 'done' || !info.result) return;
+    const result = info.result;
+    if ((+result.checked || 0) > 0) paintHome(result);
+    if ((result.failed || []).length) {
+      setStatus('Could not check grading status in ' + result.failed[0].name, 'err');
+    }
+  } catch (err) {
+    if (homeStill(paintSeq)) setStatus('Could not check grading status: ' + firstLine(err.message), 'err');
+  } finally {
+    S.homeChecking = false;
+  }
+}
+
+/* Refresh from Canvas on the home page, and the Refresh button on To Do.
+   Both re-read the course list and the assignment lists for the term on
+   screen. To Do is those lists, so it changes only after this finishes.
+   Reads only. */
+function setHomeRefreshBusy(on) {
+  document.querySelectorAll('#btnRefresh, #behindRefresh').forEach(btn => {
+    btn.disabled = !!on;
+    if (on) btn.setAttribute('aria-busy', 'true');
+    else btn.removeAttribute('aria-busy');
+  });
+}
+
+function homeStill(paintSeq) {
+  return S.view === 'picker' && !(S.route && S.route.courseId) && paintSeq === homePaintSeq;
+}
+
+async function pollHomeJob(jobId, paintSeq) {
+  let info = null;
+  for (let i = 0; i < 600; i++) {
+    info = await api('/jobs/' + jobId);
+    if (!info || info.state !== 'running') break;
+    if (!homeStill(paintSeq)) return null;
+    if (info.message) setStatus(info.message);
+    await new Promise(resolve => setTimeout(resolve, 500));
+  }
+  if (!homeStill(paintSeq)) return null;
+  if (!info || info.state === 'error') throw new Error((info && info.error) || 'The refresh failed.');
+  if (info.state !== 'done') throw new Error('The refresh did not finish.');
+  return info.result || {};
+}
+
+/* A Studio window opened before /picker/refresh existed answers 404. The
+   per-course assignment refresh has been there the whole time, so use it
+   and then re-read To Do from what was just saved. */
+async function refreshTodoLists(paintSeq) {
+  const term = S.term || '__all';
+  const picked = await api('/picker?refresh=1');
+  if (!homeStill(paintSeq)) return null;
+  const courses = (picked.courses || []).filter(c =>
+    c && c.id && !c.excluded && (term === '__all' || (c.term_label || '') === term));
+  const failed = [];
+  for (let i = 0; i < courses.length; i++) {
+    if (!homeStill(paintSeq)) return null;
+    const course = courses[i];
+    const name = course.title || course.name || 'this course';
+    setStatus('Reading assignments in ' + name);
+    try {
+      const started = await api('/courses/' + encodeURIComponent(course.id) + '/hub/refresh',
+        { body: {} });
+      const out = await pollHomeJob(started.job, paintSeq);
+      if (out == null) return null;
+    } catch (err) {
+      if (!homeStill(paintSeq)) return null;
+      failed.push({ name: name, error: firstLine(err.message) });
+    }
+  }
+  if (!homeStill(paintSeq)) return null;
+  const again = await api('/picker');
+  again.failed = failed;
+  return again;
+}
+
+function reportHomeRefresh(result) {
+  const failed = (result && result.failed) || [];
+  if (failed.length === 1) {
+    setStatus('Refreshed from Canvas. Could not read ' + failed[0].name + '.', 'err');
+  } else if (failed.length) {
+    setStatus('Refreshed from Canvas. ' + failed.length + ' courses could not be read.', 'err');
+  } else {
+    setStatus('Refreshed from Canvas', 'ok');
+  }
+}
+
+async function refreshHomeFromCanvas() {
+  if (S.homeRefreshing) return;
+  if (S.view !== 'picker' || (S.route && S.route.courseId)) return;
+  const paintSeq = ++homePaintSeq;
+  S.homeRefreshing = true;
+  setHomeRefreshBusy(true);
+  setStatus('Refreshing from Canvas…');
+  try {
+    let result;
+    try {
+      const started = await api('/picker/refresh', { body: { term: S.term || '__all' } });
+      result = await pollHomeJob(started.job, paintSeq);
+    } catch (err) {
+      if (!(err && err.status === 404)) throw err;
+      result = await refreshTodoLists(paintSeq);
+    }
+    if (result == null || !homeStill(paintSeq)) return;
+    if (result.error && !result.courses) throw new Error(result.error);
+    paintHome(result);
+    reportHomeRefresh(result);
+  } catch (err) {
+    if (paintSeq === homePaintSeq) setStatus(firstLine(err.message), 'err');
+  } finally {
+    S.homeRefreshing = false;
+    setHomeRefreshBusy(false);
   }
 }
 
@@ -2128,6 +2274,7 @@ function paintHome(picked) {
     : '<p class="hint">No courses in this term.</p>';
   wireCourseTools($('#pickerBody'));
   S.behind = behindShown(picked.behind);
+  S.regrade = inTermRows(picked.regrade);
   if (typeof renderBehind === 'function') renderBehind($('#pickerStrip'), S.behind);
 
   renderStorage();
@@ -2137,12 +2284,17 @@ function paintHome(picked) {
 /* The server ranks past-due work by days, not by how many are waiting.
    This screen shows five, and only for the term on screen. */
 function behindShown(rows) {
+  return inTermRows(rows).slice(0, 5);
+}
+
+/* To Do rows for the courses in the term on screen. */
+function inTermRows(rows) {
   const all = Array.isArray(rows) ? rows : [];
-  if (S.term === '__all') return all.slice(0, 5);
+  if (S.term === '__all') return all;
   const ids = new Set((S.courses || [])
     .filter(c => (c.term_label || '') === S.term)
     .map(c => String(c.id)));
-  return all.filter(row => ids.has(String(row.course_id))).slice(0, 5);
+  return all.filter(row => ids.has(String(row.course_id)));
 }
 
 function courseCount(list) {
@@ -2336,8 +2488,10 @@ async function openCourse(courseId, refresh) {
   if (!S.courses.some(c => String(c.id) === String(courseId)) && typeof ensureCourse === 'function') {
     try { await ensureCourse(courseId); } catch (_) { /* the fallback name below */ }
   }
-  S.course = S.courses.find(c => String(c.id) === String(courseId)) || { id: courseId, name: 'Course ' + courseId };
-  crumbs([{ label: 'Courses', href: '#/' }, { label: courseTitle(S.course), href: '#/c/' + courseId }, { label: 'Grade' }]);
+  S.course = (S.course && String(S.course.id) === String(courseId) && S.course.name)
+    ? S.course
+    : (S.courses.find(c => String(c.id) === String(courseId)) || { id: courseId, name: 'Course ' + courseId });
+  await courseCrumbs(courseId, [{ label: 'Grade' }]);
   $('#headerActions').innerHTML = '';
   $('#pickerTitle').textContent = courseTitle(S.course);
   $('#pickerTitle').title = S.course.name || '';
@@ -2351,9 +2505,51 @@ async function openCourse(courseId, refresh) {
     $('#pickerHint').textContent = firstLine(err.message);
     return;
   }
-  const waiting = S.assignments.reduce((a, x) => a + (x.graded ? 0 : (+x.needs_grading || 0)), 0);
+  paintAssignments(courseId);
+  checkCourseStatus(courseId, !!refresh);
+}
+
+const onAssignmentList = cid => S.view === 'picker' && S.route
+  && String(S.route.courseId) === String(cid) && S.route.areaId === 'grade';
+
+/* Whether each assignment is graded, asked of Canvas behind the list: the
+   submission states only, no files, and skipped when this course was checked
+   in the last few minutes. Refresh asks regardless. Reads only. */
+async function checkCourseStatus(courseId, force) {
+  if (S.health && S.health.canvas && S.health.canvas.ok === false) return;
+  let info = null;
+  try {
+    const { job } = await api(`/courses/${courseId}/grade-status`, { body: { force: !!force } });
+    for (let i = 0; i < 240; i++) {
+      info = await api('/jobs/' + job);
+      if (!info || info.state !== 'running' || !onAssignmentList(courseId)) break;
+      await new Promise(resolve => setTimeout(resolve, 600));
+    }
+  } catch (err) {
+    if (err && err.status === 404) return;
+    if (onAssignmentList(courseId)) setStatus('Could not check grading status: ' + firstLine(err.message), 'err');
+    return;
+  }
+  if (!onAssignmentList(courseId) || !info) return;
+  if (info.state === 'error') {
+    setStatus('Could not check grading status: ' + firstLine(info.error), 'err');
+    return;
+  }
+  const result = info.result || {};
+  if (info.state !== 'done' || !(+result.checked > 0) || !Array.isArray(result.assignments)) return;
+  S.assignments = result.assignments;
+  paintAssignments(courseId);
+}
+
+/* Submissions still to grade: the status check's count, else Canvas's own. */
+const waitingOf = a => +(a.waiting != null ? a.waiting : a.needs_grading) || 0;
+
+function paintAssignments(courseId) {
+  const waiting = S.assignments.reduce((a, x) => a + (x.graded ? 0 : waitingOf(x)), 0);
+  const checked = S.assignments.map(x => x.status_checked_at).filter(Boolean).sort().pop();
   $('#pickerHint').textContent = `${S.assignments.length} assignments`
-    + (waiting ? ` · ${waiting} submission${waiting === 1 ? '' : 's'} waiting to grade` : '');
+    + (waiting ? ` · ${waiting} submission${waiting === 1 ? '' : 's'} waiting to grade` : '')
+    + (checked ? ` · checked with Canvas ${fmtDate(checked)}` : '');
   $('#pickerBody').innerHTML = `<table class="asgTable"><thead><tr>
       <th>Assignment</th><th>Due</th><th class="tg">To grade</th>
       <th style="text-align:right">Points</th>
@@ -2365,9 +2561,15 @@ async function openCourse(courseId, refresh) {
         <td style="color:var(--muted)">${esc(fmtDate(a.due_at) || '—')}</td>
         <td class="tg">${a.graded
       ? '<span class="pill good gradedMark">Graded</span>'
-      : (a.needs_grading
-      ? `<span class="tgBadge" title="${a.needs_grading} submission(s) Canvas says are waiting">${
-          a.needs_grading}</span>`
+      : (+a.resubmitted && !waitingOf(a))
+      ? `<span class="pill warn" title="Graded, then ${a.resubmitted} student(s) handed in again${
+          a.resubmitted_since ? ' since ' + esc(fmtDate(a.resubmitted_since)) : ''}. Needs review.">Graded · ${
+          a.resubmitted} resubmitted</span>`
+      : (waitingOf(a)
+      ? `<span class="tgBadge" title="${waitingOf(a)} submission(s) waiting to grade${
+          a.status_checked_at ? '' : ', by Canvas\'s count'}">${waitingOf(a)}</span>${
+          +a.resubmitted ? ` <span class="pill warn" title="${a.resubmitted} handed in again after grading">+${
+            a.resubmitted} resubmitted</span>` : ''}`
       : '<span class="muted">—</span>')}</td>
         <td class="num">${a.points_possible ?? '—'}</td>
         <td>${a.has_rubric ? '<span class="pill good">rubric</span>' : '<span class="pill warn">none</span>'}</td>
@@ -2461,12 +2663,11 @@ async function openAssignment(courseId, assignmentId, opts = {}) {
   setStatus('');
   const a = S.ws.assignment || {};
   S.assignment = a;
-  crumbs([
-    { label: 'Courses', href: '#/' },
-    { label: courseTitle(S.course), href: '#/c/' + courseId + '/grade' },
-    { label: a.name || 'Assignment' },
-  ]);
-  document.title = (a.name || 'Assignment') + ' · CourseForge Studio';
+  const assignmentName = a.name
+    || ((S.assignments || []).find(row => String(row.id) === String(assignmentId)) || {}).name
+    || 'Assignment';
+  await courseCrumbs(courseId, [{ label: assignmentName }], '#/c/' + courseId + '/grade');
+  document.title = assignmentName + ' · ' + courseTitle(S.course) + ' · CourseForge Studio';
   renderHeaderActions();
   S.sel = 0;
   render();
@@ -2580,13 +2781,15 @@ function gradesLiveLine(n) {
   return `${n} grade${n === 1 ? '' : 's'} live`;
 }
 /* Every turned-in submission has a finished Canvas score. An automatic
-   score with the written answers still open does not count. */
+   score with the written answers still open does not count, and nor does a
+   score given to an attempt the student has since replaced. */
 function gradingFinished(ws) {
   const people = Object.values((ws && ws.extracted) || {}).filter(s => s && typeof s === 'object');
   const submitted = people.filter(s => s.status && s.status !== 'unsubmitted'
     || (s.quiz_review && s.quiz_review.length));
   if (!submitted.length) return false;
-  return submitted.every(s => !writtenOpen(s) && s.canvas_score != null);
+  return submitted.every(s => !writtenOpen(s) && s.canvas_score != null
+    && !isResubmission(s));
 }
 function paintGradedStamp() {
   const host = $('#viewWork');
@@ -2656,13 +2859,26 @@ async function resolveConflicts(uids, choice) {
   } catch (err) { setStatus('could not resolve: ' + err.message, 'err'); }
 }
 
+const hasBlendFile = st => !!st && (st.filenames || []).some(f => /\.blend1?$/i.test(f));
+const blenderFound = () => !!(S.health && S.health.blender && S.health.blender.ok);
+
+/* The Blender pass, for the whole class or only the students given. Minutes
+   of rendering per file, so picking the few who need it is worth the clicks.
+   Finished renders are reused either way. */
+function doBlend(ids) {
+  const only = ids && ids.length ? ids.map(String) : null;
+  runJob(only ? `Reading .blend files with Blender for ${only.length} student${only.length === 1 ? '' : 's'}`
+              : 'Reading .blend files with Blender',
+    () => api(`/a/${S.ids.courseId}/${S.ids.assignmentId}/blend`, { body: only ? { only } : {} }),
+    () => openAssignment(S.ids.courseId, S.ids.assignmentId));
+}
+
 function renderHeaderActions() {
   const synced = !!(S.ws.draft && S.ws.draft.synced_at);
   const canAI = !(S.health.claude && S.health.claude.logged_in === false);
   const models = S.health.models || [S.health.model];
-  const hasBlend = Object.values(S.ws.extracted || {}).some(
-    st => (st.filenames || []).some(f => /\.blend1?$/i.test(f)));
-  const blenderOk = !!(S.health.blender && S.health.blender.ok);
+  const hasBlend = Object.values(S.ws.extracted || {}).some(hasBlendFile);
+  const blenderOk = blenderFound();
   // Chasing missing work only makes sense once the deadline has gone.
   const dueAt = (S.ws.assignment || {}).due_at;
   const pastDue = !!(dueAt && new Date(dueAt).getTime() < Date.now());
@@ -2673,6 +2889,8 @@ function renderHeaderActions() {
   $('#headerActions').innerHTML = `
     <span class="tbGroup"><span class="tbTag">Get</span>
       <button class="btn" id="btnSync">${synced ? 'Re-sync' : 'Sync from Canvas'}</button>
+      ${synced ? `<button class="btn" id="btnFolder"
+        title="Where the downloaded files are on this computer, by term, class and assignment">Files folder</button>` : ''}
       ${hasBlend ? `<button class="btn" id="btnBlend" ${blenderOk ? '' : 'disabled'}
         title="${blenderOk ? 'Open every .blend in Blender and extract stats, renders and a 3D preview'
                            : 'Blender was not found on this machine'}">Blender pass</button>` : ''}
@@ -2708,14 +2926,14 @@ Where every submission has images, this is the model that grades the whole class
       <button class="btn" id="btnExport" ${synced ? '' : 'disabled'}
         title="Write every grade, rubric score and comment to a spreadsheet in this assignment's folder on this computer. Nothing leaves the machine">Export grades</button>
     </span>`;
-  $('#btnSync').onclick = doSync;
+  $('#btnSync').onclick = () => doSync();
+  const bf = $('#btnFolder');
+  if (bf) bf.onclick = showFilesFolder;
   $('#btnGrade').onclick = () => doGrade(null);
   $('#selModel').onchange = ev => setModel(ev.target.value);
   $('#selVision').onchange = ev => setModel(ev.target.value, 'vision_model');
   const bb = $('#btnBlend');
-  if (bb) bb.onclick = () => runJob('Reading .blend files with Blender',
-    () => api(`/a/${S.ids.courseId}/${S.ids.assignmentId}/blend`, { body: {} }),
-    () => openAssignment(S.ids.courseId, S.ids.assignmentId));
+  if (bb) bb.onclick = () => doBlend(null);
   $('#btnCharts').onclick = () => {
     S.view = S.view === 'insights' ? 'grade' : 'insights';
     renderHeaderActions(); render();
@@ -2870,8 +3088,16 @@ function staleSync(ws) {
 
 function doSync(opts = {}) {
   const { courseId, assignmentId } = S.ids;
-  runJob('Syncing from Canvas', () => api(`/a/${courseId}/${assignmentId}/sync`, { body: {} }),
-    () => {
+  // Re-sync asks about large files again, even after an earlier "skip". The
+  // sync on opening an assignment keeps that earlier answer.
+  const large = opts.large || (opts.auto ? null : 'ask');
+  runJob('Syncing from Canvas',
+    () => api(`/a/${courseId}/${assignmentId}/sync`, { body: large ? { large } : {} }),
+    result => {
+      if (result && result.download_check) {
+        if (S.ids && S.ids.assignmentId === assignmentId) askLargeDownload(result.download_check, opts);
+        return;
+      }
       openAssignment(courseId, assignmentId);
       if (opts.auto) {
         setStatus('synced from Canvas just now', 'ok');
@@ -2883,6 +3109,42 @@ function doSync(opts = {}) {
     },
     { autoClose: !!opts.auto });
 }
+const sizeText = n => (+n >= 1e9 ? (+n / 1e9).toFixed(1) + ' GB' : Math.round((+n || 0) / 1e6) + ' MB');
+
+/* The sync sized the files first and found more than download_confirm_mb to
+   fetch. Say how much, from how many students, and let the instructor choose:
+   everything, everything but the files over the limit, or nothing for now. */
+function askLargeDownload(info, opts = {}) {
+  const n = +info.files || 0, who = +info.students || 0, over = +info.over_limit || 0;
+  const free = info.free_bytes == null ? null : +info.free_bytes;
+  const fits = free == null || free > (+info.bytes || 0) + 256e6;
+  const keep = (+info.bytes || 0) - (+info.over_limit_bytes || 0);
+  openModal(`<h3>${esc(sizeText(info.bytes))} to download</h3>
+    <p>${n} file${n === 1 ? '' : 's'} across ${who} student${who === 1 ? '' : 's'}'
+      submissions${info.assignment_name ? ' for <b>' + esc(info.assignment_name) + '</b>' : ''}.
+      The largest is ${esc(sizeText(info.largest))}.${over ? ` ${over} ${over === 1 ? 'is' : 'are'}
+      over ${esc(sizeText(info.limit_bytes))}, ${esc(sizeText(info.over_limit_bytes))} together.` : ''}</p>
+    ${free == null ? '' : `<p class="hint">Free on this computer: ${esc(sizeText(free))}.${
+      fits ? '' : ' Not enough to download everything.'}</p>`}
+    <p class="hint">Videos are only for you to watch here; they are never sent to Claude.
+      A skipped file stays listed on the student's card, and Re-sync asks again.</p>
+    <div class="foot"><span class="spacer"></span>
+      <button class="btn" id="dlCancel" type="button">Not now</button>
+      ${over ? `<button class="btn" id="dlSkip" type="button">${over === n
+        ? `Skip ${n === 1 ? 'it' : 'all ' + n}`
+        : `Skip the ${over} over ${esc(sizeText(info.limit_bytes))}, download ${esc(sizeText(keep))}`}</button>` : ''}
+      <button class="btn primary" id="dlAll" type="button" ${fits ? '' : 'disabled'}>Download all ${
+        esc(sizeText(info.bytes))}</button>
+    </div>`, { label: 'Large download' });
+  $('#dlCancel').onclick = () => {
+    closeModal();
+    setStatus('sync stopped before downloading; nothing changed', 'ok');
+  };
+  const skip = $('#dlSkip');
+  if (skip) skip.onclick = () => { closeModal(); doSync({ ...opts, large: 'skip' }); };
+  $('#dlAll').onclick = () => { closeModal(); doSync({ ...opts, large: 'all' }); };
+}
+
 /* Which model reads a submission that has pictures in it. Falls back to the
    grading model, which is what the server does when the setting is empty. */
 function visionModel() {
@@ -2933,6 +3195,44 @@ function doExport() {
     .catch(err => setStatus('export failed: ' + firstLine(err.message), 'err'));
 }
 
+/* The files live in data/<course id>/<assignment id>/files. data/Browse holds a
+   shortcut to that folder under the term, class and assignment names. */
+function showFilesFolder() {
+  const { courseId, assignmentId } = S.ids;
+  const url = `/a/${courseId}/${assignmentId}/folder`;
+  api(url, { body: {} }).then(r => {
+    const shown = r.folder || r.files;
+    const host = $('#modalHost');
+    host.innerHTML = `<div class="modalBack"><div class="modal narrow">
+        <h3>Files folder</h3>
+        <div class="sub">${r.shortcut
+          ? `<b>${esc(r.label)}</b> is a shortcut to this assignment's downloaded
+             files, named by term, class and assignment. Deleting the shortcut never
+             deletes the files.`
+          : `This assignment's downloaded files, one folder per student
+             (<b>number - Last, First</b>). The class and assignment folders are
+             named the same way, number first.`}</div>
+        <label class="annLabel">Where it is
+          <input type="text" id="ffPath" readonly value="${esc(shown)}"></label>
+        <div class="foot">
+          <button class="btn primary" id="ffOpen">Open in File Explorer</button>
+          <button class="btn" id="ffCopy">Copy the path</button>
+          <span class="spacer"></span>
+          <button class="btn" id="ffClose">Close</button>
+        </div></div></div>`;
+    $('#ffClose').onclick = () => { host.innerHTML = ''; };
+    $('#ffOpen').onclick = () => api(url, { body: { open: true } })
+      .then(o => setStatus(o.opened ? 'opened in File Explorer' : 'could not open the folder', o.opened ? 'ok' : 'err'))
+      .catch(err => setStatus('could not open: ' + firstLine(err.message), 'err'));
+    $('#ffCopy').onclick = () => {
+      $('#ffPath').select();
+      navigator.clipboard.writeText(shown)
+        .then(() => setStatus('folder path copied', 'ok'))
+        .catch(() => setStatus('could not copy; the path is selected, press Ctrl+C', 'err'));
+    };
+  }).catch(err => setStatus('could not find the folder: ' + firstLine(err.message), 'err'));
+}
+
 function showExported(r) {
   const folder = String(r.csv || '').replace(/[\\/][^\\/]*$/, '');
   const host = $('#modalHost');
@@ -2978,12 +3278,20 @@ function openInstructions() {
         how strictly to treat length floors. These override the rubric where they conflict.
         They also override the syllabus late penalty: “ignore late grades for this assignment”
         lifts it for the class, and “ignore Jane Doe’s tardy submission” lifts it for that student only.
-        Saving applies that to grades already on this screen. You do not have to re-grade.</div>
-      <textarea class="instructions" id="instrText" placeholder="e.g. Ignore late grades for this assignment. Or: ignore Jane Doe’s tardy submission — do not dock points for it.">${esc(S.ws.instructions || '')}</textarea>
+        Type @ to name a student in this class. Saving applies that to grades already on this screen.
+        You do not have to re-grade.</div>
+      <div class="asstBox">
+        <textarea class="instructions" id="instrText" role="combobox" aria-expanded="false"
+          aria-autocomplete="list" aria-controls="instrMention"
+          placeholder="Type @ for a student. Ignore late grades for this assignment, or ignore one student's tardy submission.">${esc(S.ws.instructions || '')}</textarea>
+        <ul class="asstMention" id="instrMention" role="listbox" hidden
+          aria-label="Students in this class"></ul>
+      </div>
       <div class="foot">
         <button class="btn" id="instrCancel">Cancel</button>
         <button class="btn primary" id="instrSave">Save</button>
       </div></div></div>`;
+  wireInstructionMentions(courseId);
   $('#instrCancel').onclick = () => { host.innerHTML = ''; };
   $('#instrSave').onclick = async () => {
     const text = $('#instrText').value;
@@ -2996,6 +3304,137 @@ function openInstructions() {
       setStatus(n ? `instructions saved — late penalty changed for ${n}` : 'instructions saved', 'ok');
     } catch (err) { setStatus('save failed: ' + err.message, 'err'); }
   };
+}
+
+/* @ in the instructions box, the same offer the Assistant composer makes.
+   Picking a name puts that student's spelling in the text. The grader swaps
+   it for a tag before the text is sent. */
+const INSTR_MENTION = /@([\p{L}][\p{L}'\-. ]{0,28}|)$/u;
+
+function instructionPeople() {
+  const extracted = (S.ws && S.ws.extracted) || {};
+  return Object.values(extracted).filter(s => s && (s.name || s.user_id)).map(s => ({
+    user_id: s.user_id,
+    name: s.name || '',
+    sortable: s.sortable_name || '',
+    tag: s.pseudonym || '',
+  }));
+}
+
+function mentionRank(people, query) {
+  const q = String(query || '').trim().toLowerCase();
+  const labeled = p => [p.name, p.sortable, typeof studentLabel === 'function' ? studentLabel(p) : ''].join(' ');
+  if (!q) return people.slice().sort((a, b) => labeled(a).localeCompare(labeled(b))).slice(0, 8);
+  const scored = [];
+  for (const p of people) {
+    const name = labeled(p).toLowerCase();
+    const words = name.split(/\s+/);
+    let rank = null;
+    if (name.startsWith(q)) rank = 0;
+    else if (words.some(w => w.startsWith(q))) rank = 1;
+    else if (name.includes(q)) rank = 2;
+    if (rank != null) scored.push([rank, name, p]);
+  }
+  scored.sort((a, b) => (a[0] - b[0]) || a[1].localeCompare(b[1]));
+  return scored.slice(0, 8).map(row => row[2]);
+}
+
+function wireInstructionMentions(courseId) {
+  const box = $('#instrText');
+  const list = $('#instrMention');
+  if (!box || !list) return;
+  const state = { open: false, hits: [], pick: 0, from: 0, to: 0, people: instructionPeople() };
+  const close = () => {
+    state.open = false;
+    list.hidden = true;
+    list.innerHTML = '';
+    box.setAttribute('aria-expanded', 'false');
+    box.removeAttribute('aria-activedescendant');
+  };
+  const sync = () => {
+    const caret = box.selectionStart;
+    const match = state.people.length ? INSTR_MENTION.exec(box.value.slice(0, caret)) : null;
+    if (!match) { close(); return; }
+    const hits = mentionRank(state.people, match[1] || '');
+    state.from = caret - match[0].length;
+    state.to = caret;
+    state.hits = hits;
+    state.pick = 0;
+    state.open = true;
+    box.setAttribute('aria-expanded', 'true');
+    if (!hits.length) {
+      list.hidden = false;
+      list.innerHTML = `<li class="asstMentionNone" role="option" aria-disabled="true">
+        Nobody in this class matches "${esc(match[1] || '')}".</li>`;
+      return;
+    }
+    list.hidden = false;
+    list.innerHTML = hits.map((p, i) => `<li role="option" data-i="${i}" id="instrMention-${i}"
+      aria-selected="${i === 0}">${esc(typeof studentLabel === 'function' ? studentLabel(p) : p.name)}</li>`).join('');
+    list.querySelectorAll('[data-i]').forEach(li => {
+      li.onmousedown = ev => { ev.preventDefault(); take(+li.dataset.i); };
+    });
+    box.setAttribute('aria-activedescendant', 'instrMention-0');
+  };
+  const take = index => {
+    const person = state.hits[index == null ? state.pick : index];
+    if (!person) { close(); return; }
+    const shown = typeof studentLabel === 'function' ? (studentLabel(person) || person.name) : person.name;
+    const head = box.value.slice(0, state.from);
+    const tail = box.value.slice(state.to);
+    const insert = shown + (tail.startsWith(' ') ? '' : ' ');
+    box.value = head + insert + tail;
+    const caret = head.length + insert.length;
+    box.setSelectionRange(caret, caret);
+    close();
+    box.focus();
+    setStatus(person.tag ? (shown + ' goes to the grader as ' + person.tag) : shown, 'ok');
+  };
+  box.oninput = sync;
+  box.onclick = sync;
+  box.onkeyup = ev => { if (ev.key === 'ArrowLeft' || ev.key === 'ArrowRight') sync(); };
+  box.onblur = () => setTimeout(close, 120);
+  box.onkeydown = ev => {
+    if (!state.open) return;
+    if (ev.key === 'ArrowDown' || ev.key === 'ArrowUp') {
+      ev.preventDefault();
+      if (!state.hits.length) return;
+      const step = ev.key === 'ArrowDown' ? 1 : -1;
+      state.pick = (state.pick + step + state.hits.length) % state.hits.length;
+      list.querySelectorAll('[data-i]').forEach(li => {
+        li.setAttribute('aria-selected', String(+li.dataset.i === state.pick));
+      });
+      box.setAttribute('aria-activedescendant', 'instrMention-' + state.pick);
+    } else if (ev.key === 'Escape') {
+      ev.preventDefault();
+      close();
+    } else if ((ev.key === 'Enter' || ev.key === 'Tab') && state.hits.length) {
+      ev.preventDefault();
+      take();
+    }
+  };
+  const fill = rows => {
+    if (rows && rows.length) {
+      const known = {};
+      state.people.forEach(p => { if (p.name) known[p.name] = p; });
+      state.people = rows.map(p => {
+        const prior = known[p.name] || {};
+        return {
+          user_id: p.user_id || prior.user_id || '',
+          name: p.name || prior.name || '',
+          sortable: p.sortable || prior.sortable || '',
+          tag: p.tag || prior.tag || '',
+        };
+      });
+    }
+    sync();
+  };
+  if (typeof loadNicks === 'function') {
+    loadNicks().then(() => fill(state.people)).catch(() => {});
+  }
+  api('/assistant/' + encodeURIComponent(courseId) + '/roster')
+    .then(out => fill(out && out.students))
+    .catch(() => fill(state.people));
 }
 
 /* ------------------------------------------------------------------- ask */
@@ -3089,6 +3528,350 @@ function openAsk(student) {
     if (ev.key === 'Enter' && (ev.metaKey || ev.ctrlKey)) { ev.preventDefault(); ask(); }
   });
   $('#askText').focus();
+}
+
+/* --------------------------------------------------------- overlap flags */
+/* Grading measures the whole class for near-identical work on its own. A
+   student it marks stays marked here, and out of a push, until you look. */
+function overlapFlags() {
+  return ((S.ws && S.ws.draft) || {}).overlap_flags || {};
+}
+function overlapHeld(uid) {
+  const flags = overlapFlags(), key = String(uid);
+  if ((flags.reviewed || {})[key]) return [];
+  return (flags.students || {})[key] || [];
+}
+function overlapMatchName(m) {
+  const row = (S.ws.extracted || {})[String(m.with)];
+  return row ? studentLabel(row) : (m.with_name || 'another student');
+}
+function sharePct(x) { return Math.round(100 * (+x || 0)) + '%'; }
+
+/* Every student's strongest match, measured with no one asking: red holds a
+   push, yellow is worth a look, green is a little shared wording. Nothing
+   shared means no flag at all. The percent is always printed beside the
+   colour, so the colour is never the only signal. */
+const OV_WORDS = { red: 'High overlap', yellow: 'Overlap worth a look', green: 'Low overlap' };
+function overlapLevel(uid) {
+  return (overlapFlags().levels || {})[String(uid)] || null;
+}
+function ovHow(m) {
+  return m && m.method === 'code' ? ' (same code, names changed)' : '';
+}
+function ovMark(uid) {
+  const lv = overlapLevel(uid);
+  if (!lv) return '';
+  return `<span class="ovMark ${esc(lv.level)}" title="${esc(OV_WORDS[lv.level] || 'Overlap')}: ${
+    esc(sharePct(lv.containment))} matches ${esc(overlapMatchName(lv))}${esc(ovHow(lv))}">${
+    esc(sharePct(lv.containment))}</span>`;
+}
+function ovTag(s) {
+  const lv = overlapLevel(s.user_id);
+  if (!lv) return '';
+  return `<button type="button" class="tag ovTag ${esc(lv.level)}" id="ovTag"
+      title="See this work beside ${esc(overlapMatchName(lv))}'s, with the matching wording highlighted">${
+    esc(OV_WORDS[lv.level] || 'Overlap')} · ${esc(sharePct(lv.containment))} with ${
+    esc(overlapMatchName(lv))}${lv.method === 'code' ? ' · code' : ''}</button>`;
+}
+
+async function doOverlapChecked(ids, checked) {
+  const { courseId, assignmentId } = S.ids;
+  try {
+    const r = await api(`/a/${courseId}/${assignmentId}/overlap_checked`,
+      { body: { only: ids.map(String), checked } });
+    S.ws.draft.overlap_flags = r.overlap_flags;
+    const n = (r.changed || []).length;
+    setStatus(checked
+      ? `overlap checked for ${n} — ${n === 1 ? 'it' : 'they'} can be pushed now`
+      : 'overlap flag put back', 'ok');
+    render();
+  } catch (err) { setStatus('could not mark: ' + err.message, 'err'); }
+}
+
+function overlapBox(s) {
+  const flags = overlapFlags(), key = String(s.user_id);
+  const matches = (flags.students || {})[key] || [];
+  if (!matches.length) return '';
+  const mark = (flags.reviewed || {})[key];
+  const list = matches.map(m => `<li><b>${esc(sharePct(m.containment))}</b> of the
+      ${m.method === 'code' ? 'code' : 'wording'} matches <b>${esc(overlapMatchName(m))}</b>${
+        m.method === 'code'
+          ? ` · the same program with names changed${m.longest_lines
+            ? `, longest run ${num(m.longest_lines)} lines` : ''}`
+          : (m.longest_words ? ` · longest identical run ${num(m.longest_words)} words` : '')}${m.watched
+        ? ' · <i>a pair you named in a note, so it is flagged at a lower bar</i>' : ''}</li>`).join('');
+  if (mark) {
+    return `<div class="callout overlapFlag done">Overlap checked by you
+      ${esc(fmtDate(mark.at) || '')}.<ul>${list}</ul>
+      <div class="actionRow" style="margin:6px 0 0">
+        <button class="btn sm" id="ovUndo">Put the flag back</button></div></div>`;
+  }
+  const quote = (matches[0].passage || '').slice(0, 260);
+  return `<div class="callout bad overlapFlag"><b>This submission matches another student's.</b>
+      Found automatically when the class was measured. It is overlap, not a finding:
+      look at the two side by side and decide. Push skips this student until you
+      mark it checked.
+      <ul>${list}</ul>
+      ${quote ? `<div class="ovQuote">“${esc(quote)}${(matches[0].passage || '').length > 260 ? '…' : ''}”</div>` : ''}
+      <div class="actionRow" style="margin:10px 0 0">
+        <button class="btn sm" id="ovCompare">Compare with ${esc(overlapMatchName(matches[0]))}</button>
+        <button class="btn sm" id="ovNote">Add a note…</button>
+        <button class="btn sm" id="ovOk">Mark overlap checked</button>
+      </div></div>`;
+}
+
+/* A pair named in a note is measured on every assignment both turned in.
+   When it is flagged the red box above already says so; otherwise this says
+   what was found, which is usually "nothing this time". */
+function watchingBox(s) {
+  const rows = (overlapFlags().watching || {})[String(s.user_id)] || [];
+  const quiet = rows.filter(m => !m.flagged);
+  if (!quiet.length) return '';
+  return `<div class="callout watchPair"><b>Watching this pair.</b> Your note names
+      ${quiet.length === 1 ? 'this student and ' + esc(overlapMatchName(quiet[0])) : 'these pairs'},
+      so they are measured against each other on every assignment.
+      <ul>${quiet.map(m => `<li>${esc(overlapMatchName(m))}: ${m.containment
+        ? `<b>${esc(sharePct(m.containment))}</b> of the wording shared${m.longest_words
+          ? `, longest identical run ${num(m.longest_words)} words` : ''}. Below the bar for a flag.`
+        : 'nothing shared on this assignment.'}
+        <button class="btn sm" data-wcmp="${esc(m.with)}">Compare</button></li>`).join('')}</ul></div>`;
+}
+
+/* ---------------------------------------------------------- side by side */
+/* Two submissions next to each other, the wording they share highlighted
+   where it sits. Grey is what the whole class shares (the prompt, a
+   template): left out of the percentage, but shown so nothing is hidden. */
+/* Three layers, strongest on top: word for word, then the same code under
+   other names, then what the whole class has. Each character takes the
+   strongest layer it is in, so one never hides another's edges. */
+function markedText(text, side) {
+  const layer = new Uint8Array(text.length), run = new Int32Array(text.length).fill(-1);
+  const paint = (ranges, code) => (ranges || []).forEach((r, i) => {
+    for (let c = r.start; c < r.end && c < text.length; c++) {
+      if (layer[c] < code) { layer[c] = code; run[c] = i; }
+    }
+  });
+  paint(side.common, 1);
+  paint(side.similar, 2);
+  paint(side.shared, 3);
+  let out = '';
+  for (let c = 0; c < text.length;) {
+    let e = c;
+    while (e < text.length && layer[e] === layer[c] && run[e] === run[c]) e++;
+    const piece = esc(text.slice(c, e)), i = run[c];
+    if (layer[c] === 3) {
+      const r = side.shared[i];
+      out += `<mark class="ovHit" data-kind="shared" data-run="${i}" data-peer="${r.peer == null ? '' : r.peer}"
+          tabindex="0" title="${r.words} words match exactly. Click to find them on the other side.">${piece}</mark>`;
+    } else if (layer[c] === 2) {
+      const r = side.similar[i];
+      out += `<mark class="ovSim" data-kind="similar" data-run="${i}" data-peer="${r.peer == null ? '' : r.peer}"
+          tabindex="0" title="${r.lines} ${r.lines === 1 ? 'line' : 'lines'} of the same code with different names. Click to find it on the other side.">${piece}</mark>`;
+    } else if (layer[c] === 1) {
+      out += `<span class="ovDim" title="The whole class has this wording (the prompt or a template). Not counted.">${piece}</span>`;
+    } else {
+      out += piece;
+    }
+    c = e;
+  }
+  return out;
+}
+
+async function openSideBySide(uidA, uidB) {
+  const { courseId, assignmentId } = S.ids;
+  const host = $('#modalHost');
+  host.innerHTML = `<div class="modalBack"><div class="modal cmpModal">
+      <h3>Lining the two up…</h3></div></div>`;
+  let r;
+  try {
+    r = await api(`/a/${courseId}/${assignmentId}/overlap_pair`,
+      { body: { a: String(uidA), b: String(uidB) } });
+  } catch (err) {
+    host.innerHTML = '';
+    setStatus('could not compare: ' + err.message, 'err');
+    return;
+  }
+  const label = side => {
+    const row = (S.ws.extracted || {})[String(side.user_id)];
+    return row ? studentLabel(row) : side.name;
+  };
+  const code = r.a.code || r.b.code;
+  const column = (side, id) => `<section class="cmpCol">
+      <h4>${esc(label(side))}</h4>
+      <div class="cmpText${code ? ' code' : ''}" id="${id}">${side.text
+        ? markedText(side.text, side)
+        : '<span class="muted">Nothing the student typed or wrote to compare.</span>'}</div>
+    </section>`;
+  const n = (r.a.shared || []).length;
+  host.innerHTML = `<div class="modalBack"><div class="modal cmpModal">
+      <h3>${esc(label(r.a))} and ${esc(label(r.b))}</h3>
+      <div class="sub"><b>${esc(sharePct(r.containment))}</b> of the wording matches${
+        r.longest_words ? ` · longest identical run ${num(r.longest_words)} words` : ''} ·
+        ${n} matching ${n === 1 ? 'passage' : 'passages'}. A match is the same 6+ words in a
+        row, ignoring capitals and punctuation, so reworded text is not marked.${r.code
+          ? `<br><b>${esc(sharePct(r.code.containment))}</b> of the code is the same program
+             with names allowed to differ${r.code.longest_lines
+               ? ` · longest run ${num(r.code.longest_lines)} lines` : ''}. Comments and the
+             text inside quotes are left out of that reading.` : ''}
+        <span class="cmpKey"><mark class="ovHit">Highlighted</mark> is word for word in both.${
+          r.code ? ' <mark class="ovSim">Blue</mark> is the same code with different names.' : ''}
+        <span class="ovDim">Grey</span> is wording the whole class has, left out of the count.
+        Click a highlight to find it on the other side.</span></div>
+      <div class="cmpCols">${column(r.a, 'cmpA')}${column(r.b, 'cmpB')}</div>
+      <div class="foot">
+        <button class="btn ai" id="cmpAsk" title="Claude reads the shared passages and says what it sees, including the likely innocent explanation">Ask Claude to read this pair</button>
+        <button class="btn" id="cmpClose">Close</button>
+      </div></div></div>`;
+  const jump = m => {
+    const other = m.closest('.cmpText').id === 'cmpA' ? $('#cmpB') : $('#cmpA');
+    const peer = m.dataset.peer === '' ? null
+      : other.querySelector(`mark[data-kind="${m.dataset.kind}"][data-run="${m.dataset.peer}"]`);
+    if (!peer) return;
+    other.scrollTop += peer.getBoundingClientRect().top - other.getBoundingClientRect().top
+      - other.clientHeight / 3;
+    m.scrollIntoView({ block: 'nearest' });
+    [m, peer].forEach(el => {
+      el.classList.add('flash');
+      setTimeout(() => el.classList.remove('flash'), 1400);
+    });
+  };
+  host.querySelectorAll('mark[data-kind]').forEach(m => {
+    m.onclick = () => jump(m);
+    m.onkeydown = ev => { if (ev.key === 'Enter' || ev.key === ' ') { ev.preventDefault(); jump(m); } };
+  });
+  $('#cmpClose').onclick = () => { host.innerHTML = ''; };
+  $('#cmpAsk').onclick = () => doOverlap([String(uidA), String(uidB)]);
+  $('#cmpClose').focus();
+}
+
+/* ----------------------------------------------------------- watch notes */
+/* Your notes on a student, kept on their page and shown here on every
+   assignment. Never part of what Claude is sent. */
+function watchNotesOf(uid) {
+  return ((S.ws && S.ws.watch_notes) || {})[String(uid)] || [];
+}
+function noteMark(uid) {
+  const open = watchNotesOf(uid).filter(n => !n.resolved);
+  if (!open.length) return '';
+  const concern = open.some(n => n.kind === 'integrity');
+  const tip = open.map(n => (n.assignment_name ? n.assignment_name + ': ' : '') + n.text)
+    .join('\n').slice(0, 400);
+  return `<span class="noteMark${concern ? ' bad' : ''}" title="${esc(tip)}">${
+    concern ? '⚑' : 'note'}</span>`;
+}
+function notesBox(s) {
+  const notes = watchNotesOf(s.user_id);
+  const open = notes.filter(n => !n.resolved);
+  const closed = notes.length - open.length;
+  if (!open.length && !closed) return '';
+  const aid = String(S.ids.assignmentId);
+  const rows = open.map(n => `<li class="${n.kind === 'integrity' ? 'concern' : ''}">
+      <div class="noteHead">
+        <span class="tag ${n.kind === 'integrity' ? 'danger' : ''}">${
+          n.kind === 'integrity' ? 'integrity concern' : 'note'}</span>
+        <span class="muted">${n.assignment_id === aid ? 'this assignment'
+          : esc(n.assignment_name || 'no assignment')} · ${esc(fmtDate(n.created) || '')}</span>
+        <span class="noteBtns">
+          <button class="btn sm" data-nres="${esc(n.id)}">Resolve</button>
+          <button class="btn sm" data-ndel="${esc(n.id)}">Delete</button></span>
+      </div>
+      ${noteLink(n, s.user_id)}
+      <div class="noteText">${esc(n.text)}</div></li>`).join('');
+  return `<div class="watchNotes"><b>Your notes on this student</b>
+      ${rows ? `<ul>${rows}</ul>` : ''}
+      ${closed ? `<p class="muted">${closed} resolved ${closed === 1 ? 'note' : 'notes'} on the
+        <a href="#/student/${esc(s.user_id)}">student page</a>.</p>` : ''}</div>`;
+}
+
+function noteLink(n, uid) {
+  if (!n.about_user_id) return '';
+  const label = id => {
+    const row = (S.ws.extracted || {})[String(id)];
+    return row ? studentLabel(row)
+      : (String(id) === String(n.about_user_id) ? n.about_name : n.user_name) || 'another student';
+  };
+  return String(n.user_id) === String(uid)
+    ? `<div class="noteLink">May have copied from <a href="#/student/${esc(n.about_user_id)}">${
+        esc(label(n.about_user_id))}</a></div>`
+    : `<div class="noteLink">Named as the possible source in your note on <a href="#/student/${
+        esc(n.user_id)}">${esc(label(n.user_id))}</a></div>`;
+}
+
+async function changeNote(uid, nid, body) {
+  try {
+    await api(`/student/${encodeURIComponent(uid)}/watch/${encodeURIComponent(nid)}`, { body });
+    // Reloaded rather than patched: a note naming a pair shows under both
+    // students, and ending it ends the watch on the pair.
+    S.ws = await api(`/a/${S.ids.courseId}/${S.ids.assignmentId}`);
+    setStatus(body.delete ? 'note deleted' : 'note resolved', 'ok');
+    render();
+  } catch (err) { setStatus('could not change the note: ' + err.message, 'err'); }
+}
+
+function openNote(student, opts = {}) {
+  const host = $('#modalHost');
+  const aName = (S.ws.assignment || {}).name || 'this assignment';
+  host.innerHTML = `<div class="modalBack"><div class="modal">
+      <h3>Note on ${esc(studentLabel(student))}</h3>
+      <div class="sub">Kept on this student's page and shown here in the grader on
+        every assignment. Copied to your Canvas files with your other notes.
+        Never sent to Claude.</div>
+      <label class="fieldLabel" for="noteKind">Kind</label>
+      <select id="noteKind">
+        <option value="integrity"${opts.kind === 'integrity' ? ' selected' : ''}>Academic integrity concern</option>
+        <option value="note"${opts.kind === 'integrity' ? '' : ' selected'}>General note</option>
+      </select>
+      <label class="fieldLabel" for="noteText">Note</label>
+      <textarea id="noteText" class="askBox" rows="4" maxlength="2000"
+        placeholder="e.g. I think this was copied. Keep an eye on them.">${esc(opts.text || '')}</textarea>
+      <label class="fieldLabel" for="noteAbout">Copied from
+        <span class="hint">— optional. The grader then compares these two closely on every assignment.</span></label>
+      <select id="noteAbout">
+        <option value="">Nobody in particular</option>
+        ${Object.values(S.ws.extracted || {})
+          .filter(o => String(o.user_id) !== String(student.user_id))
+          .sort((a, b) => studentLabel(a).localeCompare(studentLabel(b)))
+          .map(o => `<option value="${esc(o.user_id)}"${String(opts.about || '') === String(o.user_id)
+            ? ' selected' : ''}>${esc(studentLabel(o))}</option>`).join('')}
+      </select>
+      <label class="tick" style="margin-top:8px">
+        <input type="checkbox" id="noteHere" checked> About ${esc(aName)}
+      </label>
+      <div class="foot">
+        <span class="sub" id="noteState" style="margin:0;flex:1;text-align:left"></span>
+        <button class="btn" id="noteCancel">Cancel</button>
+        <button class="btn on" id="noteSave">Save note</button>
+      </div></div></div>`;
+  $('#noteText').focus();
+  $('#noteCancel').onclick = () => { host.innerHTML = ''; };
+  $('#noteSave').onclick = async () => {
+    const text = $('#noteText').value.trim();
+    if (!text) { $('#noteState').textContent = 'Write something first.'; return; }
+    const here = $('#noteHere').checked;
+    $('#noteSave').disabled = true;
+    const about = $('#noteAbout').value;
+    const other = about ? (S.ws.extracted || {})[about] : null;
+    try {
+      await api(`/student/${encodeURIComponent(student.user_id)}/watch`, { body: {
+        text, kind: $('#noteKind').value,
+        course_id: here ? String(S.ids.courseId) : '',
+        assignment_id: here ? String(S.ids.assignmentId) : '',
+        assignment_name: here ? aName : '',
+        user_name: student.name || '',
+        about_user_id: about,
+        about_name: other ? (other.name || '') : '',
+      } });
+      // A named pair changes the overlap scan, so take the fresh workspace.
+      S.ws = await api(`/a/${S.ids.courseId}/${S.ids.assignmentId}`);
+      host.innerHTML = '';
+      setStatus('note saved to ' + studentLabel(student) + "'s page"
+        + (other ? ' · watching them with ' + studentLabel(other) : ''), 'ok');
+      render();
+    } catch (err) {
+      $('#noteState').textContent = err.message;
+      $('#noteSave').disabled = false;
+    }
+  };
 }
 
 /* --------------------------------------------------------------- overlap */
@@ -3823,7 +4606,12 @@ function openPush(only) {
             + write.map(s => `  ${studentLabel(s)}: ${s.score}`
               + (s.curved_by ? `   (${s.earned} earned ${s.curved_by > 0 ? '+' : ''}${
                   s.curved_by}${s.curved_by > 0 ? ' curve' : ' late'})` : '')
+              + (s.rubric ? (s.rubric_differs
+                  ? `   + rubric rows (${s.rubric_total} as graded)` : '   + rubric rows') : '')
               + (s.comment ? '   + comment' : '')).join('\n') : '',
+          // The rubric rows keep the points as graded; the score above is
+          // written after them, so it is the grade Canvas keeps.
+          r.rubric_note ? '\nNOTE: ' + r.rubric_note : '',
         ].filter(Boolean).join('\n');
         $('#pushGo').disabled = !write.length;
       };
@@ -3925,9 +4713,25 @@ function liveAtScan(s) {
   if (typeof s.scan_live === 'boolean') return s.scan_live;
   return s.canvas_score != null && !!s.canvas_posted_at;
 }
+const LATE_TURN_IN = 'turned in after grading';
+/* Graded once, then handed in again: the score Canvas holds is for an earlier
+   attempt (often a placeholder zero). Mirrors gradesync.is_resubmission. */
+function isResubmission(s) {
+  if (!s || s.canvas_score == null) return false;
+  if (s.canvas_grade_matches != null) return s.canvas_grade_matches === false;
+  return s.canvas_state === 'submitted' && !!(s.canvas_graded_at && s.submitted_at)
+    && String(s.submitted_at) > String(s.canvas_graded_at);
+}
+function resubmittedText(s) {
+  const when = fmtDate(s.submitted_at);
+  return `resubmitted${when ? ' ' + when : ''} · was ${num(s.canvas_score)}`;
+}
 function unscoredReason(s, e) {
   if (isScored(e)) return '';
   if (s && s.status === 'unsubmitted') return 'no submission';
+  // The last grading run skipped this student for having nothing in, and work
+  // has come in since. That skip is out of date: the work still needs a grade.
+  if (e && e.unscored_reason === 'no submission') return LATE_TURN_IN;
   if (e && e.unscored_reason) return e.unscored_reason;
   if (e) return 'nothing readable';
   return 'not graded yet';
@@ -4108,11 +4912,17 @@ function students() {
     if (S.query && ![s.name, s.sortable_name, studentLabel(s)].join(' ')
       .toLowerCase().includes(S.query)) return false;
     const e = entryOf(s.user_id);
-    if (S.filter === 'review') return reviewHold(s);
+    if (S.filter === 'review') return reviewHold(s) || overlapHeld(s.user_id).length > 0;
     if (S.filter === 'human') return !!(e && (e.source === 'human' || e.source === 'canvas'));
     // Not live on Canvas when the assignment was scanned. A slider score or a
     // push since then does not take anyone off this list; a re-sync does.
-    if (S.filter === 'ungraded') return !liveAtScan(s);
+    // A resubmission is ungraded again, whatever was live at the scan. Only
+    // work that was turned in: a student with nothing in has no score either,
+    // but there is nothing to grade, and Missing is where they are listed.
+    if (S.filter === 'ungraded') {
+      return s.status !== 'unsubmitted' && (!liveAtScan(s) || isResubmission(s));
+    }
+    if (S.filter === 'resubmitted') return isResubmission(s);
     // The working set most of the time: whoever handed something in. Everyone
     // else is a roster entry with nothing to read, and scrolling past them is
     // the whole reason this chip exists.
@@ -4159,6 +4969,9 @@ function selectionState(ids) {
   return {
     ids, n, entries, canAI, allOk,
     flagged: ids.filter(uid => reviewHold((S.ws.extracted || {})[String(uid)] || { user_id: uid })).length,
+    blendIds: ids.filter(uid => hasBlendFile((S.ws.extracted || {})[String(uid)])),
+    blenderOk: blenderFound(),
+    overlapHeld: ids.filter(uid => overlapHeld(uid).length).length,
     clashes: entries.filter(e => e && e.conflict).length,
   };
 }
@@ -4175,6 +4988,15 @@ function selectionItems(st) {
                  title: 'Keep the local score for these; the next push overwrites Canvas' });
     items.push({ sep: true });
   }
+  if (st.blendIds.length) {
+    const nb = st.blendIds.length;
+    items.push({ id: 'blend',
+                 label: nb === 1 ? 'Blender pass for this student' : 'Blender pass for ' + nb + ' students',
+                 bar: 'Blender pass', disabled: !st.blenderOk,
+                 title: !st.blenderOk ? 'Blender was not found on this machine'
+                   : nb < st.n ? `Only ${nb} of the ${st.n} selected turned in a .blend file`
+                   : 'Open just these .blend files in Blender for stats, renders and a 3D preview' });
+  }
   items.push({ id: 'regrade',
                label: one ? 'Re-grade this student' : 'Re-grade ' + st.n + ' students',
                bar: 'Re-grade', cls: 'ai', disabled: !st.canAI,
@@ -4184,6 +5006,11 @@ function selectionItems(st) {
                bar: st.allOk ? 'Un-mark reviewed' : 'Mark reviewed',
                title: st.allOk ? 'Put the review flag back on these'
                                : 'Clears the review block so these can be pushed to Canvas' });
+  if (st.overlapHeld) {
+    items.push({ id: 'overlapOk', label: 'Mark overlap checked',
+                 bar: 'Overlap checked',
+                 title: 'You looked at the matching submissions. Lets push include these' });
+  }
   items.push({ id: 'insights', label: 'Insights',
                title: 'Charts and a written read for just these students' });
   items.push({ id: 'overlap', label: 'Overlap check',
@@ -4204,6 +5031,7 @@ function runSelectionAction(name, ids) {
   const st = selectionState(ids);
   if (name === 'takeCanvas') return resolveConflicts(st.ids, 'canvas');
   if (name === 'keepMine') return resolveConflicts(st.ids, 'mine');
+  if (name === 'blend') return doBlend(st.blendIds);
   if (name === 'regrade') return doGrade(st.ids);
   if (name === 'review') return doMarkReviewed(!st.allOk, st.ids);
   if (name === 'insights') {
@@ -4213,6 +5041,7 @@ function runSelectionAction(name, ids) {
     return;
   }
   if (name === 'overlap') return doOverlap(st.ids);
+  if (name === 'overlapOk') return doOverlapChecked(st.ids.filter(uid => overlapHeld(uid).length), true);
   if (name === 'curve') return openCurve(st.ids);
   if (name === 'push') return openPush(st.ids);
 }
@@ -4377,15 +5206,18 @@ function renderRoster() {
     const noScore = !!e && !isScored(e);
     const dot = e && e.source === 'human' ? '<span class="dot human"></span>'
       : e && e.source === 'canvas' ? '<span class="dot canvas"></span>'
-        : reviewHold(s) ? '<span class="dot flag"></span>'
+        : (reviewHold(s) || overlapHeld(s.user_id).length || isResubmission(s)) ? '<span class="dot flag"></span>'
           : s.status === 'unsubmitted' ? '<span class="dot none"></span>' : '';
     const sub = s.status === 'unsubmitted' ? 'no submission'
+      : isResubmission(s) ? esc(resubmittedText(s))
       : noScore ? esc(unscoredReason(s, e))
         : (e && e.conflict) ? (writtenOpen(s)
           ? `Canvas auto ${num(e.conflict.canvas_score)} · written open`
           : `Canvas has ${num(e.conflict.canvas_score)}`)
           : writtenOpen(s) ? 'written answers not graded'
-            : (reviewHold(s) ? 'needs review' : (lateText(s) || `${s.words || 0} words`));
+            : overlapHeld(s.user_id).length
+              ? `matches ${overlapMatchName(overlapHeld(s.user_id)[0])} · check`
+              : (reviewHold(s) ? 'needs review' : (lateText(s) || `${s.words || 0} words`));
     const picked = S.picked.has(String(s.user_id));
     const b = document.createElement('button');
     b.type = 'button';
@@ -4414,7 +5246,7 @@ function renderRoster() {
         : '<span class="postMark live" title="students can see this score">●</span>';
     const cmtMark = e && e.post_comment && (e.comment || '').trim()
       ? '<span class="cmtMark" title="this comment will be included on the next push">cmt</span>' : '';
-    b.innerHTML = `<span><span class="nm">${dot}${esc(studentLabel(s))}${ok}${clash}${vidMark}${cmtMark}</span><span class="sub">${esc(sub)}</span></span>
+    b.innerHTML = `<span><span class="nm">${dot}${esc(studentLabel(s))}${ok}${clash}${vidMark}${cmtMark}${ovMark(s.user_id)}${noteMark(s.user_id)}</span><span class="sub">${esc(sub)}</span></span>
                    <span class="sc">${postMark}${lateMark}${curveMark}${total}</span>`;
     b.onclick = ev => onRowClick(ev, i, s.user_id);
     host.appendChild(b);
@@ -4447,7 +5279,7 @@ function unscoredRows() {
     if (isScored(e)) return;
     const why = unscoredReason(s, e);
     const bucket = why === 'no submission' ? 'no_submission'
-      : why === 'not graded yet' ? 'not_graded_yet' : 'nothing_readable';
+      : (why === 'not graded yet' || why === LATE_TURN_IN) ? 'not_graded_yet' : 'nothing_readable';
     out[bucket].push(studentLabel(s));
   });
   return out;
@@ -4845,8 +5677,12 @@ function renderDetail() {
   else if (e.source === 'canvas') tags += '<span class="tag edit">pulled from Canvas</span>';
   else if (e.source === 'claude') tags += `<span class="tag ai">graded by ${esc(e.model || 'claude')}</span>`;
   if (s.status === 'unsubmitted') tags += '<span class="tag danger">no submission</span>';
+  if (isResubmission(s)) {
+    tags += `<span class="tag warn" title="Handed in again after it was graded. Canvas still holds the earlier score until you grade and push this attempt.">${esc(resubmittedText(s))} · needs regrading</span>`;
+  }
   if (s.late) tags += `<span class="tag warn">${esc(lateText(s))}</span>`;
   tags += canvasTag(s, e);
+  tags += ovTag(s);
   (e.flags || []).forEach(f => { tags += `<span class="tag warn">${esc(f)}</span>`; });
   if (e.confidence && e.confidence !== 'high') tags += `<span class="tag">confidence: ${esc(e.confidence)}</span>`;
 
@@ -4862,6 +5698,7 @@ function renderDetail() {
     html += `<div class="callout bad" style="margin-bottom:14px"><b>Claude flagged this for you.</b>
       ${esc(e.needs_human_reason || 'It could not grade this fairly.')}</div>`;
   }
+  html += overlapBox(s) + watchingBox(s) + notesBox(s);
 
   if (e.conflict) {
     const c = e.conflict;
@@ -4903,6 +5740,10 @@ function renderDetail() {
       <button class="btn ai" id="btnGradeOne">${gradeIds.length > 1
         ? `Re-grade ${gradeIds.length} students` : 'Re-grade this student'}</button>
       <button class="btn" id="btnAsk">Ask about this work…</button>
+      <button class="btn" id="btnNote" title="A note on this student, kept on their page and shown here on every assignment">Note…</button>
+      ${overlapLevel(s.user_id) ? `<button class="btn ovBtn ${esc(overlapLevel(s.user_id).level)}" id="btnSide"
+        title="Their work beside ${esc(overlapMatchName(overlapLevel(s.user_id)))}'s, matching wording highlighted">Overlap check: ${
+        esc(overlapMatchName(overlapLevel(s.user_id)))}</button>` : ''}
       ${e.needs_human || e.human_ok ? `<button class="btn" id="btnReviewOne"
         title="${e.human_ok ? 'Put the review flag back'
                             : 'Clears the review block so this can be pushed'}">${
@@ -5026,6 +5867,32 @@ function renderDetail() {
   const one = $('#btnReviewOne');
   if (one) one.onclick = () => doMarkReviewed(!e.human_ok, [String(s.user_id)]);
   $('#btnAsk').onclick = () => openAsk(s);
+  $('#btnNote').onclick = () => openNote(s);
+  const ovMatches = overlapHeld(s.user_id);
+  const ovCompare = $('#ovCompare');
+  if (ovCompare) ovCompare.onclick = () => openSideBySide(s.user_id, ovMatches[0].with);
+  const ovNote = $('#ovNote');
+  if (ovNote) ovNote.onclick = () => openNote(s, { kind: 'integrity', about: ovMatches[0].with,
+    text: `${sharePct(ovMatches[0].containment)} of this submission's wording matches ${overlapMatchName(ovMatches[0])}'s.` });
+  const ovOk = $('#ovOk');
+  if (ovOk) ovOk.onclick = () => doOverlapChecked([String(s.user_id)], true);
+  const ovUndo = $('#ovUndo');
+  if (ovUndo) ovUndo.onclick = () => doOverlapChecked([String(s.user_id)], false);
+  const ovTagBtn = $('#ovTag');
+  if (ovTagBtn) ovTagBtn.onclick = () =>
+    openSideBySide(s.user_id, overlapLevel(s.user_id).with);
+  const sideBtn = $('#btnSide');
+  if (sideBtn) sideBtn.onclick = () => openSideBySide(s.user_id, overlapLevel(s.user_id).with);
+  host.querySelectorAll('[data-wcmp]').forEach(btn => btn.onclick = () =>
+    openSideBySide(s.user_id, btn.dataset.wcmp));
+  host.querySelectorAll('[data-nres]').forEach(btn => btn.onclick = () =>
+    changeNote(s.user_id, btn.dataset.nres, { resolved: true }));
+  host.querySelectorAll('[data-ndel]').forEach(btn => btn.onclick = () =>
+    askConfirm({ summary: 'Delete this note from ' + studentLabel(s) + "'s page and from "
+      + 'the grader. Resolve it instead to keep it on their page.' },
+    () => changeNote(s.user_id, btn.dataset.ndel, { delete: true }),
+    { title: 'Delete this note?', verb: 'Yes, delete it',
+      note: 'Removes the note here and the copy in your Canvas files. Nothing in the course changes.' }));
   const choiceIds = conflictChoiceIds(s.user_id);
   const cfC = $('#cfCanvas'); if (cfC) cfC.onclick = () => resolveConflicts(choiceIds, 'canvas');
   const cfM = $('#cfMine'); if (cfM) cfM.onclick = () => resolveConflicts(choiceIds, 'mine');
@@ -5074,7 +5941,9 @@ function noScoreNote(s, e) {
     letter grades and the rubric analysis, and it is not pushed to Canvas.
     ${why === 'no submission'
       ? 'Whether a missing submission earns a zero is your call: set it below, or let your Canvas missing-submission policy handle it.'
-      : 'Open the submitted work and score it by hand, or re-sync if the file should have been readable.'}</div>`;
+      : why === LATE_TURN_IN
+        ? 'This came in after the last grading run. Grade this student, or score it by hand.'
+        : 'Open the submitted work and score it by hand, or re-sync if the file should have been readable.'}</div>`;
 }
 
 function aiDeltaNote(e) {
@@ -5228,17 +6097,20 @@ function fileUrl(name) {
    is shown. The separate image part would put the same picture again below. */
 function inlinedInEntry(s, path) {
   const name = String(path || '').split(/[\\/]/).pop();
-  if (!name || !/_rce\d+_/.test(name)) return false;
+  if (!name || !/(^|_)rce\d+_/.test(name)) return false;
   return (s.parts || []).some(p => p && p.html && p.html.indexOf(name) >= 0);
 }
 
+/* The name the file route takes: the path under files/. That is
+   "<uid> - <Last, First>/essay.docx", one more folder for rendered pages, or
+   one segment for a file an older sync left flat. */
 function fileRel(path) {
   const norm = String(path || '').replace(/\\/g, '/');
   const mark = '/files/';
   const at = norm.toLowerCase().lastIndexOf(mark);
   if (at >= 0) {
     const rel = norm.slice(at + mark.length);
-    if (rel && !rel.includes('..') && rel.split('/').length <= 2) return rel;
+    if (rel && !rel.includes('..') && rel.split('/').length <= 3) return rel;
   }
   return norm.split('/').pop() || '';
 }
@@ -5331,10 +6203,34 @@ function isVideoPart(p) {
   return p.kind === 'video' || (!!p.path && VIDEO_RE.test(p.path));
 }
 
+/* What the grader read from this video: the transcript made on this computer.
+   A time jumps the player there, so a line in a rationale can be checked in
+   seconds. Shown only once the video has been read. */
+function clockText(sec) {
+  const s = Math.max(0, Math.floor(+sec || 0));
+  const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), r = s % 60;
+  return (h ? h + ':' + String(m).padStart(2, '0') : m) + ':' + String(r).padStart(2, '0');
+}
+function transcriptBlock(p) {
+  if (!Array.isArray(p.transcript)) return '';
+  const lines = p.transcript;
+  const head = lines.length
+    ? `Transcript · ${lines.length} ${lines.length === 1 ? 'line' : 'lines'}`
+    : 'No speech heard';
+  return `<details class="vidTranscript">
+    <summary>${head} <span class="wc">made on this computer, can mis-hear words ·
+      graded with ${num(p.read_frames || 0)} still frames</span></summary>
+    ${lines.length ? `<div class="tsLines">${lines.map(t =>
+      `<div class="tsLine"><button class="tsJump" type="button" data-t="${+t.start || 0}"
+        title="Play from here">${clockText(t.start)}</button> ${esc(t.text || '')}</div>`).join('')}</div>`
+      : '<div class="hint" style="padding:6px 0">The grader went by the still frames alone.</div>'}
+  </details>`;
+}
+
 function videoCard(p) {
   const d = p.data || {};
   const name = (p.path || '').split(/[\\/]/).pop();
-  const url = fileUrl(name);
+  const url = fileUrl(fileRel(p.path));
   const mb = (d.bytes || 0) / 1e6;
   const size = mb ? `${mb.toFixed(mb < 10 ? 1 : 0)} MB` : '';
   // A part cached before video was understood carries no data payload, so
@@ -5351,7 +6247,7 @@ function videoCard(p) {
         SpeedGrader.
         <div class="videoBar" style="margin-top:9px">
           <a class="btn sm" href="${url}&amp;dl=1" download>Download</a>
-        </div></div></div>`;
+        </div></div>${transcriptBlock(p)}</div>`;
   }
 
   return `<div class="workSec videoCard">${head}
@@ -5363,15 +6259,93 @@ function videoCard(p) {
           `<button class="btn sm${r === 1 ? ' on' : ''}" data-rate="${r}"
             >${r}x</button>`).join('')}</span>
         <span class="spacer" style="flex:1"></span>
-        <span class="videoNote">not graded automatically — watch it and score by hand</span>
+        <span class="videoNote">${Array.isArray(p.transcript)
+          ? 'graded from its transcript and still frames — watch to check the score'
+          : 'grading reads it as a transcript and still frames'}</span>
         <a class="btn sm" href="${url}&amp;dl=1" download>Download</a>
       </div>
+    </div>${transcriptBlock(p)}</div>`;
+}
+
+/* A Canvas Studio recording has no file here: Studio keeps it and plays it
+   only to someone Canvas has signed in. Play asks Canvas for a one-time launch
+   and opens Studio's own player in a window beside this one. Not in the pane:
+   Canvas refuses to load inside another site's page. The link is used once, so
+   each click asks again; the same window is reused. */
+function studioCard(p, s) {
+  return `<div class="workSec videoCard studioCard" data-uid="${esc(String(s.user_id))}">
+    <h4>${esc(p.label)} <span class="wc">video · kept in Canvas Studio</span></h4>
+    <div class="videoWrap studioWrap">
+      <div class="studioSlot"><button class="btn primary" type="button" data-studio="play"
+        >▶ Play beside this window</button></div>
+      <div class="videoBar">
+        <span class="videoNote">Opens Studio's own player next to this window, signed in
+          through your Canvas connection. Nothing is downloaded.</span>
+        <span class="spacer" style="flex:1"></span>
+        <a class="btn sm" href="${sgUrl(s.user_id)}" target="_blank" rel="noopener">SpeedGrader ↗</a>
+      </div>
     </div></div>`;
+}
+
+async function studioLink(uid) {
+  const { courseId, assignmentId } = S.ids;
+  const r = await api(`/a/${courseId}/${assignmentId}/studio_launch`,
+                      { body: { user_id: String(uid) } });
+  return r.url;
+}
+
+/* The right-hand side of the screen, a little under half of it, full height.
+   The work stays readable on the left and the player is not on top of it. */
+function besideFeatures() {
+  const scr = window.screen || {};
+  const left0 = scr.availLeft || 0, top0 = scr.availTop || 0;
+  const wide = scr.availWidth || window.outerWidth || 1280;
+  const tall = scr.availHeight || window.outerHeight || 800;
+  const w = Math.round(Math.max(480, Math.min(960, wide * 0.42)));
+  return `popup=yes,width=${w},height=${tall},left=${left0 + wide - w},top=${top0}`;
+}
+
+function wireStudio(host) {
+  host.querySelectorAll('.studioCard').forEach(card => {
+    const uid = card.dataset.uid;
+    const play = card.querySelector('[data-studio="play"]');
+    if (!play) return;
+    play.onclick = async () => {
+      // Opened before the wait, or the browser treats it as a pop-up.
+      const w = window.open('', 'cfStudioPlayer', besideFeatures());
+      if (!w) {
+        setStatus('The browser blocked the player window. Allow pop-ups for this page, then try again.', 'err');
+        return;
+      }
+      play.disabled = true;
+      play.textContent = 'Asking Canvas…';
+      try {
+        const url = await studioLink(uid);
+        w.opener = null;
+        w.location.href = url;
+        w.focus();
+        setStatus('playing in the window beside this one', 'ok');
+      } catch (err) {
+        w.close();
+        setStatus('Canvas would not open the recording: ' + (err.message || err), 'err');
+      } finally {
+        play.disabled = false;
+        play.textContent = '▶ Play beside this window';
+      }
+    };
+  });
 }
 
 /* Speed is the one control a browser does not put on screen, and it is the one
    that matters when there are forty recordings to get through. */
 function wireVideos(host) {
+  host.querySelectorAll('.videoCard .tsJump').forEach(btn => btn.onclick = () => {
+    const vid = btn.closest('.videoCard').querySelector('video');
+    if (!vid) return;
+    vid.currentTime = +btn.dataset.t || 0;
+    vid.play().catch(() => {});
+    vid.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+  });
   host.querySelectorAll('.videoWrap').forEach(wrap => {
     const vid = wrap.querySelector('video');
     if (!vid) return;
@@ -5479,7 +6453,7 @@ function docxStem(p) {
 }
 
 function docxUrl(p) {
-  return fileUrl((p.path || '').split(/[\\/]/).pop() || '');
+  return fileUrl(fileRel(p.path));
 }
 
 function docxMediaStem(p, stems) {
@@ -5532,10 +6506,13 @@ function docxFailed(el) {
 function pdfNameOf(p) {
   if (!p || !p.path || p.kind === 'error') return '';
   const norm = String(p.path).replace(/\\/g, '/');
-  const base = norm.split('/').pop() || '';
-  if (/\.pdf$/i.test(base)) return base;
-  const folder = norm.match(/\/([^/]+)-pages\/page-\d+\.png$/i);
-  return folder ? folder[1] + '.pdf' : '';
+  const rel = fileRel(p.path);
+  if (/\.pdf$/i.test(rel)) return rel;
+  // ".../<student>/<stem>-pages/page-001.png" was drawn from "<student>/<stem>.pdf".
+  const folder = rel.match(/^(.*?)([^/]+)-pages\/page-\d+\.png$/i);
+  if (folder) return folder[1] + folder[2] + '.pdf';
+  const flat = norm.match(/\/([^/]+)-pages\/page-\d+\.png$/i);
+  return flat ? flat[1] + '.pdf' : '';
 }
 
 let pdfWire = 0;
@@ -5551,7 +6528,7 @@ function pdfCard(p, url, reused) {
   let label = p.label;
   if (!fromFile) {
     try {
-      label = decodeURIComponent((url.split('name=').pop() || '').split('&')[0]);
+      label = decodeURIComponent((url.split('name=').pop() || '').split('&')[0]).split('/').pop();
     } catch (_) { label = 'PDF'; }
   }
   const plain = (fromFile && p.text && String(p.text).trim())
@@ -5787,6 +6764,9 @@ function renderWork(s, e) {
         body += `<div class="workSec"><h4>${esc(p.label)}</h4>
           <img class="workImg" loading="lazy" alt="${esc(p.label)}"
             src="${esc(fileUrl(fileRel(p.path)))}"></div>`;
+      } else if (p.kind === 'linked' && p.data && p.data.video
+                 && /Canvas Studio/.test(p.label || '')) {
+        body += studioCard(p, s);
       } else if (isVideoPart(p)) {
         body += videoCard(p);
       } else if (p.kind === 'blend') {
@@ -5830,6 +6810,7 @@ function renderWork(s, e) {
   wirePdf(host);
   wireViewers(host);
   wireVideos(host);
+  wireStudio(host);
   host.scrollTop = 0;
 }
 

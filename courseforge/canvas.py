@@ -165,7 +165,7 @@ class CanvasClient(ContentOps, FilesOps, CourseOps):
             match = _NEXT_LINK.search(headers.get("Link", "") or headers.get("link", ""))
             url = match.group(1) if match else None
 
-    def download(self, url: str, dest: Path) -> Path:
+    def download(self, url: str, dest: Path, max_bytes: int | None = None) -> Path:
         """Fetch a Canvas file URL to disk.
 
         Submission attachment URLs are already signed and redirect to S3 or
@@ -174,11 +174,12 @@ class CanvasClient(ContentOps, FilesOps, CourseOps):
         for plain /api/v1/files/:id/download URLs that do need it. A tokened
         request never follows the redirect: the Canvas token must not land on
         AWS.
+
+        The bytes go straight to disk as they arrive, so a large video is not
+        held in memory. `max_bytes` raises the size limit for one file, for a
+        sync the instructor agreed to (see grader.download_plan).
         """
         dest.parent.mkdir(parents=True, exist_ok=True)
-        payload = self._fetch_bytes(url, timeout=max(self.timeout, 120))
-        if not payload:
-            raise RuntimeError("the download was empty")
         # Written beside the destination and renamed into place, so `dest`
         # exists only once it is complete. Written straight to `dest`, a second
         # sync running at the same time saw the file exist, skipped the fetch,
@@ -186,8 +187,19 @@ class CanvasClient(ContentOps, FilesOps, CourseOps):
         # fine a moment later was recorded as "not a zip file" and graded from
         # its one picture.
         part = dest.with_name(dest.name + ".part")
-        part.write_bytes(payload)
-        part.replace(dest)
+        try:
+            got = self._fetch_bytes(url, timeout=max(self.timeout, 120),
+                                    limit=max(int(max_bytes or 0), MAX_DOWNLOAD_BYTES),
+                                    sink=part)
+            if not got:
+                raise RuntimeError("the download was empty")
+            part.replace(dest)
+        finally:
+            if part.exists():
+                try:
+                    part.unlink()
+                except OSError:
+                    pass
         return dest
 
     # --------------------------------------------------------------- reading
@@ -261,6 +273,27 @@ class CanvasClient(ContentOps, FilesOps, CourseOps):
         return list(self.paged(
             f"/courses/{course_id}/assignments/{assignment_id}/submissions"))
 
+    def grading_states(self, course_id: int | str, assignment_ids: list,
+                       chunk: int = 20) -> list[dict]:
+        """Submission rows for several assignments at once, nothing attached.
+
+        Workflow state, score, posted_at and the submit stamps are enough to
+        tell whether an assignment is graded. One course-wide call per twenty
+        assignments, instead of a full sync of each one. Reads only.
+
+        Active enrollments only. Without that, `student_ids[]=all` also
+        returns students who have dropped, and an ungraded post from one of
+        them kept work on To Do that Canvas, the sync and the roster all
+        leave out.
+        """
+        ids = [str(a) for a in assignment_ids if str(a).strip()]
+        out: list[dict] = []
+        for start in range(0, len(ids), max(1, chunk)):
+            out.extend(self.paged(f"/courses/{course_id}/students/submissions",
+                                  student_ids=["all"], enrollment_state="active",
+                                  assignment_ids=ids[start:start + chunk]))
+        return out
+
     def discussion_view(self, course_id: int | str, topic_id: int | str) -> dict:
         return self.get(f"/courses/{course_id}/discussion_topics/{topic_id}/view")
 
@@ -268,27 +301,43 @@ class CanvasClient(ContentOps, FilesOps, CourseOps):
     def post_grade(self, course_id: int | str, assignment_id: int | str, user_id: int | str,
                    score: float | None = None, comment: str | None = None,
                    rubric: dict | None = None) -> dict:
-        """Write one grade and/or comment. Callers must gate this themselves."""
+        """Write one grade and/or comment. Callers must gate this themselves.
+
+        `rubric` maps a Canvas criterion id to {"points", "comments"}. When it
+        is given, it goes in its own request first and the score goes second.
+        On an assignment with "Use this rubric for assignment grading" turned
+        on, Canvas recomputes the score from a rubric assessment, and in a
+        single request that would replace a late-docked or curved
+        posted_grade with the plain rubric sum. Writing the score last means
+        the grade Canvas keeps is always the one the push preview showed.
+        """
+        rubric_fields: list[tuple[str, str]] = []
+        for crit_id, entry in (rubric or {}).items():
+            if entry.get("points") is not None:
+                rubric_fields.append((f"rubric_assessment[{crit_id}][points]",
+                                      str(entry["points"])))
+            if entry.get("comments"):
+                rubric_fields.append((f"rubric_assessment[{crit_id}][comments]",
+                                      entry["comments"]))
         fields: list[tuple[str, str]] = []
         if score is not None:
             fields.append(("submission[posted_grade]", str(score)))
         if comment:
             fields.append(("comment[text_comment]", comment))
-        for crit_id, entry in (rubric or {}).items():
-            if entry.get("points") is not None:
-                fields.append((f"rubric_assessment[{crit_id}][points]", str(entry["points"])))
-            if entry.get("comments"):
-                fields.append((f"rubric_assessment[{crit_id}][comments]", entry["comments"]))
-        if not fields:
+        if not fields and not rubric_fields:
             raise ValueError("post_grade called with nothing to write")
 
-        body = urllib.parse.urlencode(fields).encode("utf-8")
-        payload, _ = self._request(
-            "PUT",
-            f"{self.base}/api/v1/courses/{course_id}/assignments/{assignment_id}/submissions/{user_id}",
-            data=body,
-            content_type="application/x-www-form-urlencoded",
-        )
+        url = (f"{self.base}/api/v1/courses/{course_id}/assignments/"
+               f"{assignment_id}/submissions/{user_id}")
+        payload = None
+        for part in (rubric_fields, fields):
+            if not part:
+                continue
+            payload, _ = self._request(
+                "PUT", url,
+                data=urllib.parse.urlencode(part).encode("utf-8"),
+                content_type="application/x-www-form-urlencoded",
+            )
         return payload or {}
 
     def _json_body(self, method: str, path: str, body: dict) -> dict:
@@ -557,6 +606,19 @@ class CanvasClient(ContentOps, FilesOps, CourseOps):
             f"/courses/{course_id}/users", enrollment_type=["student"],
             enrollment_state=["active"], include=["enrollments"]))
 
+    def student_submissions(self, course_id: int | str, user_id) -> list[dict]:
+        """One student's submissions in one course, assignment included.
+
+        Canvas returns a row for work that was never turned in, which is how
+        a missing item is visible. Reads only.
+        """
+        uid = str(user_id).strip()
+        if not uid:
+            return []
+        return list(self.paged(
+            f"/courses/{course_id}/students/submissions",
+            student_ids=[uid], include=["assignment"]))
+
     def submitted_pairs(self, course_id: int | str, student_ids: list,
                         assignment_ids: list) -> set:
         """{(assignment_id, user_id)} for work already handed in.
@@ -720,7 +782,9 @@ class CanvasClient(ContentOps, FilesOps, CourseOps):
             req.add_header("Cookie", baked)
         return urllib.request.build_opener(self._NoRedirect).open(req, timeout=timeout)
 
-    def _read_limited(self, resp, limit: int = MAX_DOWNLOAD_BYTES) -> bytes:
+    def _read_limited(self, resp, limit: int = MAX_DOWNLOAD_BYTES,
+                      sink: Path | None = None) -> bytes | int:
+        """The body, or with `sink` the number of bytes written to that file."""
         length = resp.headers.get("Content-Length")
         if length:
             try:
@@ -730,17 +794,26 @@ class CanvasClient(ContentOps, FilesOps, CourseOps):
                 pass
         chunks: list[bytes] = []
         total = 0
-        while True:
-            chunk = resp.read(64 * 1024)
-            if not chunk:
-                break
-            total += len(chunk)
-            if total > limit:
-                raise RuntimeError("file is larger than the download limit")
-            chunks.append(chunk)
-        return b"".join(chunks)
+        out = open(sink, "wb") if sink is not None else None
+        try:
+            while True:
+                chunk = resp.read(1024 * 1024 if out else 64 * 1024)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > limit:
+                    raise RuntimeError("file is larger than the download limit")
+                if out:
+                    out.write(chunk)
+                else:
+                    chunks.append(chunk)
+        finally:
+            if out:
+                out.close()
+        return total if out else b"".join(chunks)
 
-    def _fetch_bytes(self, url: str, timeout: int) -> bytes:
+    def _fetch_bytes(self, url: str, timeout: int, limit: int = MAX_DOWNLOAD_BYTES,
+                     sink: Path | None = None) -> bytes | int:
         """Download file bytes.
 
         A Canvas /files/:id/download link does not return the file. It 302s to
@@ -748,6 +821,9 @@ class CanvasClient(ContentOps, FilesOps, CourseOps):
         bucket. The bearer token stays on the Canvas host only. Cookies set
         along the way are sent back to the host that set them, because InstFS
         refuses the next hop without them.
+
+        With `sink` the body is written to that file and the byte count is
+        returned instead of the bytes.
         """
         if not canvas_policy.file_url_allowed(url, self.base, self.allowed_hosts):
             raise RuntimeError("refused to fetch a file from a host that is not Canvas")
@@ -759,7 +835,7 @@ class CanvasClient(ContentOps, FilesOps, CourseOps):
         on_canvas = canvas_policy.same_host(self.base, url)
         attempts = (True, False) if on_canvas else (False,)
         for use_token in attempts:
-            got = self._follow_file(url, timeout, use_token, errors)
+            got = self._follow_file(url, timeout, use_token, errors, limit, sink)
             if got:
                 return got
         fid = _FILE_IN_URL.search(url)
@@ -771,13 +847,14 @@ class CanvasClient(ContentOps, FilesOps, CourseOps):
                 info = None
             fresh = (info or {}).get("url") if isinstance(info, dict) else ""
             if fresh and fresh != url:
-                got = self._follow_file(fresh, timeout, False, errors)
+                got = self._follow_file(fresh, timeout, False, errors, limit, sink)
                 if got:
                     return got
         raise RuntimeError(f"could not download attachment ({'; '.join(errors)})")
 
     def _follow_file(self, url: str, timeout: int, use_token: bool,
-                     errors: list[str]) -> bytes | None:
+                     errors: list[str], limit: int = MAX_DOWNLOAD_BYTES,
+                     sink: Path | None = None) -> bytes | int | None:
         """Follow one download, up to five redirects. None means this attempt failed."""
         target = url
         cookies: dict[tuple[str, str], str] = {}
@@ -807,7 +884,7 @@ class CanvasClient(ContentOps, FilesOps, CourseOps):
                         _keep_cookies(resp.headers, target, cookies)
                         target = urllib.parse.urljoin(target, loc)
                         continue
-                    data = self._read_limited(resp)
+                    data = self._read_limited(resp, limit, sink)
                     ctype = (resp.headers.get("Content-Type") or "").lower()
             except urllib.error.HTTPError as exc:
                 loc = ""
@@ -825,6 +902,11 @@ class CanvasClient(ContentOps, FilesOps, CourseOps):
             if data and "text/html" in ctype and not target.lower().split("?", 1)[0].endswith(
                     (".html", ".htm")):
                 errors.append("Canvas returned a web page instead of the file")
+                if sink is not None:
+                    try:
+                        Path(sink).unlink()
+                    except OSError:
+                        pass
                 return None
             if data:
                 return data

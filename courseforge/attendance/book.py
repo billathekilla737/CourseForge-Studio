@@ -13,6 +13,8 @@ import threading
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
+from .. import folders
+
 STATUSES = ("present", "tardy", "absent", "excused")
 WEEKDAYS = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
 _WEEK_NUM = {name: i for i, name in enumerate(WEEKDAYS)}
@@ -193,7 +195,7 @@ def _path(app, course_id, mkdir: bool = False) -> Path:
     key = _course_key(course_id)
     if mkdir:
         return Path(app.course_dir(key)) / "attendance.json"
-    return Path(app.store.root) / key / "attendance.json"
+    return folders.under(Path(app.store.root), key) / "attendance.json"
 
 
 def load(app, course_id) -> dict:
@@ -352,9 +354,10 @@ def outstanding(app) -> list[str]:
     except OSError:
         return []
     for child in children:
-        if not child.name.isdigit() or not (child / "attendance.json").is_file():
+        cid = folders.leading_id(child.name)
+        if not cid or not (child / "attendance.json").is_file():
             continue
-        stored = load(app, child.name)
+        stored = load(app, cid)
         if not _has_anything(stored):
             continue
         side = load_sidecar(root, sync_key(child.name))
@@ -691,7 +694,7 @@ def roster(app, course_id) -> list[dict]:
     """
     rows = []
     try:
-        path = Path(app.store.root) / _course_key(course_id) / "students.json"
+        path = folders.under(Path(app.store.root), _course_key(course_id)) / "students.json"
         raw = json.loads(path.read_text(encoding="utf-8")) if path.is_file() else []
     except (OSError, ValueError):
         raw = []

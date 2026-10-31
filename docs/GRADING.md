@@ -901,6 +901,26 @@ Students flagged `needs_human` are skipped by the push until you clear them with
 **Mark reviewed** (one student from their detail pane, or a whole selection from
 the roster bar).
 
+**Rubric rows.** A push fills in the Canvas rubric for each student as well as
+the score, one row per criterion with the points and Claude's reason for them.
+Only criteria that exist on the assignment's Canvas rubric (as of the last sync)
+are sent. Rows Studio made up for itself are never sent: the single "Overall"
+row it uses when an assignment has no rubric, and the quiz rows ("Already scored
+by Canvas" and one per written question). A grade typed straight into the
+gradebook with no breakdown (a total-only grade) sends no rubric rows. If you
+change the rubric in Canvas, sync the assignment before pushing so the rows
+match.
+
+The rubric rows always hold the points as graded. The score is the earned score
+minus any late penalty, plus any curve, so the two can differ. When the
+assignment has "Use this rubric for assignment grading" turned on, Canvas
+recomputes the score from the rubric whenever a rubric is saved. To keep that
+from replacing a late-docked or curved score, Studio writes each student in two
+steps: the rubric rows first, then the score and comment. The score Canvas keeps
+is the one the push plan showed. The plan marks students whose rubric total
+differs from their score ("+ rubric rows (34 as graded)") and adds a note
+explaining the difference.
+
 A push writes scores into the gradebook. Whether students **see** them is a
 separate question, and Canvas answers it with the course's *posting policy*:
 

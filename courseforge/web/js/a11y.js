@@ -92,16 +92,13 @@
   }
 
   /* ------------------------------------------------------------- the area */
-  function openA11y(cid, rest) {
+  async function openA11y(cid, rest) {
     rest = Array.isArray(rest) ? rest : [];
     const kind = rest[0] || 'html';
     S.a11y.courseId = cid;
     showView('area');
-    crumbs([
-      { label: 'Courses', href: '#/' },
-      { label: (S.course && S.course.name) || S.a11y.courseLabel || 'Course', href: '#/c/' + cid },
-      { label: 'Accessibility' },
-    ]);
+    await courseCrumbs(cid, [{ label: 'Accessibility' }]);
+    if (String(S.a11y.courseId) !== String(cid)) return;
     $('#headerActions').innerHTML = '';
     areaHead('Accessibility', 'Two different jobs share this screen. Fix accessibility makes a file usable by a screen reader; Find and replace changes the words inside one. Nothing is pushed until you confirm.');
     areaTabs(KINDS.map(k => ({ id: k.id, label: k.label, group: k.group, title: k.title })), kind, id => {

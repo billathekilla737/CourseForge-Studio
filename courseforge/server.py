@@ -27,11 +27,11 @@ from pathlib import Path
 from socketserver import ThreadingMixIn
 from urllib.parse import parse_qs, urlparse
 
-from . import (accommodations, areas, audit, blender, confirm, curve, extract,
+from . import (accommodations, areas, audit, blender, browse, confirm, folders, curve, extract,
                grader, humanize,
-               latepolicy, llm, gradesync, handoff, htmlclean, instruct,
+               latepolicy, llm, gradestatus, gradesync, handoff, htmlclean, instruct,
                nicknames, overlap, quizgrade, quizedit, routing, schedule,
-               statesync, teaching, terms)
+               statesync, studiomedia, teaching, terms, videoread, watchnotes)
 from .canvas import CanvasClient, CanvasError
 from . import config
 from .config import Config
@@ -64,13 +64,17 @@ def student_file_response(name: str, download: bool = False) -> tuple[str, bool]
 
 _PAGE_DIR = re.compile(r"^[A-Za-z0-9._-]{1,160}-(?:pages|media)$")
 _PAGE_FILE = re.compile(r"^[A-Za-z0-9._-]{1,120}$")
+# files/<uid> - <Last, First>/: the name part is the student's, so anything a
+# folder may hold. The resolve check below keeps it inside files/.
+_STUDENT_DIR = re.compile(r"^\d{1,20}(?: - [^/\\]{1,80})?$")
 
 
 def submission_file(files_dir: Path, raw: str) -> Path | None:
     """A file under an assignment's files folder, or None.
 
-    The usual name is one segment. A rendered PDF page or a picture pulled out
-    of a Word file lives one folder down, named ``<stem>-pages`` or
+    A file sits in the student's folder, ``<uid> - <name>/<file>``, or flat as
+    one segment from an older sync. A rendered PDF page or a picture pulled
+    out of a Word file lives one folder further down, named ``<stem>-pages`` or
     ``<stem>-media``. Anything else, including ``..``, is refused.
     """
     text = (raw or "").replace("\\", "/").strip().strip("/")
@@ -79,6 +83,10 @@ def submission_file(files_dir: Path, raw: str) -> Path | None:
     parts = text.split("/")
     if any(part in ("", ".", "..") for part in parts):
         return None
+    if len(parts) >= 2 and _STUDENT_DIR.match(parts[0]) and not _PAGE_DIR.match(parts[0]):
+        inner = submission_file(Path(files_dir) / parts[0], "/".join(parts[1:]))
+        root = Path(files_dir).resolve()
+        return inner if inner is not None and root in inner.parents else None
     if len(parts) == 1:
         if not _PAGE_FILE.match(parts[0]):
             return None
@@ -187,6 +195,53 @@ for _ext, _ctype in ((".js", "text/javascript"), (".mjs", "text/javascript"),
                      (".ttf", "font/ttf"), (".ico", "image/x-icon"),
                      (".png", "image/png"), (".webp", "image/webp")):
     mimetypes.add_type(_ctype, _ext)
+
+
+def canvas_criterion_ids(assignment: dict | None) -> set[str]:
+    """The criterion ids of the rubric Canvas actually has on this assignment.
+
+    Read from the assignment as the last sync saved it (assignment.json). Only
+    these ids may be sent as rubric_assessment rows. The draft's rubric can hold
+    rows Studio made up -- "_overall" when the assignment has no rubric (see
+    grader._rubric_of), "_quiz_auto" and "q<id>" on a quiz (see
+    quizgrade.class_rubric) -- and Canvas has nowhere to put those.
+
+    The ids are compared as a set, not by their shape. Canvas ids on this
+    account look like "_8947", which starts with an underscore exactly as the
+    made-up "_overall" does; an older string test (digits only) threw away
+    every real criterion and posted the total alone.
+    """
+    ids: set[str] = set()
+    for crit in (assignment or {}).get("rubric") or []:
+        if not isinstance(crit, dict):
+            continue
+        cid = crit.get("id")
+        if cid is None or str(cid).strip() == "":
+            continue
+        ids.add(str(cid))
+    return ids
+
+
+def canvas_rubric_payload(entry: dict, rubric: list[dict],
+                          canvas_ids: set[str]) -> dict:
+    """Per-criterion points and comments for one student, Canvas rows only.
+
+    A total-only entry (a grade typed straight into the gradebook, with no
+    breakdown) sends no rows. A criterion with no score yet is left out
+    rather than sent as a zero.
+    """
+    if entry.get("total_only") or not canvas_ids:
+        return {}
+    scores = entry.get("scores") or {}
+    rationales = entry.get("rationales") or {}
+    out: dict[str, dict] = {}
+    for crit in rubric or []:
+        cid = str(crit.get("id") or "")
+        if not cid or cid not in canvas_ids or scores.get(cid) is None:
+            continue
+        out[cid] = {"points": scores.get(cid),
+                    "comments": rationales.get(cid) or ""}
+    return out
 
 
 class JobSink:
@@ -466,9 +521,7 @@ class App:
 
     def course_dir(self, course_id) -> Path:
         """Where an area keeps its work for one course: data/<course>/<area>/..."""
-        path = self.store.root / safe_id(course_id)
-        path.mkdir(parents=True, exist_ok=True)
-        return path
+        return self.store.course_dir(course_id)
 
     @property
     def me_id(self) -> int | str | None:
@@ -641,20 +694,38 @@ class App:
                     "_dir": str(adir),
                 })
             self.store.save_assignments(course_id, cached)
+            browse.refresh_in_background(self.cfg, self.store.root)   # renames
+        # Graded or not comes from the light status check when it is current,
+        # and from the last sync otherwise (gradestatus.state_for decides).
+        cdir = self.store.course_dir(course_id)
+        status = gradestatus.load(self.store.root, course_id)
         for row in cached:
             if not isinstance(row, dict):
                 continue
-            book = self.store.draft(course_id, row.get("id")) or {}
-            row["graded"] = gradesync.assignment_is_graded(
-                row.get("needs_grading"),
-                self.store.extracted(course_id, row.get("id")),
-                row.get("has_submissions"),
-                book.get("students"), book.get("rubric"),
-                book.get("points_possible"),
-                graded_submissions_exist=row.get("graded_submissions_exist"))
+            state = gradestatus.state_for(cdir, row, status, self.store.read)
+            row["graded"] = state["graded"]
+            # Never graded; resubmissions are counted on their own.
+            row["waiting"] = state["fresh"]
+            row["resubmitted"] = state["resubmitted"]
+            row["resubmitted_since"] = state["resubmitted_since"]
+            row["status_checked_at"] = state["checked_at"]
         return cached
 
     def workspace(self, course_id, assignment_id) -> dict:
+        # Grading measures the class for near-identical work as it finishes.
+        # Work graded before that existed, or re-synced since, is measured here
+        # the first time it is opened. Local and cheap: no model is involved.
+        flags = (self.store.draft(course_id, assignment_id).get("overlap_flags") or {})
+        stamp = grader.overlap_stamp(self.store, course_id, assignment_id)
+        if stamp and flags.get("stamp") != stamp:
+            try:
+                grader.overlap_flags(self.store, course_id, assignment_id)
+            except Exception:  # noqa: BLE001  the page opens without it
+                pass
+        # A curved total saved by an older version kept its decimal (5.59 of 10,
+        # an F, where the curve now gives 6, a D), and the charts and letters
+        # read that saved number. Opening the assignment puts it right.
+        self._refresh_totals(course_id, assignment_id)
         draft = self.store.draft(course_id, assignment_id)
         policy = draft.get("late_policy") or self.course_late_policy(course_id)
         draft = self._reprice_late(course_id, assignment_id, draft, policy)
@@ -664,6 +735,8 @@ class App:
             self.store.read(adir / "submissions.json", []),
             adir / "files", course_id, assignment_id,
             getattr(self.cfg, "base_url", "") or "")
+        # A video graded from its transcript shows that transcript beside it.
+        extracted = videoread.attach_cached(extracted, adir / "video")
         return {
             "assignment": self.store.assignment(course_id, assignment_id),
             "draft": draft,
@@ -673,6 +746,9 @@ class App:
             "late_waiver": latepolicy.waives_everyone(
                 self.store.instructions(course_id, assignment_id)),
             "pseudonymize": self.cfg.pseudonymize,
+            # The instructor's notes on these students, from any assignment.
+            # Shown beside the work; never part of what a model is sent.
+            "watch_notes": watchnotes.for_students(self.store.root, extracted.keys()),
             # Measured locally and cheap, so the teaching bar can say something
             # useful the moment the page opens rather than waiting to be asked.
             "teaching_signal": self.teaching_signal(course_id, assignment_id),
@@ -1691,6 +1767,45 @@ class App:
                 "count": len(sent), "sent": [pool[u]["name"] for u in sent],
                 "failed": failed}
 
+    def remind_one_student(self, user_id, course_id, course_name, titles,
+                           confirm_token: str | None = None) -> dict:
+        """One private Canvas message about one class's late or missing work."""
+        from .studentsarea.assemble import first_name, person, reminder_message
+        uid = str(user_id)
+        if not str(course_id or "").strip():
+            raise ValueError("The reminder needs a course.")
+        try:
+            row = person(self, uid)
+            full = row.get("name") or ""
+        except Exception:  # noqa: BLE001
+            full = ""
+        instructor = ""
+        try:
+            me = self.client.get("/users/self/profile", attempts=1, timeout=8)
+            instructor = me.get("name") or ""
+        except Exception:  # noqa: BLE001
+            instructor = ""
+        subject, body = reminder_message(full or "there", course_name, titles, instructor)
+        self._gate(
+            "remind-one",
+            {"user_id": uid, "course_id": str(course_id),
+             "subject": subject, "body": body},
+            "Send a Canvas message to %s about missing work in %s"
+            % (first_name(full), (course_name or "this course").strip() or "this course"),
+            confirm_token,
+            detail=body,
+            what="messaging a student")
+        self.client.create_conversation([uid], subject, body, course_id or None)
+        audit.record(
+            self.course_dir(course_id) if course_id else self.cfg.data_dir,
+            "grade", "messaged",
+            'Sent a private Canvas message to %s about missing work in "%s". Subject: "%s".'
+            % (first_name(full), course_name, subject),
+            students=[audit.person(uid, full or uid)],
+            count=1, course_id=course_id,
+            detail={"subject": subject, "body": body[:2000]})
+        return {"ok": True, "subject": subject, "body": body}
+
     # ------------------------------------------------- carrying work between
     # machines. See handoff.py for what travels and what deliberately does not.
 
@@ -2027,6 +2142,25 @@ class App:
                                                 name="handoff")
         self._handoff_worker.start()
 
+    def start_browse_refresh(self) -> None:
+        """Rebuild data/Browse in the background: names may have changed in
+        Canvas since the last run, and assignments synced before this existed
+        get their shortcuts here."""
+        browse.refresh_in_background(self.cfg, self.store.root)
+
+    def browse_folder(self, course_id, assignment_id) -> dict:
+        """Where this assignment's files are, by name and by id."""
+        files = self.store.assignment_dir(course_id, assignment_id) / "files"
+        browse.refresh_quietly(self.cfg, self.store.root)
+        return {"files": str(files),
+                **browse.where(self.store.root, course_id, assignment_id)}
+
+    def open_browse_folder(self, course_id, assignment_id) -> dict:
+        from .courseops.export_import import open_folder
+        place = self.browse_folder(course_id, assignment_id)
+        folder = place.get("folder") or place["files"]
+        return {**place, "opened": open_folder(folder)}
+
     def stop_handoff_worker(self) -> None:
         self._handoff_stop.set()
 
@@ -2034,10 +2168,10 @@ class App:
         root = self.store.root
         if not root.is_dir():
             return
-        for adir in sorted(root.glob("*/*")):
-            if not adir.is_dir() or not handoff.enabled(adir):
+        for adir in [a for c in folders.children(root) for a in folders.children(c)]:
+            if not handoff.enabled(adir):
                 continue
-            course_id, assignment_id = adir.parent.name, adir.name
+            course_id, assignment_id = folders.id_of(adir.parent), folders.id_of(adir)
             key = self._handoff_key(course_id, assignment_id)
             draft = self.store.draft(course_id, assignment_id)
             if not draft:
@@ -2310,8 +2444,10 @@ class App:
             name = info.get("name") or str(uid)
             if info.get("status") == "unsubmitted":
                 missing.append(name)
-            elif entry:
+            elif entry and entry.get("unscored_reason") != "no submission":
                 unreadable.append(name)
+            # A "no submission" skip on someone who has since turned work in is
+            # out of date: that work is waiting to be graded.
             else:
                 ungraded.append(name)
         return {"no_submission": sorted(missing),
@@ -2476,6 +2612,9 @@ class App:
 
         rubric = draft.get("rubric") or []
         possible = draft.get("points_possible") or 0
+        # Only rows of the rubric Canvas really has get sent; see
+        # canvas_criterion_ids for why this is a set and not a string test.
+        canvas_ids = canvas_criterion_ids(self.store.assignment(course_id, assignment_id))
 
         # Students see the grade when it is written. `show` is kept on the
         # signature so an older page cannot ask for a hidden push.
@@ -2495,6 +2634,11 @@ class App:
                                     == "unsubmitted" else "no score")})
             elif quizgrade.hold_for_review(entry, extracted.get(uid) or {}):
                 skipped.append({"user_id": uid, "name": name, "why": "flagged for human review"})
+            elif grader.overlap_held(draft, uid):
+                other = grader.overlap_held(draft, uid)[0].get("with_name") or "another student"
+                skipped.append({"user_id": uid, "name": name,
+                                "why": f"shares most of its wording with {other}: "
+                                       "mark the overlap checked first"})
             else:
                 # The curved score is the one that counts, and the dry run has to
                 # show it: posting a number the instructor never saw would be the
@@ -2503,18 +2647,18 @@ class App:
                 score = curve.final_total(entry, rubric, possible)
                 item = {"user_id": uid, "name": name, "score": score,
                         "comment": self._push_comment(entry, mode)}
-                if not entry.get("total_only"):
-                    scores = entry.get("scores") or {}
-                    rationales = entry.get("rationales") or {}
-                    item["rubric"] = {
-                        str(c.get("id")): {
-                            "points": scores.get(str(c.get("id"))),
-                            "comments": rationales.get(str(c.get("id"))) or "",
-                        }
-                        for c in rubric
-                        if str(c.get("id") or "").isdigit()
-                        and scores.get(str(c.get("id"))) is not None
-                    }
+                rows = canvas_rubric_payload(entry, rubric, canvas_ids)
+                if rows:
+                    item["rubric"] = rows
+                    # The rubric rows hold the points as graded; the score
+                    # carries the late dock and any curve. When they differ
+                    # the preview says so, and post_grade writes the score
+                    # after the rubric so Canvas's rubric total cannot
+                    # replace it (see CanvasClient.post_grade).
+                    rubric_total = round(sum(float(r["points"]) for r in rows.values()), 2)
+                    item["rubric_total"] = rubric_total
+                    if round(rubric_total - float(score), 2):
+                        item["rubric_differs"] = True
                 info = extracted.get(uid) or {}
                 quiz_meta = info.get("quiz") if isinstance(info.get("quiz"), dict) else {}
                 questions = quizgrade.question_scores(entry)
@@ -2541,14 +2685,27 @@ class App:
         if dry_run:
             n_curved = sum(1 for p in planned if p.get("curved_by"))
             n_comments = sum(1 for p in planned if p.get("comment"))
+            n_rubric = sum(1 for p in planned if p.get("rubric"))
+            n_differs = sum(1 for p in planned if p.get("rubric_differs"))
+            rubric_note = ""
+            if n_differs:
+                rubric_note = (f"{n_differs} score(s) differ from their rubric rows "
+                               "(late penalty or curve). The rubric rows show the "
+                               "points as graded; the score shown here is written "
+                               "after them and is the grade Canvas keeps.")
             log(f"dry run: would push {len(planned)} score(s)"
                 + (f", {n_comments} with a comment" if n_comments else ", scores only")
+                + (f", {n_rubric} with rubric rows" if n_rubric else "")
                 + f", skip {len(skipped)}"
                 + (f"; {n_curved} include a curve" if n_curved else "")
                 + f"; grades land {landing}")
+            if rubric_note:
+                log(rubric_note)
             return {"dry_run": True, "would_post": planned, "skipped": skipped,
                     "include_comments": mode != "none", "comment_mode": mode,
                     "comments_n": n_comments,
+                    "rubric_n": n_rubric, "rubric_differs_n": n_differs,
+                    "rubric_note": rubric_note,
                     "show": bool(show), "landing": landing}
 
         # `show` is deliberately not part of what the token is bound to. Both
@@ -3596,8 +3753,12 @@ def make_handler(app: App):
                     if action == "sync":
                         # One sync per assignment at a time: a second request
                         # while one is running joins it (see Jobs.start).
+                        # "all" / "skip" answers the large-download question;
+                        # "ask" asks again even after an earlier skip.
+                        large = str(body.get("large") or "") or None
                         job = app.jobs.start("sync", lambda log: grader.sync_assignment(
-                            app.cfg, app.client, app.store, cid, aid, log, me_id=app.me_id),
+                            app.cfg, app.client, app.store, cid, aid, log, me_id=app.me_id,
+                            large=large),
                             key=f"sync:{cid}:{aid}")
                         return self._json({"job": job})
 
@@ -3666,6 +3827,11 @@ def make_handler(app: App):
                     if action == "export":
                         return self._json(app.export(cid, aid))
 
+                    if action == "folder":
+                        if body.get("open"):
+                            return self._json(app.open_browse_folder(cid, aid))
+                        return self._json(app.browse_folder(cid, aid))
+
                     if action == "ask":
                         uid = parts[5] if len(parts) > 5 else body.get("user_id")
                         question = (body.get("question") or "").strip()
@@ -3702,6 +3868,23 @@ def make_handler(app: App):
                             raise ValueError("no students given")
                         return self._json(app.mark_reviewed(
                             cid, aid, ids, bool(body.get("reviewed", True))))
+
+                    if action == "overlap_pair":
+                        # Reads only: two submissions with their shared wording marked.
+                        return self._json(grader.overlap_pair(
+                            app.store, cid, aid, body.get("a"), body.get("b")))
+
+                    if action == "studio_launch":
+                        # Reads only: a one-time link to Studio's own player.
+                        return self._json(studiomedia.launch(
+                            app.client, app.store, cid, aid, body.get("user_id")))
+
+                    if action == "overlap_checked":
+                        ids = [str(u) for u in (body.get("only") or [])]
+                        if not ids:
+                            raise ValueError("no students given")
+                        return self._json(grader.mark_overlap_checked(
+                            app.store, cid, aid, ids, bool(body.get("checked", True))))
 
                     if action == "teaching":
                         only = body.get("only") or None
@@ -3788,6 +3971,7 @@ def build_server(cfg: Config) -> tuple[ThreadedServer, App]:
 
 def serve(cfg: Config) -> None:
     server, _app = build_server(cfg)
+    _app.start_browse_refresh()
 
     # Keeps Canvas current for anything already being carried between machines.
     # Only touches assignments handed off at least once, so this uploads nothing

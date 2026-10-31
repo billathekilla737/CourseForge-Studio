@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+from pathlib import Path
 
 from . import blender, humanize, llm
 from .canvas import CanvasClient
@@ -268,6 +269,29 @@ def cmd_students(cfg: Config, course: str, who: str = "") -> int:
     return 0
 
 
+def cmd_folders(cfg: Config, apply: bool = False, undo: bool = False) -> int:
+    from . import folder_migration as fm
+    root = Path(cfg.data)
+    if (apply or undo) and fm.app_running(cfg.port):
+        print(f"The Studio is running on port {cfg.port}. Close it first: a folder renamed "
+              "under a running job would make it write to the old name.")
+        return 2
+    if undo:
+        out = fm.undo(root)
+        print(f"Put back {out['undone']} rename(s).")
+        return 0
+    plan = fm.plan(root)
+    print(fm.summary(plan))
+    if not apply:
+        print("\nNothing was changed. Run again with --apply to make these renames.")
+        return 0
+    if plan["too_long"]:
+        return 1
+    out = fm.apply(root, plan)
+    print(f"\nRenamed {out['moved']} item(s). Undo log: {out['log']}")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     from . import cli as area_cli
     argv = list(sys.argv[1:] if argv is None else argv)
@@ -310,6 +334,12 @@ def main(argv: list[str] | None = None) -> int:
     p_record.add_argument("--student", default="",
                           help="only entries naming this Canvas user id or name")
     p_record.add_argument("--limit", type=int, default=30, help="how many entries to print")
+    p_folders = sub.add_parser(
+        "folders", help="rename data folders to '<id> - <name>' (shows the plan unless --apply)")
+    p_folders.add_argument("--apply", action="store_true",
+                           help="make the renames; close the Studio first")
+    p_folders.add_argument("--undo", action="store_true",
+                           help="put every renamed folder back, from data/renames.json")
     area_cli.register_all(sub)
     args = parser.parse_args(argv)
 
@@ -320,6 +350,8 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "doctor":
         return cmd_doctor(cfg)
+    if args.command == "folders":
+        return cmd_folders(cfg, apply=args.apply, undo=args.undo)
     if args.command == "courses":
         return cmd_courses(cfg)
     if args.command == "tools":

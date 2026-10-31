@@ -32,11 +32,8 @@
     mem.draftSeen = null;
     mem.draftPlaced = {};
     showView('area');
-    crumbs([
-      { label: 'Courses', href: '#/' },
-      { label: (S.course && S.course.name) || 'Course', href: '#/c/' + courseId },
-      { label: 'Assistant' },
-    ]);
+    await courseCrumbs(courseId, [{ label: 'Assistant' }]);
+    if (String(mem.courseId) !== String(courseId)) return;
     $('#headerActions').innerHTML = '';
     areaHead('Assistant', 'Ask for work in plain words. Every change to the live course '
       + 'stops here for your Allow, with the exact command shown.');

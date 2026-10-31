@@ -90,8 +90,9 @@ def animation_report():
 
 
 # --------------------------------------------------------------------- stats
-def mesh_stats(obj, depsgraph):
+def mesh_stats(obj, depsgraph, trouble=None):
     """Topology of the EVALUATED mesh, i.e. what the modifiers actually produce."""
+    trouble = trouble if trouble is not None else []
     out = {"eval_error": None}
     try:
         ev = obj.evaluated_get(depsgraph)
@@ -120,6 +121,13 @@ def mesh_stats(obj, depsgraph):
         interior = sum(1 for f in bm.faces
                        if all(len(e.link_faces) > 2 for e in f.edges) and len(f.edges) > 0)
         zero_area = sum(1 for f in bm.faces if f.calc_area() < 1e-9)
+        bm.normal_update()
+        outward = [(f, f.normal.copy()) for f in bm.faces]
+        try:
+            bmesh.ops.recalc_face_normals(bm, faces=bm.faces)
+            inward = sum(1 for f, n in outward if f.normal.dot(n) < 0)
+        except Exception:
+            inward = None
         bm.free()
 
         out.update({
@@ -131,12 +139,15 @@ def mesh_stats(obj, depsgraph):
             "non_manifold_edges": non_manifold,
             "loose_verts": loose_verts, "loose_edges": loose_edges,
             "interior_faces": interior, "zero_area_faces": zero_area,
+            "inward_faces": inward,
             "uv_layers": [uv.name for uv in me.uv_layers],
             "has_uvs": len(me.uv_layers) > 0,
             "shade_smooth": any(p.use_smooth for p in me.polygons),
             "custom_normals": me.has_custom_normals,
         })
         out.update(uv_stats(me))
+        out.update(safe("mesh extras %s" % obj.name,
+                        lambda: mesh_extras(obj, me), {}, trouble))
     finally:
         try:
             ev.to_mesh_clear()
@@ -164,7 +175,150 @@ def uv_stats(me):
             "uv_overlap_estimate": round(crowded / total, 3)}
 
 
-def object_report(obj, depsgraph):
+# Above this many evaluated vertices the doubles search is skipped (reported as
+# null) so one huge sculpt cannot eat the whole Blender timeout.
+MAX_DOUBLES_VERTS = 400_000
+DOUBLES_DISTANCE = 0.0001
+
+
+def largest_object_image(obj):
+    """(name, w, h) of the biggest image texture on the object's materials, or None."""
+    best = None
+    for slot in getattr(obj, "material_slots", None) or []:
+        mat = slot.material
+        tree = getattr(mat, "node_tree", None) if mat else None
+        if not tree:
+            continue
+        for node in tree.nodes:
+            img = getattr(node, "image", None) if node.type == "TEX_IMAGE" else None
+            if img is None:
+                continue
+            try:
+                w, h = int(img.size[0]), int(img.size[1])
+            except Exception:
+                continue
+            if w > 0 and h > 0 and (best is None or w * h > best[1] * best[2]):
+                best = (img.name, w, h)
+    return best
+
+
+def mesh_extras(obj, me):
+    """Doubles, UV islands and texel density, measured in world space.
+
+    Runs on a bmesh copy of the evaluated mesh so the topology numbers above are
+    untouched. Students no longer type these in; the file has to say them.
+    """
+    out = {"doubles": None, "uv_islands": None, "uv_area_fraction": None,
+           "surface_area_m2": None, "texel_density_px_per_m": None, "texel_image": None}
+    bm = bmesh.new()
+    try:
+        bm.from_mesh(me)
+        bmesh.ops.transform(bm, matrix=obj.matrix_world, verts=bm.verts)
+        bm.verts.ensure_lookup_table()
+
+        if len(bm.verts) <= MAX_DOUBLES_VERTS:
+            from mathutils import kdtree
+            tree = kdtree.KDTree(len(bm.verts))
+            for i, v in enumerate(bm.verts):
+                tree.insert(v.co, i)
+            tree.balance()
+            out["doubles"] = sum(1 for v in bm.verts
+                                 if len(tree.find_range(v.co, DOUBLES_DISTANCE)) > 1)
+
+        area = sum(f.calc_area() for f in bm.faces)
+        out["surface_area_m2"] = round(area, 6)
+
+        uv = bm.loops.layers.uv.active
+        if uv is None and len(bm.loops.layers.uv):
+            uv = bm.loops.layers.uv[0]
+        if uv is not None:
+            # Union-find over faces: two faces are on one island when they share
+            # a vertex at the same UV coordinate.
+            parent = list(range(len(bm.faces)))
+
+            def root(i):
+                while parent[i] != i:
+                    parent[i] = parent[parent[i]]
+                    i = parent[i]
+                return i
+
+            seen = {}
+            uv_area = 0.0
+            for fi, face in enumerate(bm.faces):
+                pts = []
+                for loop in face.loops:
+                    u, v = loop[uv].uv
+                    pts.append((u, v))
+                    key = (loop.vert.index, round(u, 5), round(v, 5))
+                    other = seen.setdefault(key, fi)
+                    if other != fi:
+                        a, b = root(fi), root(other)
+                        if a != b:
+                            parent[a] = b
+                # Shoelace area of the face in UV space.
+                acc = 0.0
+                for k in range(len(pts)):
+                    x1, y1 = pts[k]
+                    x2, y2 = pts[(k + 1) % len(pts)]
+                    acc += x1 * y2 - x2 * y1
+                uv_area += abs(acc) / 2.0
+            out["uv_islands"] = len({root(i) for i in range(len(bm.faces))})
+            out["uv_area_fraction"] = round(uv_area, 4)
+
+            img = largest_object_image(obj)
+            if img and area > 1e-12 and uv_area > 0:
+                out["texel_image"] = img[0]
+                out["texel_density_px_per_m"] = round(
+                    math.sqrt(uv_area * img[1] * img[2] / area), 1)
+    finally:
+        bm.free()
+    return out
+
+
+MODIFIER_SETTINGS = {
+    "BEVEL": ("width", "segments", "limit_method", "use_clamp_overlap", "offset_type"),
+    "MIRROR": ("use_clip", "use_axis", "use_bisect_axis"),
+    "ARRAY": ("count", "fit_type", "use_constant_offset", "use_relative_offset"),
+    "SOLIDIFY": ("thickness",),
+    "SUBSURF": ("levels", "render_levels"),
+    "BOOLEAN": ("operation", "solver"),
+    "MULTIRES": ("levels", "render_levels", "sculpt_levels"),
+}
+
+
+def modifier_settings(mod):
+    """The few settings a rubric asks about, for the modifier types it names."""
+    out = {}
+    for attr in MODIFIER_SETTINGS.get(mod.type, ()):
+        if not hasattr(mod, attr):
+            continue
+        try:
+            val = getattr(mod, attr)
+            if isinstance(val, float):
+                val = round(val, 5)
+            elif not isinstance(val, (bool, int, str)) and val is not None:
+                val = [bool(x) if isinstance(x, bool) else x for x in val]
+            out[attr] = val
+        except Exception:
+            continue
+    if mod.type == "BOOLEAN":
+        target = getattr(mod, "object", None)
+        out["object"] = target.name if target else None
+    return out
+
+
+def modifier_record(mod):
+    rec = {"type": mod.type, "name": mod.name,
+           "show_render": bool(getattr(mod, "show_render", True))}
+    if mod.type in MODIFIER_SETTINGS:
+        try:
+            rec["settings"] = modifier_settings(mod)
+        except Exception:
+            pass
+    return rec
+
+
+def object_report(obj, depsgraph, trouble=None):
     rec = {
         "name": obj.name,
         "type": obj.type,
@@ -173,19 +327,19 @@ def object_report(obj, depsgraph):
         "parent": obj.parent.name if obj.parent else None,
         "collections": [c.name for c in obj.users_collection],
         "location": rounded(obj.location),
+        "dimensions": rounded(obj.dimensions, 3),
         "scale": rounded(obj.scale),
         "rotation_deg": rounded([math.degrees(a) for a in obj.rotation_euler], 2),
         "unapplied_scale": any(abs(s - 1.0) > 1e-4 for s in obj.scale),
         "unapplied_rotation": any(abs(a) > 1e-4 for a in obj.rotation_euler),
-        "modifiers": [{"type": m.type, "name": m.name,
-                       "show_render": bool(getattr(m, "show_render", True))}
-                      for m in obj.modifiers],
+        # Stack order, top to bottom, with key settings for the common types.
+        "modifiers": [modifier_record(m) for m in obj.modifiers],
         "modifier_types": sorted({m.type for m in obj.modifiers}),
         "vertex_groups": len(obj.vertex_groups) if hasattr(obj, "vertex_groups") else 0,
         "materials": [ms.material.name if ms.material else None for ms in obj.material_slots],
     }
     if obj.type == "MESH" and obj.data:
-        rec["mesh"] = mesh_stats(obj, depsgraph)
+        rec["mesh"] = mesh_stats(obj, depsgraph, trouble)
         try:
             bb = [Vector(c) for c in obj.bound_box]
             centre = sum(bb, Vector()) / 8.0
@@ -197,7 +351,8 @@ def object_report(obj, depsgraph):
     return rec
 
 
-def material_report():
+def material_report(trouble=None):
+    trouble = trouble if trouble is not None else []
     out = []
     for mat in bpy.data.materials:
         if mat.users == 0:
@@ -212,8 +367,128 @@ def material_report():
             for n in mat.node_tree.nodes:
                 if n.type == "TEX_IMAGE" and n.image:
                     rec["images"].append(n.image.name)
+            # Added sections. Each is guarded on its own so a node type that
+            # moved in a new Blender costs this one field, not the material.
+            tree = mat.node_tree
+            rec["principled"] = safe("principled %s" % mat.name,
+                                     lambda: principled_report(tree), [], trouble)
+            rec["textures"] = safe("textures %s" % mat.name,
+                                   lambda: texture_report(tree), [], trouble)
         out.append(rec)
     return out
+
+
+MAX_BSDF_PER_MATERIAL = 4
+MAX_TEXTURES_PER_MATERIAL = 8
+
+
+def socket_value(sock):
+    """A socket's default value, or "linked" when something drives it."""
+    if sock is None:
+        return None
+    if sock.is_linked:
+        return "linked"
+    val = getattr(sock, "default_value", None)
+    if isinstance(val, float):
+        return round(val, 4)
+    try:
+        return rounded(val, 4)
+    except Exception:
+        return None
+
+
+def upstream_types(sock, depth=0, seen=None):
+    """Node types feeding one input socket, walking back through reroutes etc."""
+    seen = seen if seen is not None else set()
+    found = []
+    if sock is None or depth > 8:
+        return found
+    for link in sock.links:
+        node = link.from_node
+        if node.as_pointer() in seen:
+            continue
+        seen.add(node.as_pointer())
+        found.append(node.type)
+        for inp in node.inputs:
+            if inp.is_linked:
+                found.extend(upstream_types(inp, depth + 1, seen))
+    return found
+
+
+def principled_report(tree):
+    out = []
+    for node in tree.nodes:
+        if node.type != "BSDF_PRINCIPLED":
+            continue
+        normal = node.inputs.get("Normal")
+        feeding = upstream_types(normal) if normal is not None else []
+        out.append({
+            "node": node.name,
+            "base_color": socket_value(node.inputs.get("Base Color")),
+            "metallic": socket_value(node.inputs.get("Metallic")),
+            "roughness": socket_value(node.inputs.get("Roughness")),
+            "normal_linked": bool(normal is not None and normal.is_linked),
+            "normal_via_normal_map": "NORMAL_MAP" in feeding,
+            "normal_via_bump": "BUMP" in feeding,
+        })
+        if len(out) >= MAX_BSDF_PER_MATERIAL:
+            break
+    return out
+
+
+def downstream_targets(node, depth=0, via=(), seen=None):
+    """Where one node's output ends up: 'Base Color', 'Normal via NORMAL_MAP', ..."""
+    seen = seen if seen is not None else set()
+    hits = []
+    if depth > 8:
+        return hits
+    for output in node.outputs:
+        for link in output.links:
+            to = link.to_node
+            if to.type in ("BSDF_PRINCIPLED", "OUTPUT_MATERIAL"):
+                label = link.to_socket.name
+                if to.type == "OUTPUT_MATERIAL":
+                    label = "Material Output " + label
+                if via:
+                    label += " via " + ">".join(via)
+                hits.append(label)
+                continue
+            if to.type == "GROUP":
+                tree = getattr(to, "node_tree", None)
+                hits.append("node group %s" % (tree.name if tree else to.name))
+                continue
+            key = (to.as_pointer(), output.name)
+            if key in seen:
+                continue
+            seen.add(key)
+            step = via if to.type == "REROUTE" else via + (to.type,)
+            hits.extend(downstream_targets(to, depth + 1, step, seen))
+    return hits
+
+
+def texture_report(tree):
+    out = []
+    for node in tree.nodes:
+        if node.type != "TEX_IMAGE":
+            continue
+        img = node.image
+        targets = []
+        for hit in downstream_targets(node):
+            if hit not in targets:
+                targets.append(hit)
+        out.append({
+            "node": node.name,
+            "image": img.name if img else None,
+            "colorspace": img.colorspace_settings.name if img else None,
+            "feeds": targets[:6],
+        })
+        if len(out) >= MAX_TEXTURES_PER_MATERIAL:
+            break
+    return out
+
+
+def is_power_of_two(n):
+    return n > 0 and (n & (n - 1)) == 0
 
 
 def image_report():
@@ -226,20 +501,293 @@ def image_report():
             path = bpy.path.abspath(img.filepath)
         except Exception:
             pass
-        out.append({
+        rec = {
             "name": img.name,
             "packed": bool(img.packed_file),
             "filepath": img.filepath,
             "missing": bool(img.filepath) and not img.packed_file and not os.path.exists(path),
-        })
+        }
+        # Added fields: what a texture rubric checks without asking the student.
+        try:
+            w, h = int(img.size[0]), int(img.size[1])
+            rec["size"] = [w, h]
+            rec["power_of_two"] = is_power_of_two(w) and is_power_of_two(h)
+        except Exception:
+            rec["size"] = None
+            rec["power_of_two"] = None
+        rec["colorspace"] = getattr(getattr(img, "colorspace_settings", None), "name", None)
+        rec["source"] = getattr(img, "source", None)
+        out.append(rec)
     return out
+
+
+# ---------------------------------------------------------- lights & cameras
+MAX_LIGHTS = 16
+MAX_CAMERAS = 8
+MAX_EMPTIES = 16
+
+
+def subject_bounds():
+    """(lo, hi) of the visible, renderable meshes; all meshes if none are visible."""
+    def gather(only_visible):
+        lo = Vector((1e18, 1e18, 1e18))
+        hi = Vector((-1e18, -1e18, -1e18))
+        found = False
+        for obj in bpy.data.objects:
+            if obj.type != "MESH":
+                continue
+            if only_visible:
+                try:
+                    if not obj.visible_get() or obj.hide_render:
+                        continue
+                except Exception:
+                    pass
+            for corner in obj.bound_box:
+                p = obj.matrix_world @ Vector(corner)
+                lo = Vector((min(lo.x, p.x), min(lo.y, p.y), min(lo.z, p.z)))
+                hi = Vector((max(hi.x, p.x), max(hi.y, p.y), max(hi.z, p.z)))
+                found = True
+        return (lo, hi) if found else None
+    return gather(True) or gather(False)
+
+
+def subject_centre():
+    bounds = subject_bounds()
+    return (bounds[0] + bounds[1]) / 2.0 if bounds else None
+
+
+def horizontal_angle(a, b):
+    """Angle in degrees (0-180) between two vectors in the ground (XY) plane."""
+    a2 = Vector((a.x, a.y))
+    b2 = Vector((b.x, b.y))
+    if a2.length < 1e-9 or b2.length < 1e-9:
+        return None
+    return round(math.degrees(a2.angle(b2)), 1)
+
+
+def light_report(scene):
+    centre = subject_centre()
+    cam = scene.camera
+    cam_to_subject = None
+    if cam is not None and centre is not None:
+        cam_to_subject = centre - cam.matrix_world.translation
+    out = []
+    for obj in bpy.data.objects:
+        if obj.type != "LIGHT" or obj.data is None:
+            continue
+        light = obj.data
+        loc = obj.matrix_world.translation
+        aim = (obj.matrix_world.to_3x3() @ Vector((0.0, 0.0, -1.0))).normalized()
+        rec = {
+            "name": obj.name,
+            "type": light.type,
+            "energy": round(float(getattr(light, "energy", 0.0)), 3),
+            "color": rounded(getattr(light, "color", (1, 1, 1)), 3),
+            "shadow_soft_size": round(float(getattr(light, "shadow_soft_size", 0.0)), 4),
+            "location": rounded(loc),
+            "rotation_deg": rounded([math.degrees(a) for a in obj.matrix_world.to_euler()], 2),
+            "hide_render": bool(getattr(obj, "hide_render", False)),
+        }
+        if light.type == "AREA":
+            rec["shape"] = getattr(light, "shape", None)
+            rec["size"] = round(float(getattr(light, "size", 0.0)), 4)
+            if rec["shape"] in ("RECTANGLE", "ELLIPSE"):
+                rec["size_y"] = round(float(getattr(light, "size_y", 0.0)), 4)
+        if light.type == "SPOT":
+            rec["spot_size_deg"] = round(math.degrees(getattr(light, "spot_size", 0.0)), 2)
+            rec["spot_blend"] = round(float(getattr(light, "spot_blend", 0.0)), 3)
+        if light.type == "SUN":
+            rec["sun_angle_deg"] = round(math.degrees(getattr(light, "angle", 0.0)), 3)
+        if centre is not None:
+            # A sun has no position worth measuring; its direction is the light.
+            to_subject = aim if light.type == "SUN" else centre - loc
+            if light.type != "SUN":
+                rec["distance_to_subject"] = round(to_subject.length, 4)
+                if light.type in ("SPOT", "AREA") and to_subject.length > 1e-9:
+                    # How far the light's beam points away from the subject.
+                    rec["aim_off_subject_deg"] = round(
+                        math.degrees(aim.angle(to_subject.normalized())), 1)
+            from_subject = -to_subject
+            flat = Vector((from_subject.x, from_subject.y)).length
+            rec["elevation_deg"] = round(math.degrees(math.atan2(from_subject.z, flat)), 1)
+            rec["angle_from_camera_deg"] = (
+                horizontal_angle(cam_to_subject, to_subject) if cam_to_subject is not None
+                else None)
+        out.append(rec)
+    out.sort(key=lambda r: r["energy"], reverse=True)
+    return out[:MAX_LIGHTS], len(out)
+
+
+# A light more than this far around the subject from the camera is behind it:
+# a rim or back light, not a key or fill.
+BACK_LIGHT_DEG = 110
+
+
+def energy_ratio(ranked):
+    if len(ranked) >= 2 and ranked[1]["energy"] > 0:
+        return round(ranked[0]["energy"] / ranked[1]["energy"], 2)
+    return None
+
+
+def lighting_summary(lights, total):
+    lit = [l for l in lights if not l.get("hide_render")]
+    ranked = sorted(lit, key=lambda r: r["energy"], reverse=True)
+    front = [l for l in ranked if (l.get("angle_from_camera_deg") or 0) < BACK_LIGHT_DEG]
+    types = {l["type"] for l in ranked[:2]}
+    return {
+        "count": total,
+        "render_enabled": len(lit),
+        "by_energy": [[l["name"], l["type"], l["energy"]] for l in ranked],
+        "strongest": ranked[0]["name"] if ranked else None,
+        "second": ranked[1]["name"] if len(ranked) > 1 else None,
+        # Strongest over second strongest, whatever side of the subject they are on.
+        "key_fill_ratio": energy_ratio(ranked),
+        # The same, leaving out lights behind the subject (rim/back lights).
+        "back_lights": [l["name"] for l in ranked
+                        if (l.get("angle_from_camera_deg") or 0) >= BACK_LIGHT_DEG],
+        "key_fill_ratio_front": energy_ratio(front),
+        "front_pair": [l["name"] for l in front[:2]],
+        # Sun strength is W/m2 and the others are W, so the ratio is not like for like.
+        "ratio_mixes_sun": "SUN" in types and len(types) > 1,
+    }
+
+
+def camera_report(scene):
+    cams = [o for o in bpy.data.objects if o.type == "CAMERA"]
+    out = {"count": len(cams), "names": [c.name for c in cams][:MAX_CAMERAS],
+           "active": None}
+    cam = scene.camera
+    if cam is None or cam.type != "CAMERA" or cam.data is None:
+        return out
+    data = cam.data
+    active = {
+        "name": cam.name,
+        "type": data.type,
+        "lens_mm": round(float(data.lens), 3),
+        "sensor_width_mm": round(float(data.sensor_width), 3),
+        "sensor_fit": getattr(data, "sensor_fit", None),
+        "location": rounded(cam.matrix_world.translation),
+        "rotation_deg": rounded([math.degrees(a) for a in cam.matrix_world.to_euler()], 2),
+        "dof": bool(getattr(getattr(data, "dof", None), "use_dof", False)),
+    }
+    if data.type == "ORTHO":
+        active["ortho_scale"] = round(float(data.ortho_scale), 4)
+    bounds = subject_bounds()
+    if bounds:
+        try:
+            from bpy_extras.object_utils import world_to_camera_view
+            lo, hi = bounds
+            corners = [Vector((x, y, z)) for x in (lo.x, hi.x)
+                       for y in (lo.y, hi.y) for z in (lo.z, hi.z)]
+            inside = 0
+            for c in corners:
+                p = world_to_camera_view(scene, cam, c)
+                if p.z > 0 and -0.001 <= p.x <= 1.001 and -0.001 <= p.y <= 1.001:
+                    inside += 1
+            centre = world_to_camera_view(scene, cam, (lo + hi) / 2.0)
+            active["subject_corners_in_frame"] = inside
+            active["subject_centre_in_frame"] = rounded(centre[:2], 3) if centre.z > 0 else None
+        except Exception:
+            pass
+    out["active"] = active
+    return out
+
+
+def render_report(scene):
+    r = scene.render
+    eevee = getattr(scene, "eevee", None)
+    cycles = getattr(scene, "cycles", None)
+    img = r.image_settings
+    vs = scene.view_settings
+    return {
+        "engine": r.engine,
+        "eevee_samples": getattr(eevee, "taa_render_samples", None)
+        if eevee is not None else None,
+        "cycles_samples": getattr(cycles, "samples", None) if cycles is not None else None,
+        "cycles_denoising": getattr(cycles, "use_denoising", None)
+        if cycles is not None else None,
+        "resolution": [r.resolution_x, r.resolution_y],
+        "resolution_percentage": r.resolution_percentage,
+        "file_format": getattr(img, "file_format", None),
+        "color_mode": getattr(img, "color_mode", None),
+        "color_depth": getattr(img, "color_depth", None),
+        "film_transparent": bool(getattr(r, "film_transparent", False)),
+        "view_transform": getattr(vs, "view_transform", None),
+        "look": getattr(vs, "look", None),
+        "exposure": round(float(getattr(vs, "exposure", 0.0)), 4),
+        "gamma": round(float(getattr(vs, "gamma", 1.0)), 4),
+        "display_device": getattr(scene.display_settings, "display_device", None),
+    }
+
+
+def world_report(scene):
+    world = scene.world
+    out = {"name": world.name if world else None, "hdri": False, "hdri_image": None,
+           "hdri_size": None, "background_color": None, "strength": None}
+    tree = getattr(world, "node_tree", None) if world else None
+    if not tree:
+        if world is not None:
+            out["background_color"] = rounded(getattr(world, "color", (0, 0, 0)), 3)
+        return out
+    for node in tree.nodes:
+        if node.type == "TEX_ENVIRONMENT" and getattr(node, "image", None):
+            out["hdri"] = True
+            out["hdri_image"] = node.image.name
+            try:
+                out["hdri_size"] = [int(node.image.size[0]), int(node.image.size[1])]
+            except Exception:
+                pass
+            break
+    for node in tree.nodes:
+        if node.type == "BACKGROUND":
+            color = node.inputs.get("Color")
+            strength = node.inputs.get("Strength")
+            out["background_color"] = socket_value(color)
+            out["strength"] = socket_value(strength)
+            break
+    return out
+
+
+def empty_report():
+    out = []
+    for obj in bpy.data.objects:
+        if obj.type != "EMPTY":
+            continue
+        rec = {
+            "name": obj.name,
+            "display_type": getattr(obj, "empty_display_type", None),
+            "display_size": round(float(getattr(obj, "empty_display_size", 1.0)), 4),
+            "location": rounded(obj.matrix_world.translation),
+            "rotation_deg": rounded([math.degrees(a) for a in obj.matrix_world.to_euler()], 2),
+            "hide_select": bool(getattr(obj, "hide_select", False)),
+        }
+        if rec["display_type"] == "IMAGE":
+            img = obj.data if isinstance(getattr(obj, "data", None), bpy.types.Image) else None
+            rec["image"] = img.name if img else None
+            if img is not None:
+                try:
+                    rec["image_size"] = [int(img.size[0]), int(img.size[1])]
+                except Exception:
+                    pass
+            rec["image_depth"] = getattr(obj, "empty_image_depth", None)
+            rec["image_side"] = getattr(obj, "empty_image_side", None)
+            rec["use_alpha"] = bool(getattr(obj, "use_empty_image_alpha", False))
+            try:
+                rec["opacity"] = round(float(obj.color[3]), 3)
+            except Exception:
+                rec["opacity"] = None
+            rec["show_in_front"] = bool(getattr(obj, "show_in_front", False))
+        out.append(rec)
+    # Image empties first: they are the reference images a rubric asks about.
+    out.sort(key=lambda r: r["display_type"] != "IMAGE")
+    return out[:MAX_EMPTIES]
 
 
 def collect_stats():
     trouble = []
     scene = bpy.context.scene
     depsgraph = bpy.context.evaluated_depsgraph_get()
-    objects = [object_report(o, depsgraph) for o in bpy.data.objects]
+    objects = [object_report(o, depsgraph, trouble) for o in bpy.data.objects]
     meshes = [o for o in objects if o["type"] == "MESH" and "mesh" in o]
 
     def total(key):
@@ -256,6 +804,7 @@ def collect_stats():
             "engine": scene.render.engine,
             "resolution": [scene.render.resolution_x, scene.render.resolution_y],
             "frame_start": scene.frame_start, "frame_end": scene.frame_end,
+            "bounds_size": safe("bounds", scene_size, None, trouble),
         },
         "counts": {
             "objects": len(bpy.data.objects),
@@ -272,6 +821,8 @@ def collect_stats():
             "non_manifold_edges": total("non_manifold_edges"),
             "loose_verts": total("loose_verts"), "loose_edges": total("loose_edges"),
             "zero_area_faces": total("zero_area_faces"),
+            "interior_faces": total("interior_faces"),
+            "inward_faces": total("inward_faces"),
         },
         "hygiene": {
             "objects_with_unapplied_scale":
@@ -284,11 +835,25 @@ def collect_stats():
             "live_modifiers": sorted({m["type"] for o in objects for m in o["modifiers"]}),
         },
         "objects": objects,
-        "materials": safe("materials", material_report, [], trouble),
+        "materials": safe("materials", lambda: material_report(trouble), [], trouble),
         "images": safe("images", image_report, [], trouble),
         "animation": safe("animation", animation_report,
                           {"actions": [], "fcurves": 0, "keyframes": 0}, trouble),
     }
+    # Added sections: what students used to type in by hand (lighting notes,
+    # render settings, self-checks) read straight from the file instead.
+    lights, light_total = safe("lights", lambda: light_report(scene), ([], 0), trouble)
+    stats["lights"] = lights
+    stats["lighting"] = safe("lighting", lambda: lighting_summary(lights, light_total),
+                             None, trouble)
+    stats["cameras"] = safe("cameras", lambda: camera_report(scene), None, trouble)
+    stats["render"] = safe("render", lambda: render_report(scene), None, trouble)
+    stats["world"] = safe("world", lambda: world_report(scene), None, trouble)
+    stats["empties"] = safe("empties", empty_report, [], trouble)
+    stats["subject_centre"] = safe(
+        "subject centre", lambda: (rounded(subject_centre()) if subject_centre() else None),
+        None, trouble)
+    stats["totals"]["doubles"] = sum((o["mesh"].get("doubles") or 0) for o in meshes)
     for o in bpy.data.objects:
         stats["counts"]["by_type"][o.type] = stats["counts"]["by_type"].get(o.type, 0) + 1
 
@@ -316,6 +881,29 @@ def collect_stats():
 
 
 # ------------------------------------------------------------------- render
+def scene_size():
+    """World-axis size of the renderable scene: width, depth, height.
+
+    This is the measurement a screenshot cannot be trusted for. None when
+    the file has nothing with a bounding box.
+    """
+    lo = Vector((1e18, 1e18, 1e18))
+    hi = Vector((-1e18, -1e18, -1e18))
+    found = False
+    for obj in bpy.data.objects:
+        if obj.type not in {"MESH", "CURVE", "SURFACE", "META", "FONT"}:
+            continue
+        for corner in obj.bound_box:
+            point = obj.matrix_world @ Vector(corner)
+            lo = Vector((min(lo.x, point.x), min(lo.y, point.y), min(lo.z, point.z)))
+            hi = Vector((max(hi.x, point.x), max(hi.y, point.y), max(hi.z, point.z)))
+            found = True
+    if not found:
+        return None
+    size = hi - lo
+    return [round(size.x, 4), round(size.y, 4), round(size.z, 4)]
+
+
 def scene_bounds():
     """World-space bounding box of everything renderable."""
     lo = Vector((1e18, 1e18, 1e18))

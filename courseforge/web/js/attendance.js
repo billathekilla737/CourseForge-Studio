@@ -84,11 +84,8 @@
     showView('area');
     if (typeof ensureCourse === 'function') await ensureCourse(courseId);
     if (String(mem().courseId) !== String(courseId)) return;
-    crumbs([
-      { label: 'Courses', href: '#/' },
-      { label: courseTitle(S.course), href: '#/c/' + courseId },
-      { label: 'Attendance' },
-    ]);
+    await courseCrumbs(courseId, [{ label: 'Attendance' }]);
+    if (String(mem().courseId) !== String(courseId)) return;
     areaHead('Attendance',
       'Who was here, tardy, or absent. Nothing is written to the gradebook.');
     if (typeof areaTabs === 'function') areaTabs([]);

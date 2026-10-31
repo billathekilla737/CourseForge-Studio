@@ -126,6 +126,118 @@ class ExtrasStayInThisTerm(unittest.TestCase):
         self.assertEqual(out["courses_checked"], 1)
         self.assertEqual(calls, [("assignments", "9"), ("quizzes", "9")])
         self.assertEqual(out["extensions"][0]["title"], "Quiz 1")
+        self.assertNotIn("work", out)
+
+
+class ReminderNote(unittest.TestCase):
+    def test_the_note_names_the_student_the_course_and_the_work(self):
+        subject, body = assemble.reminder_message(
+            "Bourgeois, Andrew", "3D Game Engine I",
+            ["Project — Maze Escape", "Week 8 Quiz"], "Ada Lovelace")
+        self.assertEqual(subject, "Missing work in 3D Game Engine I")
+        self.assertIn("Hi Andrew, you are missing 2 assignments for 3D Game Engine I:", body)
+        self.assertIn("- Project — Maze Escape", body)
+        self.assertIn("- Week 8 Quiz", body)
+        self.assertIn("Please reach out to Ada Lovelace on how to proceed from here.", body)
+
+    def test_one_assignment_stays_singular(self):
+        _subject, body = assemble.reminder_message(
+            "Robin Vale", "Game Theory", ["Quiz 1"], "")
+        self.assertIn("you are missing 1 assignment for Game Theory:", body)
+        self.assertIn("your instructor", body)
+
+
+class LateAndMissing(unittest.TestCase):
+    def test_each_class_names_how_long_and_skips_the_rest(self):
+        from datetime import datetime, timezone
+        now = datetime(2026, 10, 20, 12, 0, tzinfo=timezone.utc)
+        rows = assemble.work_items([
+            {"assignment_id": 1, "missing": True, "submitted_at": None,
+             "assignment": {"name": "Pitch", "due_at": "2026-10-08T12:00:00Z",
+                            "published": True}},
+            {"assignment_id": 2, "late": True, "seconds_late": 2 * 86400 + 3600,
+             "submitted_at": "2026-10-18T12:00:00Z",
+             "assignment": {"name": "Quiz", "due_at": "2026-10-16T12:00:00Z",
+                            "published": True}},
+            {"assignment_id": 3, "submitted_at": "2026-10-01T12:00:00Z",
+             "assignment": {"name": "On time", "due_at": "2026-10-02T12:00:00Z",
+                            "published": True}},
+            {"assignment_id": 4, "missing": True, "excused": True,
+             "assignment": {"name": "Excused", "due_at": "2026-09-01T12:00:00Z"}},
+            {"assignment_id": 5, "missing": True,
+             "assignment": {"name": "Draft", "published": False,
+                            "due_at": "2026-09-01T12:00:00Z"}},
+            {"assignment_id": 6, "submitted_at": None,
+             "assignment": {"name": "Still open", "due_at": "2026-11-01T12:00:00Z",
+                            "published": True}},
+            {"assignment_id": 7, "missing": True,
+             "assignment": {"name": "No date", "published": True}},
+        ], now)
+        self.assertEqual([(row["title"], row["label"]) for row in rows], [
+            ("Pitch", "12 days missing"),
+            ("No date", "missing"),
+            ("Quiz", "2 days late"),
+        ])
+
+    def test_the_student_page_reads_only_this_term(self):
+        app = _App(Path(tempfile.mkdtemp()))
+        calls = []
+
+        class Client:
+            def assignments_with_overrides(self, cid):
+                return []
+
+            def quizzes(self, cid):
+                return []
+
+            def student_submissions(self, cid, uid):
+                calls.append((cid, str(uid)))
+                return [{
+                    "assignment_id": 5, "missing": True,
+                    "cached_due_date": "2026-10-01T12:00:00Z",
+                    "assignment": {"id": 5, "name": "Pitch", "published": True,
+                                   "due_at": "2026-10-01T12:00:00Z"},
+                }]
+
+        app.client = Client()
+        app.courses = lambda refresh=False: [
+            {"id": "9", "name": "Games now", "term_label": "Fall 2026",
+             "term_code": "202630", "term_sort": 202630, "excluded": False},
+            {"id": "3", "name": "Old games", "term_label": "Fall 2024",
+             "term_code": "202430", "term_sort": 202430, "excluded": False},
+        ]
+        app.taught_students = lambda refresh=False: {"students": [{
+            "user_id": "7", "name": "Ada Lovelace",
+            "course_refs": [
+                {"id": "9", "name": "Games now", "term": "Fall 2026"},
+                {"id": "3", "name": "Old games", "term": "Fall 2024"},
+            ],
+        }]}
+        from courseforge import terms
+        original = terms.current_code
+        terms.current_code = lambda today=None: "202630"
+        notes = []
+        try:
+            out = assemble.course_work(app, "7", lambda msg, done, total: notes.append(msg))
+        finally:
+            terms.current_code = original
+        self.assertEqual(calls, [("9", "7")])
+        item = out["work"][0]["items"][0]
+        self.assertEqual(item["title"], "Pitch")
+        self.assertEqual(item["kind"], "missing")
+        self.assertTrue(item["label"].endswith(" missing"))
+        self.assertTrue(any(n.startswith("Reading 1 of 1:") for n in notes))
+        page = (Path(__file__).resolve().parents[1] / "courseforge" / "web" / "js"
+                / "student.js").read_text(encoding="utf-8")
+        self.assertIn('class="stCourse"', page)
+        self.assertIn("paintCourseWork", page)
+        self.assertIn("setCourseBusy", page)
+        self.assertIn("/work", page)
+        import courseforge.studentsarea.routes  # noqa: F401  registers the route
+        from courseforge.routing import ROUTER
+        hit = [r for r in ROUTER.routes if r.pattern == "/api/student/{uid}/work"]
+        self.assertEqual(len(hit), 1)
+        self.assertEqual(hit[0].method, "POST")
 
 
 if __name__ == "__main__":

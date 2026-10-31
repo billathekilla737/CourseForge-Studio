@@ -2,10 +2,10 @@
 
     data/
       courses.json
-      <course_id>/
+      <course_id> - <title> (<term>)/       found by the number; see folders.py
         assignments.json
         students.json
-        <assignment_id>/
+        <assignment_id> - <name>/
           assignment.json      the assignment, including its rubric
           submissions.json     raw submissions
           discussion.json      topic view, for graded discussions
@@ -13,7 +13,10 @@
           instructions.md      your custom grading instructions
           map.json             pseudonym -> identity (local only)
           draft.json           scores, comments, provenance
-          files/               downloaded attachments
+          files/               downloaded attachments, one folder per
+                               student: <user_id> - <Last, First>/
+      Browse/<term>/<course>/<assignment>.lnk
+                               optional shortcuts by term (browse.py)
 
 Everything under data/ is gitignored. draft.json is the single source of truth
 for the review UI and for any later push to Canvas.
@@ -27,6 +30,8 @@ import threading
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+
+from . import folders
 
 
 _ID = re.compile(r"^[A-Za-z0-9_-]+$")
@@ -59,14 +64,59 @@ class Store:
         return self._lock
 
     # ------------------------------------------------------------- locations
+    # A new folder assumes the deepest path below it is about this long, so a
+    # typical submission still fits under Windows' 260 (folders.room).
+    COURSE_DEPTH = 128
+    ASSIGNMENT_DEPTH = 87
+
+    def find_course_dir(self, course_id) -> Path | None:
+        """The course's folder if it exists, under any name. Creates nothing."""
+        return folders.find(self.root, safe_id(course_id))
+
+    def find_assignment_dir(self, course_id, assignment_id) -> Path | None:
+        cdir = self.find_course_dir(course_id)
+        return folders.find(cdir, safe_id(assignment_id)) if cdir else None
+
     def course_dir(self, course_id) -> Path:
-        path = self.root / safe_id(course_id)
-        path.mkdir(parents=True, exist_ok=True)
+        path = self.find_course_dir(course_id)
+        if path is None:
+            cid = safe_id(course_id)
+            course = next((c for c in self.courses() if str(c.get("id")) == cid), None)
+            cap = folders.room(self.root, cid, self.COURSE_DEPTH, folders.COURSE_CAP)
+            path = self.root / folders.course_label(course, cid, cap)
+            path.mkdir(parents=True, exist_ok=True)
         return path
 
     def assignment_dir(self, course_id, assignment_id) -> Path:
-        path = self.course_dir(course_id) / safe_id(assignment_id)
+        cdir = self.course_dir(course_id)
+        path = folders.find(cdir, safe_id(assignment_id))
+        if path is None:
+            aid = str(assignment_id)
+            listed = self.read(cdir / "assignments.json", []) or []
+            name = next((a.get("name") for a in listed
+                         if isinstance(a, dict) and str(a.get("id")) == aid), "")
+            cap = folders.room(cdir, aid, self.ASSIGNMENT_DEPTH, folders.ASSIGNMENT_CAP)
+            path = cdir / folders.label(aid, name, cap)
         (path / "files").mkdir(parents=True, exist_ok=True)
+        return path
+
+    def student_dir(self, course_id, assignment_id, user_id, deepest: int = 81,
+                    create: bool = True) -> Path:
+        """files/<uid> - <Last, First>/, made on first use (or only named).
+
+        An older sync left files flat as files/<uid>_<name>; those stay where
+        they are until the migration moves them, and are still read from there.
+        """
+        files = self.assignment_dir(course_id, assignment_id) / "files"
+        uid = safe_id(user_id)
+        path = folders.find(files, uid)
+        if path is None:
+            student = next((s for s in self.students(course_id)
+                            if str(s.get("id")) == uid), None)
+            cap = folders.room(files, uid, deepest, folders.STUDENT_CAP)
+            path = files / folders.student_label(student, uid, cap)
+            if create:
+                path.mkdir(parents=True, exist_ok=True)
         return path
 
     # ------------------------------------------------------------ primitives
@@ -124,7 +174,11 @@ class Store:
         self.write_text(self.assignment_dir(course_id, assignment_id) / "instructions.md", text)
 
     def extracted(self, course_id, assignment_id) -> dict:
-        return self.read(self.assignment_dir(course_id, assignment_id) / "extracted.json", {}) or {}
+        """extracted.json, its saved paths pointed at where the folders are now."""
+        adir = self.assignment_dir(course_id, assignment_id)
+        raw = self.read(adir / "extracted.json", {}) or {}
+        return folders.rebase(raw, adir, course_id, assignment_id,
+                              folders.student_dirs(adir / "files"))
 
     def save_extracted(self, course_id, assignment_id, extracted: dict) -> None:
         with self._lock:
@@ -202,5 +256,6 @@ class Store:
         path = self.assignment_dir(course_id, assignment_id)
         saved = self.instructions(course_id, assignment_id) if keep_instructions else ""
         shutil.rmtree(path, ignore_errors=True)
+        folders.forget(path.parent)
         if saved:
             self.save_instructions(course_id, assignment_id, saved)

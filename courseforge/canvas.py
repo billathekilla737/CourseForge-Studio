@@ -340,6 +340,20 @@ class CanvasClient(ContentOps, FilesOps, CourseOps):
             )
         return payload or {}
 
+    def clear_late_status(self, course_id: int | str, assignment_id: int | str,
+                          user_id: int | str) -> dict:
+        """Mark one submission "none" for lateness, which removes the points
+        Canvas's automatic late policy took off it. Studio applies the late
+        penalty itself, so this goes in before the grade on a push. Callers
+        must gate this themselves."""
+        url = (f"{self.base}/api/v1/courses/{course_id}/assignments/"
+               f"{assignment_id}/submissions/{user_id}")
+        payload, _ = self._request(
+            "PUT", url,
+            data=urllib.parse.urlencode([("submission[late_policy_status]", "none")]).encode("utf-8"),
+            content_type="application/x-www-form-urlencoded")
+        return payload or {}
+
     def _json_body(self, method: str, path: str, body: dict) -> dict:
         """Send a JSON body. Used where Canvas takes an array of objects and
         form encoding would depend on the order of repeated bracket keys."""

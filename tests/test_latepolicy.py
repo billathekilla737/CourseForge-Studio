@@ -218,7 +218,9 @@ class LoadFromAFakeCourse(unittest.TestCase):
         self.assertEqual(policy["kind"], "percent_per_day")
         self.assertFalse(policy["canvas_applies"])
 
-    def test_canvas_policy_wins_over_the_syllabus(self):
+    def test_the_syllabus_rule_stands_and_canvas_is_only_noted(self):
+        # Studio takes the late penalty; Canvas's own deduction is cleared on
+        # push (tests/test_canvas_late.py). Canvas being on is recorded, not obeyed.
         class Client:
             def course_detail(self, cid, include=None):
                 return {"syllabus_body": "10% per day late."}
@@ -232,8 +234,10 @@ class LoadFromAFakeCourse(unittest.TestCase):
                         "late_submission_interval": "day"}
 
         policy = latepolicy.load(Client(), "1", lambda html: html)
-        self.assertTrue(policy["canvas_applies"])
-        self.assertEqual(policy["kind"], "canvas")
+        self.assertFalse(policy["canvas_applies"])
+        self.assertTrue(policy["canvas_late_on"])
+        self.assertEqual(policy["kind"], "percent_per_day")
+        self.assertNotEqual(policy.get("source"), "canvas", "the syllabus rule, not Canvas's")
 
 
 class OneStudentUsesTheInstructions(unittest.TestCase):

@@ -59,8 +59,16 @@ def canvas_grade_fields(sub: dict, me_id: str | int | None) -> dict:
         mine.sort(key=lambda c: c.get("created_at") or "")
         if mine:
             comment = str(mine[-1]["comment"]).strip()
+    # Canvas's automatic late policy takes its cut off the score it shows and
+    # keeps the grade that was entered beside it. The entered grade is the one
+    # this side compares with: comparing the cut one read Canvas's deduction
+    # as another machine regrading, and copied it over the instructor's grade.
+    entered = sub.get("entered_score")
     return {
-        "canvas_score": sub.get("score"),
+        "canvas_score": entered if entered is not None else sub.get("score"),
+        "canvas_shown_score": sub.get("score"),
+        "canvas_points_deducted": sub.get("points_deducted") or 0,
+        "canvas_late_status": sub.get("late_policy_status"),
         "canvas_state": sub.get("workflow_state"),
         "canvas_graded_at": sub.get("graded_at"),
         "canvas_posted_at": sub.get("posted_at"),

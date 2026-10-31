@@ -727,7 +727,7 @@ class App:
         # read that saved number. Opening the assignment puts it right.
         self._refresh_totals(course_id, assignment_id)
         draft = self.store.draft(course_id, assignment_id)
-        policy = draft.get("late_policy") or self.course_late_policy(course_id)
+        policy = self._late_policy_for(course_id, draft)
         draft = self._reprice_late(course_id, assignment_id, draft, policy)
         adir = self.store.assignment_dir(course_id, assignment_id)
         extracted = extract.present_text_entries(
@@ -1003,7 +1003,7 @@ class App:
         info = self.store.extracted(course_id, assignment_id).get(str(user_id)) or {}
         if not info.get("late"):
             return None
-        policy = draft.get("late_policy") or self.course_late_policy(course_id)
+        policy = self._late_policy_for(course_id, draft)
         if not policy or policy.get("canvas_applies"):
             return None
         if (policy.get("kind") or "") not in latepolicy.APPLY_KINDS:
@@ -1021,12 +1021,25 @@ class App:
                      if str(f).startswith("late penalty"))
         return {"late_penalty": lp, "flags": flags}
 
+    def _late_policy_for(self, course_id, draft: dict) -> dict:
+        """The rule that prices lateness on this assignment.
+
+        The one saved when it was graded, unless that rule was "Canvas
+        deducts": Studio takes the penalty itself now, so those assignments
+        use the course's own rule from the syllabus.
+        """
+        saved = draft.get("late_policy") or {}
+        if saved and not saved.get("canvas_applies") and saved.get("kind") != "canvas":
+            return saved
+        return self.course_late_policy(course_id)
+
     def _reprice_late(self, course_id, assignment_id, draft: dict, policy: dict) -> dict:
         """Replace a late cut Studio already applied, using the fractional day.
 
         Opening the assignment is enough for those rows. It does not re-grade
         the work, add a cut to a score that never had one, or touch a waived
-        penalty or a course where Canvas already deducts.
+        penalty. A row graded while Canvas took the penalty gets Studio's own
+        now, or the waiver the instructions give.
         """
         if not policy or policy.get("canvas_applies"):
             return draft
@@ -1046,11 +1059,19 @@ class App:
                 if not info.get("late"):
                     continue
                 current = dict(entry.get("late_penalty") or {})
-                # A score with no late cut, or one Canvas already took, stays
-                # as it is. This only replaces a cut Studio itself applied.
-                if not current or current.get("waived") or current.get("kind") == "canvas":
+                # A score with no late cut stays as it is. This replaces a
+                # cut Studio applied, or one Canvas was meant to take: Canvas
+                # never deducts now, so without this those rows lose nothing.
+                if not current or current.get("waived"):
                     continue
-                if latepolicy.waiver(instructions, info):
+                reason = latepolicy.waiver(instructions, info)
+                if reason and current.get("kind") == "canvas":
+                    entry["late_penalty"] = {**current, "applied": False, "waived": True,
+                                             "points": 0, "summary": reason}
+                    entry["final_total"] = curve.final_total(entry, rubric, possible)
+                    changed = True
+                    continue
+                if reason:
                     continue
                 earned = curve.earned_total(entry, rubric)
                 fresh = latepolicy.attach(
@@ -2294,13 +2315,14 @@ class App:
     def course_late_policy(self, course_id) -> dict:
         """The late-work rule for this course, from the syllabus (or Canvas)."""
         key = str(course_id)
-        if key in self._late_cache:
-            return self._late_cache[key]
+        cache = self.__dict__.setdefault("_late_cache", {})
+        if key in cache:
+            return cache[key]
         try:
             policy = latepolicy.load(self.client, course_id, self._plain_html)
         except Exception as exc:  # noqa: BLE001
             policy = latepolicy.empty(f"Could not read the syllabus: {type(exc).__name__}")
-        self._late_cache[key] = policy
+        cache[key] = policy
         return policy
 
     def schedule_item(self, course_id, assignment_id) -> dict:
@@ -2601,6 +2623,15 @@ class App:
     def resolve(self, course_id, assignment_id, only: list[str], choice: str) -> dict:
         return gradesync.resolve_conflicts(self.store, course_id, assignment_id, only, choice)
 
+    @staticmethod
+    def _late_clear_note(planned: list[dict]) -> tuple[int, str]:
+        n = sum(1 for p in planned if p.get("clear_late"))
+        if not n:
+            return 0, ""
+        return n, (f"{n} of these {'has' if n == 1 else 'have'} Canvas's automatic late "
+                   "deduction removed first, so the late penalty is not taken twice: "
+                   "the score written is the one shown here.")
+
     def push(self, course_id, assignment_id, dry_run: bool = True,
              only: list[str] | None = None, include_comments: bool = False,
              show: bool = False, log=lambda _m: None,
@@ -2615,6 +2646,12 @@ class App:
         # Only rows of the rubric Canvas really has get sent; see
         # canvas_criterion_ids for why this is a set and not a string test.
         canvas_ids = canvas_criterion_ids(self.store.assignment(course_id, assignment_id))
+
+        # Studio takes the late penalty; Canvas's automatic one never sticks.
+        # Late work in a course where Canvas's policy is on, and any grade
+        # Canvas already cut, gets its late status cleared before the grade.
+        canvas_late_on = bool((self._late_policy_for(course_id, draft) or {})
+                              .get("canvas_late_on"))
 
         # Students see the grade when it is written. `show` is kept on the
         # signature so an older page cannot ask for a hidden push.
@@ -2680,6 +2717,10 @@ class App:
                 if round(score - earned, 2):
                     item["earned"] = earned
                     item["curved_by"] = round(score - earned, 2)
+                if info.get("canvas_late_status") != "none" and (
+                        float(info.get("canvas_points_deducted") or 0) > 0
+                        or (canvas_late_on and info.get("late"))):
+                    item["clear_late"] = True
                 planned.append(item)
 
         if dry_run:
@@ -2701,7 +2742,11 @@ class App:
                 + f"; grades land {landing}")
             if rubric_note:
                 log(rubric_note)
+            n_late, late_note = self._late_clear_note(planned)
+            if late_note:
+                log(late_note)
             return {"dry_run": True, "would_post": planned, "skipped": skipped,
+                    "late_cleared_n": n_late, "late_note": late_note,
                     "include_comments": mode != "none", "comment_mode": mode,
                     "comments_n": n_comments,
                     "rubric_n": n_rubric, "rubric_differs_n": n_differs,
@@ -2722,9 +2767,13 @@ class App:
                     # the dialog was shown has to ask again, as promised.
                     "comments": (sorted([str(i["user_id"]), i.get("comment") or ""]
                                         for i in planned)
-                                 if mode != "none" else False)},
+                                 if mode != "none" else False),
+                    "clear_late": sorted(str(i["user_id"]) for i in planned
+                                         if i.get("clear_late"))},
                    f"Write {len(planned)} grade(s) to Canvas. Students will "
-                   "be able to see them.",
+                   "be able to see them."
+                   + (" " + self._late_clear_note(planned)[1]
+                      if any(i.get("clear_late") for i in planned) else ""),
                    confirm_token, what="posting grades")
 
         self._stop_holding_grades(course_id, assignment_id, log)
@@ -2741,6 +2790,9 @@ class App:
                     self.client.grade_quiz_questions(
                         course_id, quiz.get("quiz_id"), quiz["submission_id"],
                         quiz.get("attempt") or 1, quiz["questions"])
+                if item.get("clear_late"):
+                    # First, or Canvas cuts the grade about to be written.
+                    self.client.clear_late_status(course_id, assignment_id, item["user_id"])
                 sub = self.client.post_grade(course_id, assignment_id, item["user_id"],
                                              score=item["score"], comment=item["comment"] or None,
                                              rubric=item.get("rubric") or None)
@@ -2754,8 +2806,13 @@ class App:
                     settled[item["user_id"]]["needs_human"] = False
                     settled[item["user_id"]]["human_ok"] = True
                 if isinstance(sub, dict) and sub:
+                    entered = sub.get("entered_score")
                     canvas_side[item["user_id"]] = {
-                        "canvas_score": sub.get("score"),
+                        "canvas_score": entered if entered is not None else sub.get("score"),
+                        "canvas_shown_score": sub.get("score"),
+                        "canvas_points_deducted": sub.get("points_deducted") or 0,
+                        "canvas_late_status": sub.get("late_policy_status")
+                        or ("none" if item.get("clear_late") else None),
                         "canvas_graded_at": sub.get("graded_at"),
                         "canvas_posted_at": sub.get("posted_at"),
                         "canvas_state": sub.get("workflow_state"),

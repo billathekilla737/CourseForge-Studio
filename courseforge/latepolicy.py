@@ -666,7 +666,13 @@ def load(client, course_id, plain_html: Callable[[str], str]) -> dict:
             canvas = (raw or {}).get("late_policy") if isinstance(raw, dict) else None
     except Exception:  # noqa: BLE001
         canvas = None
-    if isinstance(canvas, dict) and canvas.get("late_submission_deduction_enabled"):
+    # Studio grades lateness and Canvas never does: a push clears Canvas's
+    # deduction (see canvas_late_on in server.push). Canvas's own numbers are
+    # used only when the syllabus states no rule of its own.
+    parsed["canvas_late_on"] = bool(isinstance(canvas, dict)
+                                    and canvas.get("late_submission_deduction_enabled"))
+    parsed["canvas_applies"] = False
+    if parsed["canvas_late_on"] and (parsed.get("kind") or "none") == "none":
         interval = str(canvas.get("late_submission_interval") or "day").lower()
         if interval not in ("day", "hour"):
             interval = "day"
@@ -674,14 +680,13 @@ def load(client, course_id, plain_html: Callable[[str], str]) -> dict:
         floor = 0.0
         if canvas.get("late_submission_minimum_percent_enabled"):
             floor = float(canvas.get("late_submission_minimum_percent") or 0)
-        parsed["canvas_applies"] = True
-        parsed["kind"] = "canvas"
+        parsed["kind"] = "percent_per_day"
         parsed["percent"] = percent
         parsed["interval"] = interval
         parsed["floor_percent"] = floor
         parsed["source"] = "canvas"
         parsed["summary"] = (
-            f"Canvas already deducts {_fmt(percent)}% per {interval} late"
+            f"{_fmt(percent)}% per {interval} late, from the Canvas late policy"
             + (f", not below {_fmt(floor)}%" if floor else "")
-            + ". Studio will not dock twice.")
+            + ". Studio takes it; Canvas's own deduction is cleared on push.")
     return parsed

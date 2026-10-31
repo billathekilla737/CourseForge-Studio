@@ -42,7 +42,7 @@ class AnOldCurvedTotalIsPutRight(unittest.TestCase):
 
     def test_opening_the_assignment_does_it(self):
         src = inspect.getsource(App.workspace)
-        self.assertLess(src.index("_refresh_totals"), src.index('draft.get("late_policy")'),
+        self.assertLess(src.index("_refresh_totals"), src.index("_late_policy_for("),
                         "refreshed before the draft is read for the page")
 
 

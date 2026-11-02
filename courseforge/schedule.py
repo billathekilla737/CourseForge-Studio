@@ -229,7 +229,7 @@ def stats(items: list[dict], now: datetime | None = None) -> dict:
     """
     now = now or datetime.now(timezone.utc)
     soon = now + timedelta(days=7)
-    remaining = upcoming = exams_left = waiting = 0
+    remaining = upcoming = exams_left = waiting = graded = 0
     for item in items:
         when = _parse(item.get("due_at"))
         past = bool(when and when < now)
@@ -240,12 +240,17 @@ def stats(items: list[dict], now: datetime | None = None) -> dict:
             if item.get("exam"):
                 exams_left += 1
         waiting += int(item.get("needs_grading") or 0)
+        # Graded means something came in and nothing is left waiting. An item
+        # nobody has submitted to yet is not graded, it is just not started.
+        if item.get("has_submissions") and not int(item.get("needs_grading") or 0):
+            graded += 1
     return {
         "total": len(items),
         "remaining": remaining,
         "next_7_days": upcoming,
         "exams_left": exams_left,
         "needs_grading": waiting,
+        "graded": graded,
     }
 
 

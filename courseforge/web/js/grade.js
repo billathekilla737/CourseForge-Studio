@@ -1686,7 +1686,7 @@ function scheduleStats(items) {
      are still-due; waiting to grade includes the past-due backlog. */
   const now = Date.now();
   const soon = now + 7 * DAY_MS;
-  let remaining = 0, upcoming = 0, exams_left = 0, waiting = 0;
+  let remaining = 0, upcoming = 0, exams_left = 0, waiting = 0, graded = 0;
   for (const it of items) {
     const t = new Date(it.due_at).getTime();
     const past = !isNaN(t) && t < now;
@@ -1696,9 +1696,10 @@ function scheduleStats(items) {
       if (it.exam) exams_left++;
     }
     waiting += (+it.needs_grading || 0);
+    if (it.has_submissions && !(+it.needs_grading)) graded++;
   }
   return { total: items.length, remaining, next_7_days: upcoming,
-           exams_left, needs_grading: waiting };
+           exams_left, needs_grading: waiting, graded };
 }
 
 function schedPad(n) { return String(n).padStart(2, '0'); }
@@ -1825,8 +1826,8 @@ function renderSchedule() {
      'Tests, exams and finals still due in the courses selected below'],
     [st.needs_grading, 'Waiting to grade',
      'Submissions Canvas says are waiting, including past due, in the courses selected below'],
-    [st.total, 'Dated items this term',
-     'Every dated item in the courses selected below, past and upcoming'],
+    [st.graded, 'Items graded this term',
+     'Dated items with submissions and none left waiting to grade, in the courses selected below'],
   ].map(([n, label, hint]) => `<div class="schedStat" title="${hint}"><b>${
       n == null ? '—' : n}</b><span>${label}</span></div>`).join('');
 
@@ -1912,19 +1913,25 @@ function renderSchedule() {
       // Only the assessments in this week, and only the ones the current
       // filters are actually showing: the button acts on what is on screen.
       const exams = items.filter(i => i.exam);
+      // The week's buttons sit with its title, away from the counts on the
+      // right: styled as pills beside the item count, they read as status.
       return `<section class="week ${key === thisWeek ? 'now' : ''}">
         <div class="whead">
-          <h2>Week of ${monday.toLocaleDateString([], { month: 'short', day: 'numeric' })}${
-            key === thisWeek ? ' <span class="nowTag">this week</span>' : ''}</h2>
+          <div class="wtitle">
+            <h2>Week of ${monday.toLocaleDateString([], { month: 'short', day: 'numeric' })}${
+              key === thisWeek ? ' <span class="nowTag">this week</span>' : ''}</h2>
+            <div class="wactions">
+              <button class="btn sm ai" type="button" data-sum="${key}"
+                title="What this week teaches and tests across your courses, read from each assignment">What's this week?</button>
+              ${exams.length ? `<button class="btn sm" type="button" data-week="${key}"
+                title="Draft a reminder announcement for each of these ${
+                  exams.length} assessment(s)">Remind ${exams.length} test${
+                  exams.length > 1 ? 's' : ''}</button>` : ''}
+            </div>
+          </div>
           <div class="wmeta">${fmtRange(monday, sunday)}
             <span class="load">${items.length} item${items.length > 1 ? 's' : ''} ·
-              ${num(pts)} pts${wait ? ` · ${wait} to grade` : ''}</span>
-            <button class="weekRemind weekSum" data-sum="${key}"
-              title="What this week teaches and tests across your courses, read from each assignment">What's this week?</button>
-            ${exams.length ? `<button class="weekRemind" data-week="${key}"
-              title="Draft a reminder announcement for each of these ${
-                exams.length} assessment(s)">Remind ${exams.length} test${
-                exams.length > 1 ? 's' : ''}</button>` : ''}</div>
+              ${num(pts)} pts${wait ? ` · ${wait} to grade` : ''}</span></div>
         </div>
         <table><thead><tr><th>Due</th><th>Course</th><th>Item</th><th>Type</th>
           <th class="tg">To grade</th><th class="pts">Pts</th></tr></thead><tbody>

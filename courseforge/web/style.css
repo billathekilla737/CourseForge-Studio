@@ -874,13 +874,9 @@ mark.ovSim.flash{background:rgba(90,160,220,.6);outline:2px solid var(--edit)}
 .rowEdit:hover{border-color:var(--edit);color:var(--edit);
   background:var(--edit-soft)}
 
-/* the week-level reminder button, in the week header */
-.weekRemind{margin-left:9px;padding:2px 10px;border-radius:999px;cursor:pointer;
-  border:1px solid var(--ai);background:transparent;color:var(--ai);
-  font:600 11px var(--sans)}
-.weekRemind:hover{background:var(--ai-soft)}
-.week.now .weekRemind{border-color:var(--warn);color:var(--warn)}
-.week.now .weekRemind:hover{background:var(--warn-soft)}
+/* the week-level actions, beside the week title */
+.wtitle{display:flex;align-items:center;gap:14px;flex-wrap:wrap}
+.wactions{display:flex;gap:6px}
 
 /* the week summary: one card per course */
 .wsOverview{font-size:14px;line-height:1.6;margin:14px 0}

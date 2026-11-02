@@ -50,6 +50,77 @@ function openWeekReminders(weekKey) {
   };
 }
 
+/* Every item in one week from the courses switched on. Past due counts and the
+   "tests only" and "to grade" filters do not apply: on a Wednesday, Monday's
+   quiz is still part of what the week is about, and so is the reading. */
+function weekItems(key) {
+  const off = S.schedFilter.off;
+  return (S.sched.items || [])
+    .map(it => ({ ...it, when: new Date(it.due_at) }))
+    .filter(it => !off.has(it.course_code) && !isNaN(it.when) && weekKey(it.when) === key)
+    .sort((a, b) => a.when - b.when);
+}
+
+function openWeekSummary(key) {
+  const rows = weekItems(key);
+  if (!rows.length) { setStatus('nothing dated in that week', 'err'); return; }
+  const monday = new Date(key + 'T00:00:00');
+  const sunday = new Date(monday.getTime() + 6 * DAY_MS);
+  const week = `the week of ${fmtRange(monday, sunday)}, ${monday.getFullYear()}`;
+  // The due date goes over already written in local time: only the browser
+  // knows the zone, and the model should say "Wednesday" the way you would.
+  const items = rows.map(i => ({ course_id: i.course_id, assignment_id: i.assignment_id,
+    due_local: `${i.when.toLocaleDateString([], { weekday: 'long', month: 'short', day: 'numeric' })}, ${fmtTime(i.when)}` }));
+  runJob(`Summarizing ${week}`,
+    () => api('/schedule/week-summary', { body: { week, items } }),
+    r => showWeekSummary(r, week));
+}
+
+function showWeekSummary(r, week) {
+  const host = $('#modalHost');
+  const cards = r.courses || [];
+  const card = c => `<section class="wsCard" style="border-left-color:${esc(schedColour(c.course_id))}">
+      <div class="wsHead"><span class="cbadge" style="background:${esc(schedColour(c.course_id))}"
+        title="${esc(c.course_name)}">${esc(c.course_label)}</span>
+        <span class="wsCount">${c.items.length} item${c.items.length > 1 ? 's' : ''}</span></div>
+      <p class="wsTeach">${esc(c.teaching || 'No summary came back for this course.')}</p>
+      ${c.testing.length ? `<div class="wsTest"><b>Tested</b><ul>${
+        c.testing.map(t => `<li>${esc(t)}</li>`).join('')}</ul></div>` : ''}
+      <details class="wsItems"><summary>What's due</summary><ul>${c.items.map(i => `<li>
+        <span class="k ${KIND_CLASS[i.kind_label] || 'kind-asn'}">${esc(i.kind_label || '')}</span>
+        <span class="weekName">${esc(i.name || '')}</span>
+        <span class="weekWhen">${esc(i.due_local || '')}</span></li>`).join('')}</ul></details>
+    </section>`;
+  host.innerHTML = `<div class="modalBack"><div class="modal wide" data-studio-modal>
+      <h3>What you're teaching ${esc(week)}</h3>
+      <div class="sub">${cards.length} course${cards.length === 1 ? '' : 's'}, read from each
+        assignment's page${r.model ? ' · summarized by ' + esc(r.model) : ''}${r.cost_usd
+        ? ' · $' + Number(r.cost_usd).toFixed(3) : ''} · nothing was changed in Canvas</div>
+      ${(r.failed || []).length ? `<div class="callout bad">${r.failed.length}
+        assignment(s) could not be read and were left out: ${
+          r.failed.map(f => esc(firstLine(f.error))).join('; ')}</div>` : ''}
+      ${r.parse_error ? `<div class="callout">The summary came back in an
+        unexpected shape, so only its plain text is shown.</div>` : ''}
+      <p class="wsOverview">${esc(r.overview || '')}</p>
+      <div class="wsList">${cards.map(card).join('')}</div>
+      <div class="foot">
+        <button class="btn" id="wsCopy">Copy</button>
+        <span class="spacer"></span>
+        <button class="btn" id="wsClose">Close</button>
+      </div>
+    </div></div>`;
+  $('#wsClose').onclick = () => { host.innerHTML = ''; };
+  $('#wsCopy').onclick = () => {
+    const text = [`What you're teaching ${week}`, '', r.overview || '']
+      .concat(...cards.map(c => ['', c.course_label, c.teaching || '']
+        .concat(c.testing.length ? ['Tested: ' + c.testing.join('; ')] : [])))
+      .join('\n');
+    navigator.clipboard.writeText(text)
+      .then(() => setStatus('week summary copied', 'ok'))
+      .catch(() => setStatus('could not copy', 'err'));
+  };
+}
+
 /* The week a row belongs to, by the same local rule the sections use. */
 function weekKey_(item) {
   return weekKey(item.when || new Date(item.due_at));
@@ -1848,6 +1919,8 @@ function renderSchedule() {
           <div class="wmeta">${fmtRange(monday, sunday)}
             <span class="load">${items.length} item${items.length > 1 ? 's' : ''} ·
               ${num(pts)} pts${wait ? ` · ${wait} to grade` : ''}</span>
+            <button class="weekRemind weekSum" data-sum="${key}"
+              title="What this week teaches and tests across your courses, read from each assignment">What's this week?</button>
             ${exams.length ? `<button class="weekRemind" data-week="${key}"
               title="Draft a reminder announcement for each of these ${
                 exams.length} assessment(s)">Remind ${exams.length} test${
@@ -1886,6 +1959,9 @@ function renderSchedule() {
   });
   $('#schedBody').querySelectorAll('[data-week]').forEach(el => {
     el.onclick = () => openWeekReminders(el.dataset.week);
+  });
+  $('#schedBody').querySelectorAll('[data-sum]').forEach(el => {
+    el.onclick = () => openWeekSummary(el.dataset.sum);
   });
   $('#schedBody').querySelectorAll('[data-edit]').forEach(el => {
     el.onclick = ev => {

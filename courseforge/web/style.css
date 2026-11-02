@@ -882,6 +882,22 @@ mark.ovSim.flash{background:rgba(90,160,220,.6);outline:2px solid var(--edit)}
 .week.now .weekRemind{border-color:var(--warn);color:var(--warn)}
 .week.now .weekRemind:hover{background:var(--warn-soft)}
 
+/* the week summary: one card per course */
+.wsOverview{font-size:14px;line-height:1.6;margin:14px 0}
+.wsList{display:flex;flex-direction:column;gap:12px;margin:0 0 14px;
+  max-height:min(56vh,560px);overflow-y:auto;padding-right:4px}
+.wsCard{border:1px solid var(--line);border-left:4px solid var(--ai);
+  border-radius:var(--radius);padding:10px 14px;background:var(--bg)}
+.wsHead{display:flex;align-items:center;gap:9px}
+.wsCount{font:11px var(--mono);color:var(--muted)}
+.wsTeach{margin:8px 0 6px;font-size:13px;line-height:1.55}
+.wsTest{font-size:12.5px}
+.wsTest ul{margin:4px 0 0;padding-left:18px}
+.wsItems{margin-top:6px;font-size:12px}
+.wsItems summary{cursor:pointer;color:var(--muted)}
+.wsItems ul{list-style:none;padding:0;margin:6px 0 0;display:flex;flex-direction:column;gap:4px}
+.wsItems li{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+
 .weekList{list-style:none;padding:0;margin:14px 0;display:flex;
   flex-direction:column;gap:6px}
 .weekList li{display:flex;align-items:center;gap:9px;flex-wrap:wrap;

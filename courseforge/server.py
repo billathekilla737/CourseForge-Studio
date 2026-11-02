@@ -31,7 +31,7 @@ from . import (accommodations, areas, audit, blender, browse, confirm, folders, 
                grader, humanize,
                latepolicy, llm, gradestatus, gradesync, handoff, htmlclean, instruct,
                nicknames, overlap, quizgrade, quizedit, routing, schedule,
-               statesync, studiomedia, teaching, terms, videoread, watchnotes)
+               statesync, studiomedia, teaching, terms, videoread, watchnotes, weekly)
 from .canvas import CanvasClient, CanvasError
 from . import config
 from .config import Config
@@ -1472,6 +1472,59 @@ class App:
             "model": self.cfg.model,
             "cost_usd": round(sum(d.get("cost_usd") or 0 for d in out), 4),
             "writes_enabled": bool(self.cfg.allow_canvas_writes),
+        }
+
+    def week_summary(self, week_label: str, items: list[dict],
+                     log=lambda *_a, **_k: None) -> dict:
+        """What this week teaches and tests, across every course in it.
+
+        One Claude call for the whole week, after reading each item's own page
+        from Canvas (a few at a time, and kept for the life of the process, so
+        asking twice reads Canvas once). Writes nothing.
+        """
+        targets = weekly.wanted(items)
+        total = len(targets)
+        log(f"reading {total} assignment(s) for {week_label or 'this week'}", 0, total)
+        rows: dict[int, dict] = {}
+        failed: list[dict] = []
+        workers = max(1, min(int(self.cfg.grading_concurrency), 4))
+
+        def one(index: int, target: dict) -> None:
+            try:
+                detail = self.schedule_item(target["course_id"], target["assignment_id"])
+            except Exception as exc:  # noqa: BLE001
+                # One unreadable assignment must not cost the week; the page
+                # says which ones were left out.
+                failed.append({**target, "error": f"{type(exc).__name__}: {exc}"})
+                return
+            rows[index] = {**detail, "due_local": target["due_local"],
+                           "text": weekly.plain_text(detail.get("description") or "")}
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = [pool.submit(one, i, t) for i, t in enumerate(targets)]
+            for done, future in enumerate(concurrent.futures.as_completed(futures), 1):
+                future.result()
+                log(f"read {done}/{total}", done, total)
+
+        ordered = [rows[i] for i in sorted(rows)]
+        if not ordered:
+            raise RuntimeError("None of that week's assignments could be read "
+                               "from Canvas: " + failed[0]["error"])
+
+        log(f"{self.cfg.model} is summarizing the week")
+        result = llm.run(
+            weekly.prompt(week_label, ordered), model=self.cfg.model,
+            timeout_s=self.cfg.claude_timeout_s, system=weekly.SYSTEM,
+            on_activity=grader._activity_sink(log, "week summary", self.cfg.model))
+        data = result.data if isinstance(result.data, dict) else {}
+        out = weekly.shape(data, ordered, fallback_text="" if data else result.text)
+        return {
+            **out,
+            "week": week_label,
+            "failed": failed,
+            "model": self.cfg.model,
+            "cost_usd": round(float(result.cost_usd or 0.0), 4),
+            "parse_error": result.parse_error if not data else "",
         }
 
     def instruct_plan(self, instruction: str, term: str | None = None,
@@ -3781,6 +3834,12 @@ def make_handler(app: App):
                 if parts[1:] == ["schedule", "announce-batch"]:
                     job = app.jobs.start("announce", lambda log: app.announce_batch(
                         body.get("targets") or [], body.get("extra") or "", log))
+                    return self._json({"job": job})
+
+                # /api/schedule/week-summary  {week, items: [{course_id, assignment_id, due_local}]}
+                if parts[1:] == ["schedule", "week-summary"]:
+                    job = app.jobs.start("week-summary", lambda log: app.week_summary(
+                        body.get("week") or "", body.get("items") or [], log))
                     return self._json({"job": job})
 
                 # /api/schedule/instruct  {instruction, now_local, zone, term}

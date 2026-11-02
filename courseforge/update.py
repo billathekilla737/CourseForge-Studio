@@ -8,12 +8,17 @@ is a new version" and then go and get it, with one press and no terminal.
 
 What that has to survive:
 
-  * **Two kinds of install.** A git checkout knows its own revision and can be
-    left alone; an unzipped folder knows nothing, so the updater stamps it on
-    the way past and reads that stamp next time.
+  * **Two kinds of install.** A git checkout is updated by git -- fetch, then a
+    fast-forward -- so HEAD moves with the files. Laying the zip over a checkout
+    left HEAD behind, which made every file read as an uncommitted change and
+    every later update refuse until somebody ran git checkout. An unzipped
+    folder knows nothing, so the updater stamps it on the way past and reads
+    that stamp next time.
   * **A folder somebody is working in.** Overwriting a checkout with
     uncommitted changes destroys work that exists nowhere else, so that case is
-    refused with a sentence rather than handled cleverly.
+    refused with a sentence rather than handled cleverly. "Changed" means the
+    content differs from HEAD, not that git status lists it: a file rewritten
+    with LF endings over a CRLF checkout is listed but holds nothing to lose.
   * **Being offline, or blocked.** A check that fails must leave the window
     looking exactly as it did, because the point of the app is not updating it.
     Every failure here is reported into the status object and never raised at
@@ -98,6 +103,23 @@ def is_git_checkout(root: Path | None = None) -> bool:
     return (Path(root or install_dir()) / ".git").exists()
 
 
+def _run_git(root: Path, *args, timeout: int = 15) -> tuple:
+    """(returncode, stdout, stderr). -1 when git could not be run at all.
+
+    Never prompts: a credential dialog on a public fetch would hang the update
+    thread with nobody watching it.
+    """
+    env = dict(os.environ, GIT_TERMINAL_PROMPT="0")
+    try:
+        out = subprocess.run(["git", "-C", str(root), *args], capture_output=True,
+                             text=True, timeout=timeout, encoding="utf-8",
+                             errors="replace", env=env,
+                             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    except (OSError, subprocess.SubprocessError) as exc:
+        return -1, "", str(exc)
+    return out.returncode, out.stdout, out.stderr
+
+
 def _git(root: Path, *args) -> str:
     """Raw stdout, deliberately not stripped.
 
@@ -106,23 +128,25 @@ def _git(root: Path, *args) -> str:
     shifts the first line by one and hands back a path with its first letter
     missing -- which then reads as a file that does not exist.
     """
-    try:
-        out = subprocess.run(["git", "-C", str(root), *args], capture_output=True,
-                             text=True, timeout=15, encoding="utf-8",
-                             errors="replace",
-                             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-    except (OSError, subprocess.SubprocessError):
-        return ""
-    return out.stdout if out.returncode == 0 else ""
+    code, out, _err = _run_git(root, *args)
+    return out if code == 0 else ""
 
 
 def dirty_files(root: Path | None = None) -> list:
-    """Tracked files with uncommitted changes. Empty for a non-checkout."""
+    """Tracked files whose content differs from HEAD. Empty for a non-checkout.
+
+    `git diff HEAD` rather than `git status`. Status trusts the size it cached
+    at checkout, so under core.autocrlf a file rewritten with LF endings is
+    listed as modified even though its content is identical; the old zip
+    overlay produced exactly that on every file and then refused to update
+    again. Diff hashes the file and drops what turns out to be unchanged.
+    Staged and unstaged edits both count.
+    """
     root = Path(root or install_dir())
     if not is_git_checkout(root):
         return []
-    out = _git(root, "status", "--porcelain", "--untracked-files=no")
-    return [l[3:].strip() for l in out.split("\n") if l.strip()]
+    out = _git(root, "diff", "--name-only", "-z", "--no-renames", "HEAD")
+    return [p for p in out.split("\0") if p]
 
 
 def head_sha(root: Path) -> str:
@@ -236,6 +260,11 @@ def check(cfg, root: Path | None = None) -> Status:
         )
     else:
         status.available = status.latest != status.current
+        if status.available and _uses_git(root) and _contains(root, status.latest_sha):
+            # A checkout that already has the upstream head -- typically the
+            # machine it is written on, with commits not pushed yet. Behind
+            # is news; ahead is not.
+            status.available = False
 
     if status.available:
         status.notes = _notes(repo, status.current, status.latest, _token(cfg))
@@ -252,8 +281,28 @@ def _guard_local_edits(status: Status, root: Path) -> bool:
     status.why_not = (
         f"This folder is a git checkout with {len(bad)} uncommitted change(s) "
         f"({shown}). Updating would overwrite work that exists nowhere else, so "
-        f"it is left alone. Commit or stash, then use git pull.")
+        f"it is left alone. Commit or stash, then update again.")
     return False
+
+
+def _uses_git(root: Path) -> bool:
+    """A checkout git can actually read. A folder with .git copied onto a
+    machine without git falls back to the zip path and its stamp."""
+    return is_git_checkout(root) and bool(head_sha(root))
+
+
+def _contains(root: Path, sha: str) -> bool:
+    """Is `sha` HEAD or behind it. False when the commit is not here at all."""
+    if not sha:
+        return False
+    code, _out, _err = _run_git(root, "merge-base", "--is-ancestor", sha, "HEAD")
+    return code == 0
+
+
+def _fetch_url(repo: str) -> str:
+    """Fetched from the pinned repository by URL, never from `origin`, which
+    is whatever the person cloned from or later pointed it at."""
+    return f"https://github.com/{repo}.git"
 
 
 def _notes(repo: str, base: str, head: str, token: str) -> list:
@@ -299,6 +348,8 @@ def apply(cfg, status: Status, root: Path | None = None,
     if not sha:
         return {"ok": False, "restart": False,
                 "message": "No revision to fetch."}
+    if _uses_git(root):
+        return _apply_git(root, repo, _branch(cfg), sha, log)
     url = f"{API}/repos/{repo}/zipball/{sha}"
     with tempfile.TemporaryDirectory(prefix="cfstudio-update-") as tmp:
         tmpdir = Path(tmp)
@@ -362,6 +413,67 @@ def apply(cfg, status: Status, root: Path | None = None,
     return {"ok": True, "restart": True,
             "message": f"Updated to {status.latest or 'the latest version'}. "
                        f"{count} file(s) written. Restart to run it."}
+
+
+def _apply_git(root: Path, repo: str, branch: str, sha: str, log) -> dict:
+    """Fetch the pinned repository and fast-forward this checkout to `sha`.
+
+    Fast-forward only: a checkout with its own commits is somebody's work, and
+    merging into it or resetting it is a decision for them, not for a button.
+    The caller has already confirmed nothing differs from HEAD.
+    """
+    def fail(message: str) -> dict:
+        return {"ok": False, "restart": False, "message": message}
+
+    log("fetching the new version with git…")
+    code, _out, err = _run_git(root, "fetch", "--no-tags", _fetch_url(repo), branch,
+                               timeout=300)
+    if code != 0:
+        return fail(f"git could not fetch the update: {_last_line(err)}")
+
+    # The revision the check reported, so the window installs what it showed.
+    # If the branch was rewound since and that commit is gone, take the head.
+    code, full, _err = _run_git(root, "rev-parse", "--verify", "--quiet",
+                                f"{sha}^{{commit}}")
+    target = full.strip() if code == 0 and full.strip() else "FETCH_HEAD"
+
+    # Files that only differ from HEAD in their cached size -- LF rewritten over
+    # a CRLF checkout -- make the merge refuse as if they were edits. Re-adding
+    # them records fresh stat data; their content already equals HEAD, so
+    # nothing is staged.
+    _run_git(root, "add", "-u")
+
+    log("moving this checkout forward…")
+    before = head_sha(root)
+    code, out, err = _run_git(root, "merge", "--ff-only", "--no-edit", target,
+                              timeout=120)
+    if code != 0:
+        text = f"{out}\n{err}"
+        if "untracked working tree files would be overwritten" in text:
+            names = [l.strip() for l in text.splitlines()
+                     if l.startswith(("\t", "    ")) and l.strip()]
+            shown = ", ".join(names[:3]) + (f" and {len(names) - 3} more"
+                                            if len(names) > 3 else "")
+            return fail(f"Files that git does not track are in the way of the "
+                        f"update ({shown}). Move them out of the folder, then "
+                        f"update again. Nothing was changed.")
+        if "fast-forward" in text.lower() or "diverg" in text.lower():
+            return fail("This checkout has commits of its own that are not on "
+                        "GitHub, so it cannot simply move forward. Nothing was "
+                        "changed; use git pull and settle it there.")
+        return fail(f"git could not apply the update: {_last_line(err or out)}")
+
+    after = head_sha(root)
+    if after == before:
+        return {"ok": True, "restart": False,
+                "message": f"Already at {after[:7]}; nothing to update."}
+    return {"ok": True, "restart": True,
+            "message": f"Updated to {after[:7]} with git. Restart to run it."}
+
+
+def _last_line(text: str) -> str:
+    lines = [l.strip() for l in (text or "").splitlines() if l.strip()]
+    return lines[-1] if lines else "no reason given"
 
 
 def _unsafe(name: str, top: str) -> bool:

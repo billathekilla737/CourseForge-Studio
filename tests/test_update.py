@@ -9,6 +9,7 @@ and data, which must survive an update that replaces everything around them.
 import io
 import json
 import shutil
+import subprocess
 import tempfile
 import unittest
 import zipfile
@@ -353,6 +354,170 @@ class TheSourceIsPinned(Base):
         update.write_stamp(self.tmp, "c4925f6")
         update.check(self.cfg, root=self.tmp)
         self.assertEqual(seen, [""])
+
+
+def git(cwd, *args) -> str:
+    out = subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@t",
+                          "-c", "commit.gpgsign=false", *args],
+                         cwd=str(cwd), capture_output=True, text=True, check=True)
+    return out.stdout
+
+
+@unittest.skipUnless(shutil.which("git"), "git is not installed")
+class AGitCheckout(unittest.TestCase):
+    """A checkout is updated by git, so HEAD moves with the files.
+
+    The zip overlay left HEAD where it was. The next check compared the old
+    HEAD to GitHub and offered the update again, and the guard then saw every
+    overlaid file as an uncommitted change and refused it -- until somebody ran
+    git checkout and threw the update away. These are real repositories; a
+    local one stands in for GitHub.
+    """
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.up = self.tmp / "up"
+        self.up.mkdir()
+        git(self.up, "init", "-q", "-b", "main")
+        git(self.up, "config", "core.autocrlf", "false")
+        for name in update.MUST_CONTAIN + ("README.md",):
+            path = self.up / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b"one\ntwo\nthree\n")
+        git(self.up, "add", "-A")
+        git(self.up, "commit", "-qm", "first")
+        git(self.tmp, "-c", "core.autocrlf=false", "clone", "-q", str(self.up), "work")
+        self.work = self.tmp / "work"
+        git(self.work, "config", "core.autocrlf", "false")
+        self.cfg = Cfg()
+
+        original = update._fetch_url
+        self.addCleanup(setattr, update, "_fetch_url", original)
+        update._fetch_url = lambda repo: str(self.up)
+        self.upstream_head = self.head(self.up)
+        self.addCleanup(setattr, update, "_get", update._get)
+        update._get = self.github
+
+    def github(self, url, token="", accept=""):
+        """The commits API answers with the stand-in's head; a zip must never
+        be asked for, because a checkout is not updated by overlay."""
+        if "/zipball/" in url:
+            raise AssertionError("a git checkout downloaded the zip")
+        return FakeResponse(json.dumps({"sha": self.upstream_head}).encode())
+
+    def head(self, repo) -> str:
+        return git(repo, "rev-parse", "HEAD").strip()
+
+    def commit_upstream(self, name="courseforge/server.py", body=b"new\n") -> str:
+        path = self.up / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(body)
+        git(self.up, "add", "-A")
+        git(self.up, "commit", "-qm", f"change {name}")
+        self.upstream_head = self.head(self.up)
+        return self.upstream_head
+
+    def test_head_moves_with_the_files(self):
+        new = self.commit_upstream()
+        status = update.check(self.cfg, root=self.work)
+        self.assertTrue(status.available and status.can_apply, status.why_not)
+        out = update.apply(self.cfg, status, root=self.work)
+        self.assertTrue(out["ok"], out["message"])
+        self.assertTrue(out["restart"])
+        self.assertEqual(self.head(self.work), new)
+        self.assertEqual((self.work / "courseforge" / "server.py").read_bytes(), b"new\n")
+        self.assertEqual(git(self.work, "status", "--porcelain"), "")
+        self.assertFalse((self.work / update.STAMP).exists())
+
+    def test_the_next_check_says_up_to_date_and_could_update_again(self):
+        """The loop that needed git checkout to break."""
+        self.commit_upstream()
+        update.apply(self.cfg, update.check(self.cfg, root=self.work), root=self.work)
+        status = update.check(self.cfg, root=self.work)
+        self.assertFalse(status.available)
+        self.assertTrue(status.can_apply, status.why_not)
+        self.assertEqual(status.headline(), "Up to date")
+
+    def test_a_line_ending_rewrite_is_not_an_edit(self):
+        """The state the old overlay left behind: content equal to HEAD, LF
+        endings over a CRLF checkout. git status lists it; there is nothing
+        in it to lose, so it neither blocks the update nor makes merge refuse."""
+        git(self.work, "config", "core.autocrlf", "true")
+        readme = self.work / "README.md"
+        readme.unlink()
+        git(self.work, "checkout", "--", "README.md")
+        self.assertIn(b"\r\n", readme.read_bytes())
+        readme.write_bytes(b"one\ntwo\nthree\n")
+        self.assertIn("README.md", git(self.work, "status", "--porcelain"))
+        self.assertEqual(update.dirty_files(self.work), [])
+
+        new = self.commit_upstream("README.md", b"one\ntwo\nthree\nfour\n")
+        out = update.apply(self.cfg, update.check(self.cfg, root=self.work),
+                           root=self.work)
+        self.assertTrue(out["ok"], out["message"])
+        self.assertEqual(self.head(self.work), new)
+
+    def test_a_real_edit_still_blocks(self):
+        self.commit_upstream()
+        edited = self.work / "courseforge" / "launcher.py"
+        edited.write_bytes(b"my work\n")
+        status = update.check(self.cfg, root=self.work)
+        self.assertFalse(status.can_apply)
+        self.assertIn("courseforge/launcher.py", status.why_not)
+        before = self.head(self.work)
+        out = update.apply(self.cfg, update.Status(latest_sha=self.upstream_head),
+                           root=self.work)
+        self.assertFalse(out["ok"])
+        self.assertEqual(self.head(self.work), before)
+        self.assertEqual(edited.read_bytes(), b"my work\n")
+
+    def test_a_staged_edit_counts(self):
+        (self.work / "README.md").write_bytes(b"staged\n")
+        git(self.work, "add", "README.md")
+        self.assertEqual(update.dirty_files(self.work), ["README.md"])
+
+    def test_a_checkout_with_its_own_commits_is_not_forced(self):
+        (self.work / "README.md").write_bytes(b"local\n")
+        git(self.work, "commit", "-qam", "local")
+        mine = self.head(self.work)
+        self.commit_upstream()
+        out = update.apply(self.cfg, update.check(self.cfg, root=self.work),
+                           root=self.work)
+        self.assertFalse(out["ok"])
+        self.assertIn("commits of its own", out["message"])
+        self.assertEqual(self.head(self.work), mine)
+
+    def test_a_checkout_ahead_of_github_is_not_offered_an_update(self):
+        (self.work / "README.md").write_bytes(b"not pushed yet\n")
+        git(self.work, "commit", "-qam", "local")
+        status = update.check(self.cfg, root=self.work)
+        self.assertTrue(status.checked)
+        self.assertFalse(status.available)
+
+    def test_an_untracked_file_in_the_way_is_left_alone(self):
+        self.commit_upstream("docs/new.md", b"theirs\n")
+        (self.work / "docs").mkdir()
+        (self.work / "docs" / "new.md").write_bytes(b"mine\n")
+        before = self.head(self.work)
+        out = update.apply(self.cfg, update.check(self.cfg, root=self.work),
+                           root=self.work)
+        self.assertFalse(out["ok"])
+        self.assertIn("docs/new.md", out["message"])
+        self.assertEqual((self.work / "docs" / "new.md").read_bytes(), b"mine\n")
+        self.assertEqual(self.head(self.work), before)
+
+    def test_it_fetches_the_pinned_repo_not_origin(self):
+        src = Path(update.__file__).read_text(encoding="utf-8")
+        body = src[src.index("def _apply_git("):src.index("def _last_line(")]
+        self.assertIn("_fetch_url(repo)", body)
+        self.assertNotIn('"origin"', body)
+
+
+class TheFetchUrl(unittest.TestCase):
+    def test_it_is_the_public_repo(self):
+        self.assertEqual(update._fetch_url(update.ALLOWED_REPO),
+                         "https://github.com/billathekilla737/CourseForge-Studio-app.git")
 
 
 class TheLauncherShowsIt(unittest.TestCase):
